@@ -6,12 +6,18 @@
 //! - [`sealed_box`]: NaCl sealed box encryption for token payloads
 //! - [`hkdf`]: HKDF key derivation for versioned keys
 //! - [`hmac`]: HMAC request signing with constant-time comparison
+//! - [`auth_validation`]: Client authentication validation for proxy requests
 
+pub mod auth_validation;
 pub mod hkdf;
 pub mod hmac;
 pub mod keypair;
 pub mod sealed_box;
 
+pub use auth_validation::{
+    create_api_key_config, create_bearer_api_key_config, hash_api_key, parse_proxy_authorization,
+    validate_auth, ProxyCredential, TlsConnectionInfo, PROXY_AUTHORIZATION_HEADER,
+};
 pub use hkdf::{derive_hmac_key, derive_keypair, derive_keypairs, MasterKeyManager};
 pub use hmac::{
     compute_signature, signature_from_base64, signature_from_hex, signature_to_base64,

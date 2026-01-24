@@ -29,6 +29,22 @@ pub enum TokenizerError {
         host: String,
     },
 
+    /// The target IP address is blocked by network protection.
+    #[error("blocked IP address: {ip} ({reason})")]
+    BlockedAddress {
+        /// The blocked IP address.
+        ip: String,
+        /// The reason the address was blocked.
+        reason: String,
+    },
+
+    /// Client authentication failed.
+    #[error("proxy authentication required: {reason}")]
+    ProxyAuthRequired {
+        /// The reason authentication failed.
+        reason: String,
+    },
+
     /// A secret was detected in the response body.
     #[error("secret leak detected in response")]
     SecretLeakDetected,
@@ -94,8 +110,10 @@ impl TokenizerError {
             self,
             Self::InvalidPayload(_)
                 | Self::HostNotAllowed { .. }
+                | Self::BlockedAddress { .. }
                 | Self::TokenExpired
                 | Self::DecryptionError(_)
+                | Self::ProxyAuthRequired { .. }
         )
     }
 
@@ -104,7 +122,11 @@ impl TokenizerError {
     pub fn is_security_error(&self) -> bool {
         matches!(
             self,
-            Self::SecretLeakDetected | Self::DecryptionError(_) | Self::HostNotAllowed { .. }
+            Self::SecretLeakDetected
+                | Self::DecryptionError(_)
+                | Self::HostNotAllowed { .. }
+                | Self::BlockedAddress { .. }
+                | Self::ProxyAuthRequired { .. }
         )
     }
 }
@@ -143,6 +165,10 @@ mod tests {
         }
         .is_client_error());
         assert!(TokenizerError::TokenExpired.is_client_error());
+        assert!(TokenizerError::ProxyAuthRequired {
+            reason: "missing header".into()
+        }
+        .is_client_error());
 
         assert!(!TokenizerError::Timeout.is_client_error());
         assert!(!TokenizerError::InternalError("oops".into()).is_client_error());
@@ -154,6 +180,10 @@ mod tests {
         assert!(TokenizerError::DecryptionError("tampered".into()).is_security_error());
         assert!(TokenizerError::HostNotAllowed {
             host: "evil.com".into()
+        }
+        .is_security_error());
+        assert!(TokenizerError::ProxyAuthRequired {
+            reason: "invalid key".into()
         }
         .is_security_error());
 

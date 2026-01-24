@@ -9,7 +9,7 @@ use http::Request;
 use tower::{Layer, Service};
 
 use icebreaker_common::{SealedToken, TokenizerError};
-use icebreaker_crypto::TokenCrypto;
+use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 
 use crate::processor::create_processor;
 
@@ -92,6 +92,10 @@ where
             // Decrypt the token
             let payload = crypto.unseal(&sealed_token)?;
 
+            // Validate client authentication
+            let tls_info = request.extensions().get::<TlsConnectionInfo>();
+            validate_auth(&payload.auth, &request, tls_info)?;
+
             // Validate the target host
             if let Some(host) = request.uri().host() {
                 payload.validate_host(host)?;
@@ -116,8 +120,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use icebreaker_common::auth::AuthConfig;
     use icebreaker_common::{InjectConfig, ProcessorConfig};
-    use icebreaker_crypto::Keypair;
+    use icebreaker_crypto::{create_api_key_config, Keypair, PROXY_AUTHORIZATION_HEADER};
     use secrecy::SecretString;
     use std::convert::Infallible;
     use tower::ServiceExt;
@@ -231,5 +236,138 @@ mod tests {
 
         let result = service.oneshot(request).await;
         assert!(matches!(result, Err(TokenizerError::HostNotAllowed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_auth_validation_success() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload with API key auth
+        let api_key = "my-proxy-key";
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("my-secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .auth(AuthConfig::ApiKey(create_api_key_config(
+            PROXY_AUTHORIZATION_HEADER,
+            api_key,
+        )))
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Request with correct auth should succeed
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .header(TOKEN_HEADER, sealed_token.to_header())
+            .header(PROXY_AUTHORIZATION_HEADER, format!("Bearer {}", api_key))
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_auth_validation_failure() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload with API key auth
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("my-secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .auth(AuthConfig::ApiKey(create_api_key_config(
+            PROXY_AUTHORIZATION_HEADER,
+            "correct-key",
+        )))
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Request with wrong auth should fail with 407
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .header(TOKEN_HEADER, sealed_token.to_header())
+            .header(PROXY_AUTHORIZATION_HEADER, "Bearer wrong-key")
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(matches!(
+            result,
+            Err(TokenizerError::ProxyAuthRequired { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_auth_validation_missing_header() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload with API key auth
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("my-secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .auth(AuthConfig::ApiKey(create_api_key_config(
+            PROXY_AUTHORIZATION_HEADER,
+            "my-key",
+        )))
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Request without auth header should fail
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .header(TOKEN_HEADER, sealed_token.to_header())
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(matches!(
+            result,
+            Err(TokenizerError::ProxyAuthRequired { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_no_auth_required() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload with no auth
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("my-secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Request without auth header should succeed when no auth is required
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .header(TOKEN_HEADER, sealed_token.to_header())
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(result.is_ok());
     }
 }

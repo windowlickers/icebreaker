@@ -16,6 +16,12 @@ pub enum ProcessorConfig {
 
     /// OAuth token with automatic refresh.
     OAuth(OAuthConfig),
+
+    /// Request body placeholder injection.
+    InjectBody(InjectBodyConfig),
+
+    /// AWS Signature Version 4 signing.
+    Sigv4(Sigv4Config),
 }
 
 impl ProcessorConfig {
@@ -26,6 +32,8 @@ impl ProcessorConfig {
             Self::Inject(_) => "inject",
             Self::InjectHmac(_) => "inject_hmac",
             Self::OAuth(_) => "oauth",
+            Self::InjectBody(_) => "inject_body",
+            Self::Sigv4(_) => "sigv4",
         }
     }
 }
@@ -196,6 +204,65 @@ pub enum OAuthGrantType {
     RefreshToken,
 }
 
+/// Configuration for request body placeholder injection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InjectBodyConfig {
+    /// Placeholder string to replace in the request body.
+    #[serde(default = "default_placeholder")]
+    pub placeholder: String,
+}
+
+fn default_placeholder() -> String {
+    "{{ACCESS_TOKEN}}".to_string()
+}
+
+impl Default for InjectBodyConfig {
+    fn default() -> Self {
+        Self {
+            placeholder: default_placeholder(),
+        }
+    }
+}
+
+impl InjectBodyConfig {
+    /// Creates a new `InjectBodyConfig` with the given placeholder.
+    #[must_use]
+    pub fn new(placeholder: impl Into<String>) -> Self {
+        Self {
+            placeholder: placeholder.into(),
+        }
+    }
+}
+
+/// Configuration for AWS Signature Version 4 signing.
+///
+/// The access key is stored in this config, while the secret key is provided
+/// in the token payload.
+#[derive(Clone, Serialize, Deserialize, ZeroizeOnDrop)]
+pub struct Sigv4Config {
+    /// The AWS access key ID.
+    #[zeroize(skip)]
+    pub access_key: String,
+}
+
+impl Sigv4Config {
+    /// Creates a new `Sigv4Config` with the given access key.
+    #[must_use]
+    pub fn new(access_key: impl Into<String>) -> Self {
+        Self {
+            access_key: access_key.into(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Sigv4Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sigv4Config")
+            .field("access_key", &self.access_key)
+            .finish()
+    }
+}
+
 /// Cached OAuth token with expiration.
 #[derive(Debug, Clone)]
 pub struct CachedOAuthToken {
@@ -255,5 +322,11 @@ mod tests {
 
         let oauth = ProcessorConfig::OAuth(OAuthConfig::default());
         assert_eq!(oauth.processor_type(), "oauth");
+
+        let inject_body = ProcessorConfig::InjectBody(InjectBodyConfig::default());
+        assert_eq!(inject_body.processor_type(), "inject_body");
+
+        let sigv4 = ProcessorConfig::Sigv4(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
+        assert_eq!(sigv4.processor_type(), "sigv4");
     }
 }

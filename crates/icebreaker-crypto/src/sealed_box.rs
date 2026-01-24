@@ -138,6 +138,14 @@ impl TokenCrypto {
         Self { key_store }
     }
 
+    /// Generates a new `TokenCrypto` with a random keypair.
+    ///
+    /// Useful for testing and development.
+    #[must_use]
+    pub fn generate() -> Self {
+        Self::with_keypair(Keypair::generate(), "generated")
+    }
+
     /// Seals a token payload.
     pub fn seal(&self, payload: &TokenPayload) -> Result<SealedToken> {
         let primary = self

@@ -25,9 +25,9 @@ Core types shared across all crates.
 | File | Purpose |
 |------|---------|
 | `src/error.rs` | `TokenizerError` enum with `is_retryable()`, `is_client_error()`, `is_security_error()` |
-| `src/config.rs` | `ProxyConfig` with builder pattern, rate limit config, TLS config |
+| `src/config.rs` | `ProxyConfig`, `RateLimitConfig`, `TlsConfig`, `NetworkProtectionConfig` |
 | `src/token.rs` | `SealedToken`, `TokenPayload` with `secrecy`/`zeroize` protection |
-| `src/processor.rs` | `ProcessorConfig` enum: `Inject`, `InjectHmac`, `OAuth` |
+| `src/processor.rs` | `ProcessorConfig` enum: `Inject`, `InjectHmac`, `OAuth`, `InjectBody`, `Sigv4` |
 | `src/auth.rs` | `AuthConfig` types: `None`, `ApiKey`, `MutualTls` |
 
 ### icebreaker-crypto
@@ -56,6 +56,10 @@ Tower middleware stack for request/response transformation.
 | `src/processor/inject.rs` | `InjectProcessor` - header injection (Bearer, Basic, raw) |
 | `src/processor/hmac.rs` | `HmacProcessor` - HMAC request signing |
 | `src/processor/oauth.rs` | `OAuthProcessor` - OAuth token injection |
+| `src/processor/inject_body.rs` | `InjectBodyProcessor` - request body placeholder replacement |
+| `src/processor/sigv4.rs` | `Sigv4Processor` - AWS Signature Version 4 re-signing |
+| `src/network/ip_filter.rs` | `IpFilter` - SSRF prevention via IP address filtering |
+| `src/tunnel/connect_handler.rs` | `ConnectHandler` - HTTP CONNECT tunneling support |
 
 ### icebreaker-audit
 
@@ -87,11 +91,12 @@ CLI binary with subcommands.
 1. Client sends request with X-Tokenizer-Token header
 2. TokenInjectionService extracts and decrypts the sealed token
 3. Host validation checks the target against allowed hosts
-4. Processor injects the secret (header, HMAC signature, or OAuth token)
-5. Request forwarded to upstream
-6. ResponseScanLayer wraps response body with ScanningBody
-7. ScanningBody checks each chunk for secret leaks using OverlapBuffer
-8. If leak detected, error returned instead of response body
+4. Network protection validates resolved IPs (SSRF prevention)
+5. Processor injects the secret (header, body, HMAC signature, SigV4, or OAuth token)
+6. Request forwarded to upstream
+7. ResponseScanLayer wraps response body with ScanningBody
+8. ScanningBody checks each chunk for secret leaks using OverlapBuffer
+9. If leak detected, error returned instead of response body
 ```
 
 ### Secret Protection
@@ -112,6 +117,112 @@ let proxy_service = ServiceBuilder::new()
     .layer(ResponseScanLayer::new(scanner))
     .service(upstream_connector);
 ```
+
+## Processor Types
+
+Icebreaker supports multiple token injection strategies:
+
+| Processor | Config Type | Description |
+|-----------|-------------|-------------|
+| `Inject` | `InjectConfig` | Simple header injection (Bearer, Basic, raw) |
+| `InjectHmac` | `HmacConfig` | HMAC signature injection for request signing |
+| `OAuth` | `OAuthConfig` | OAuth token with automatic refresh |
+| `InjectBody` | `InjectBodyConfig` | Replace placeholders in request body with secrets |
+| `Sigv4` | `Sigv4Config` | AWS Signature Version 4 request re-signing |
+
+### InjectBody Processor
+
+Replaces placeholder strings in request bodies with secrets. Useful for APIs that require credentials in the body rather than headers.
+
+```rust
+// Default placeholder: "{{ACCESS_TOKEN}}"
+let config = InjectBodyConfig::default();
+
+// Custom placeholder
+let config = InjectBodyConfig::new("__SECRET__");
+```
+
+### Sigv4 Processor
+
+Re-signs AWS API requests with credentials from the sealed token. Extracts service, region, and timestamp from the incoming `Authorization` header.
+
+```rust
+let config = Sigv4Config::new("AKIAIOSFODNN7EXAMPLE");
+// Secret key provided in TokenPayload
+```
+
+**Note**: Cannot provide SigV4's replay protection guarantees since re-signing happens at proxy time.
+
+## Network Protection (SSRF Prevention)
+
+The `IpFilter` prevents Server-Side Request Forgery by blocking connections to internal networks.
+
+### Blocked Address Ranges
+
+| Range | Description |
+|-------|-------------|
+| `10.0.0.0/8` | Private (RFC 1918) |
+| `172.16.0.0/12` | Private (RFC 1918) |
+| `192.168.0.0/16` | Private (RFC 1918) |
+| `127.0.0.0/8` | Loopback IPv4 |
+| `::1/128` | Loopback IPv6 |
+| `fc00::/7` | Private IPv6 (ULA) |
+| `169.254.0.0/16` | Link-local IPv4 |
+| `fe80::/10` | Link-local IPv6 |
+| `100.64.0.0/10` | CGN (Carrier-Grade NAT) |
+| `224.0.0.0/4` | Multicast |
+| `240.0.0.0/4` | Reserved |
+
+### Configuration
+
+```rust
+let config = NetworkProtectionConfig {
+    block_private: true,      // Block RFC 1918 networks
+    block_loopback: true,     // Block localhost
+    block_link_local: true,   // Block link-local addresses
+    blocked_cidrs: vec![],    // Additional CIDRs to block
+    blocked_hostnames: vec![], // Hostnames to block
+    allowed_cidrs: vec![],    // Exceptions to blocking rules
+};
+
+let filter = IpFilter::new(&config)?;
+filter.validate_ip(&addr)?;
+```
+
+## HTTP CONNECT Tunneling
+
+The `ConnectHandler` supports HTTP CONNECT for HTTPS tunneling through the proxy.
+
+### CONNECT Flow
+
+```
+Client                          Proxy                         Upstream
+  |                               |                               |
+  |-- CONNECT host:443 --------->|                               |
+  |   X-Tokenizer-Token: <token> |                               |
+  |                               |-- Validate token, host       |
+  |                               |-- Resolve DNS, check IP      |
+  |                               |-- Connect to upstream        |
+  |<-- 200 Connection Established|                               |
+  |                               |                               |
+  |============= TLS Tunnel ============================>        |
+  |                               |   (bidirectional copy)       |
+```
+
+### Usage
+
+```rust
+let handler = ConnectHandler::new(crypto, ip_filter);
+
+if is_connect_request(&request) {
+    let (payload, host, port) = handler.validate_connect(&request)?;
+    let addr = handler.resolve_and_validate(&host, port).await?;
+    let upstream = handler.connect_upstream(addr).await?;
+    // Send 200, then copy bidirectionally
+}
+```
+
+**Note**: CONNECT tunnels are transparent - no secret injection occurs since TLS is end-to-end encrypted.
 
 ## Workspace Lints
 
@@ -140,6 +251,7 @@ dbg_macro = "deny"
 | `tower` / `tower-http` | Middleware composition |
 | `hyper` | HTTP server/client |
 | `sqlx` | Database (optional, via feature flags) |
+| `ipnet` | IP network parsing for SSRF protection |
 
 ## Environment Variables
 
@@ -191,15 +303,29 @@ curl -X POST https://proxy.example.com/v1/charges \
 
 ## Testing
 
+The project uses a Nix flake with direnv (`.envrc`), so the development environment loads automatically.
+
 ```bash
 # Run all tests
-cargo test
+cargo test --workspace
 
 # Run tests for a specific crate
 cargo test -p icebreaker-crypto
 
+# Run tests for specific modules
+cargo test -p icebreaker-proxy -- network::ip_filter
+cargo test -p icebreaker-proxy -- inject_body
+cargo test -p icebreaker-proxy -- sigv4
+cargo test -p icebreaker-proxy -- tunnel
+
 # Run with logging
 RUST_LOG=debug cargo test
+
+# Build the workspace
+cargo build --workspace
+
+# Run clippy
+cargo clippy --workspace
 ```
 
 ## Security Considerations
@@ -210,6 +336,8 @@ RUST_LOG=debug cargo test
 4. **Host Validation**: Tokens can only be used with pre-approved hosts
 5. **Token Expiration**: Tokens can have expiration timestamps
 6. **Audit Logging**: All operations can be logged for security review
+7. **SSRF Prevention**: Private, loopback, and link-local IPs are blocked by default
+8. **DNS Rebinding Protection**: IP validation occurs after DNS resolution
 
 ## Architecture Notes
 
@@ -218,3 +346,31 @@ RUST_LOG=debug cargo test
 - **Key Rotation**: `KeyStore` supports multiple versioned keypairs
 - **Streaming**: Response scanning uses overlap buffers for memory efficiency
 - **Extensible Processors**: Easy to add new injection strategies
+- **CONNECT Support**: Transparent tunneling for HTTPS connections
+
+## Feature Parity with superfly/tokenizer
+
+### Implemented
+
+| Feature | Status | Notes |
+|---------|--------|-------|
+| Token sealing/unsealing | ✅ | NaCl sealed boxes |
+| Header injection | ✅ | Bearer, Basic, raw |
+| HMAC signing | ✅ | SHA-256, SHA-512 |
+| OAuth token refresh | ✅ | Client credentials, refresh token |
+| Response scanning | ✅ | Streaming with overlap buffer |
+| Host validation | ✅ | Allowlist + regex patterns |
+| Body injection | ✅ | Placeholder replacement |
+| SigV4 signing | ✅ | Structure in place, needs AWS SDK |
+| SSRF protection | ✅ | Private network blocking |
+| CONNECT tunneling | ✅ | Transparent HTTPS proxy |
+
+### Remaining Work
+
+| Feature | Priority | Notes |
+|---------|----------|-------|
+| Full SigV4 implementation | Medium | Integrate `aws-sigv4` crate |
+| Streaming body injection | Low | Current impl buffers body |
+| TLS MITM for CONNECT | Low | Optional for full inspection |
+| Metrics/Prometheus | Medium | Add observability |
+| Graceful shutdown | Medium | Drain connections |

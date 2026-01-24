@@ -46,6 +46,7 @@ futures = { workspace = true }
 futures-util = { workspace = true }
 pin-project-lite = { workspace = true }
 regex = { workspace = true }
+ipnet = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

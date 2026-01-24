@@ -191,6 +191,79 @@ impl Default for LoggingConfig {
     }
 }
 
+/// Network protection configuration for SSRF prevention.
+///
+/// This configuration controls which IP addresses and networks the proxy
+/// is allowed to connect to. By default, private, loopback, and link-local
+/// addresses are blocked to prevent SSRF attacks.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkProtectionConfig {
+    /// Block private IP addresses (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16).
+    #[serde(default = "default_true")]
+    pub block_private: bool,
+
+    /// Block loopback addresses (127.0.0.0/8, ::1/128).
+    #[serde(default = "default_true")]
+    pub block_loopback: bool,
+
+    /// Block link-local addresses (169.254.0.0/16, fe80::/10).
+    #[serde(default = "default_true")]
+    pub block_link_local: bool,
+
+    /// Additional CIDR ranges to block.
+    #[serde(default)]
+    pub blocked_cidrs: Vec<String>,
+
+    /// Hostnames to block (for circular request prevention).
+    #[serde(default)]
+    pub blocked_hostnames: Vec<String>,
+
+    /// Allowed CIDR ranges that override blocking rules.
+    /// Useful for allowing specific internal services.
+    #[serde(default)]
+    pub allowed_cidrs: Vec<String>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for NetworkProtectionConfig {
+    fn default() -> Self {
+        Self {
+            block_private: true,
+            block_loopback: true,
+            block_link_local: true,
+            blocked_cidrs: Vec::new(),
+            blocked_hostnames: Vec::new(),
+            allowed_cidrs: Vec::new(),
+        }
+    }
+}
+
+impl NetworkProtectionConfig {
+    /// Creates a permissive configuration that allows all addresses.
+    ///
+    /// Use with caution - this disables SSRF protection.
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self {
+            block_private: false,
+            block_loopback: false,
+            block_link_local: false,
+            blocked_cidrs: Vec::new(),
+            blocked_hostnames: Vec::new(),
+            allowed_cidrs: Vec::new(),
+        }
+    }
+
+    /// Creates a strict configuration that blocks all private networks.
+    #[must_use]
+    pub fn strict() -> Self {
+        Self::default()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

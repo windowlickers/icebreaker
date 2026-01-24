@@ -136,14 +136,29 @@ impl RateLimiter {
         let now = Instant::now();
 
         // Calculate emission interval (time between requests)
-        let emission_interval = self.config.period / self.config.max_requests;
+        // Use checked_div to avoid panic on zero, falling back to zero duration
+        let emission_interval = self
+            .config
+            .period
+            .checked_div(self.config.max_requests)
+            .unwrap_or(Duration::ZERO);
 
         // Calculate burst tolerance (extra time allowed for bursts)
-        let burst_tolerance = emission_interval * self.config.burst;
+        // Use saturating_mul to avoid overflow panics
+        let burst_tolerance = emission_interval.saturating_mul(self.config.burst);
+
+        // Check if this is a new entry (first request for this key)
+        let is_new_entry = !state.contains_key(key);
 
         let entry = state
             .entry(key.to_string())
             .or_insert_with(|| GcraState { tat: now });
+
+        // For the first request to a key, always allow it
+        if is_new_entry {
+            entry.tat = now + emission_interval;
+            return true;
+        }
 
         // Calculate the new TAT
         let new_tat = if entry.tat < now {
@@ -187,11 +202,13 @@ mod tests {
         let config = RateLimitConfig {
             max_requests: 10,
             period: Duration::from_secs(1),
-            burst: 5,
+            // burst = max_requests allows max_requests instant requests
+            // (burst_tolerance = 10 * 100ms = 1s, which covers all 10 requests)
+            burst: 10,
         };
         let limiter = RateLimiter::new(config);
 
-        // Should allow initial requests
+        // Should allow initial burst of requests
         for _ in 0..10 {
             assert!(limiter.check("test-key").await);
         }
@@ -220,16 +237,18 @@ mod tests {
         let config = RateLimitConfig {
             max_requests: 2,
             period: Duration::from_secs(1),
-            burst: 1,
+            // burst = 3 allows 3 instant requests
+            // (burst_tolerance = 3 * 500ms = 1.5s, covering all 3 requests)
+            burst: 3,
         };
         let limiter = RateLimiter::new(config);
 
-        // Key 1 uses its limit
+        // Key 1 uses its burst capacity
         assert!(limiter.check("key1").await);
         assert!(limiter.check("key1").await);
         assert!(limiter.check("key1").await);
 
-        // Key 2 should still have its own limit
+        // Key 2 should still have its own separate limit
         assert!(limiter.check("key2").await);
         assert!(limiter.check("key2").await);
     }

@@ -177,8 +177,8 @@ mod tests {
         // Second chunk: "world"
         let chunk2 = Bytes::from("world");
         let searchable2 = buffer.process(&chunk2, false);
-        // Should be "llo" (overlap) + "world"
-        assert_eq!(&searchable2[..], b"lloworld");
+        // Should be "ello" (overlap, last 4 bytes of "hello") + "world"
+        assert_eq!(&searchable2[..], b"elloworld");
     }
 
     #[test]
@@ -190,8 +190,8 @@ mod tests {
 
         let chunk2 = Bytes::from("!");
         let searchable = buffer.process(&chunk2, true);
-        // Should include overlap + final chunk
-        assert_eq!(&searchable[..], b"llo!");
+        // Should include overlap (last 4 bytes of "hello" = "ello") + final chunk
+        assert_eq!(&searchable[..], b"ello!");
     }
 
     #[test]
