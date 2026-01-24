@@ -1,0 +1,52 @@
+[package]
+name = "icebreaker-proxy"
+description = "Tower middleware and proxy logic for the Icebreaker tokenizer proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+icebreaker-common = { path = "../icebreaker-common" }
+icebreaker-crypto = { path = "../icebreaker-crypto" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# HTTP
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+
+# Tower middleware
+tower = { workspace = true }
+tower-http = { workspace = true }
+tower-service = { workspace = true }
+
+# Secret management
+secrecy = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+# Utilities
+bytes = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+pin-project-lite = { workspace = true }
+regex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+wiremock = { workspace = true }

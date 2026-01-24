@@ -1,0 +1,26 @@
+[package]
+name = "icebreaker"
+description = "A stateless tokenizer proxy for secure secret injection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+audit-postgres = ["icebreaker-audit/postgres"]
+audit-sqlite = ["icebreaker-audit/sqlite"]
+
+[dependencies]
+icebreaker-common = { path = "../icebreaker-common" }
+icebreaker-crypto = { path = "../icebreaker-crypto" }
+icebreaker-proxy = { path = "../icebreaker-proxy" }
+icebreaker-audit = { path = "../icebreaker-audit" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+secrecy = { workspace = true }
