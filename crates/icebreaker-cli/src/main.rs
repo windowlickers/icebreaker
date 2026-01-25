@@ -3,25 +3,28 @@
 //! This binary provides the main entry point for running the Icebreaker proxy.
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use http::{Request, Response, Uri};
-use http_body_util::{combinators::BoxBody, BodyExt};
+use http::{Request, Response, StatusCode, Uri};
+use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
+use tokio::sync::watch;
 use tower::{Service, ServiceBuilder, ServiceExt};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use icebreaker_common::{InjectConfig, ProcessorConfig, ProxyConfig};
+use icebreaker_common::{HealthConfig, InjectConfig, ProcessorConfig, ProxyConfig, ShutdownConfig};
 use icebreaker_crypto::{KeyStore, Keypair, TokenCrypto, VersionedKeypair};
-use icebreaker_proxy::TokenInjectionLayer;
+use icebreaker_proxy::{MetricsLayer, TokenInjectionLayer};
 
 /// Icebreaker - A stateless tokenizer proxy
 #[derive(Parser)]
@@ -76,6 +79,30 @@ struct ServeArgs {
     /// Output logs as JSON
     #[arg(long, env = "ICEBREAKER_LOG_JSON")]
     log_json: bool,
+
+    /// Enable metrics endpoint
+    #[arg(long, env = "ICEBREAKER_METRICS_ENABLED")]
+    metrics_enabled: bool,
+
+    /// Port for metrics endpoint (Prometheus format)
+    #[arg(long, default_value = "9090", env = "ICEBREAKER_METRICS_PORT")]
+    metrics_port: u16,
+
+    /// Enable health endpoint
+    #[arg(long, default_value = "true", env = "ICEBREAKER_HEALTH_ENABLED")]
+    health_enabled: bool,
+
+    /// Port for health endpoint
+    #[arg(long, default_value = "9091", env = "ICEBREAKER_HEALTH_PORT")]
+    health_port: u16,
+
+    /// Graceful shutdown timeout in seconds
+    #[arg(long, default_value = "30", env = "ICEBREAKER_SHUTDOWN_TIMEOUT")]
+    shutdown_timeout: u64,
+
+    /// Delay before shutdown in seconds (for load balancer draining)
+    #[arg(long, default_value = "0", env = "ICEBREAKER_SHUTDOWN_DELAY")]
+    shutdown_delay: u64,
 }
 
 #[derive(Parser)]
@@ -143,6 +170,198 @@ type HttpClient = Client<
     hyper_util::client::legacy::connect::HttpConnector,
     BoxBody<Bytes, std::convert::Infallible>,
 >;
+
+/// Shared state for graceful shutdown coordination.
+#[derive(Debug)]
+struct ShutdownState {
+    /// Whether shutdown has been initiated.
+    is_shutting_down: AtomicBool,
+    /// Number of active connections.
+    active_connections: AtomicU64,
+}
+
+impl ShutdownState {
+    /// Creates a new shutdown state.
+    fn new() -> Self {
+        Self {
+            is_shutting_down: AtomicBool::new(false),
+            active_connections: AtomicU64::new(0),
+        }
+    }
+
+    /// Marks the server as shutting down.
+    fn initiate_shutdown(&self) {
+        self.is_shutting_down.store(true, Ordering::SeqCst);
+    }
+
+    /// Returns true if the server is shutting down.
+    fn is_shutting_down(&self) -> bool {
+        self.is_shutting_down.load(Ordering::SeqCst)
+    }
+
+    /// Increments the active connection count.
+    fn connection_started(&self) {
+        self.active_connections.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Decrements the active connection count.
+    fn connection_ended(&self) {
+        self.active_connections.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// Returns the number of active connections.
+    fn active_count(&self) -> u64 {
+        self.active_connections.load(Ordering::SeqCst)
+    }
+
+    /// Returns true if ready to accept traffic (not shutting down).
+    fn is_ready(&self) -> bool {
+        !self.is_shutting_down()
+    }
+
+    /// Returns true if the server is alive (always true once started).
+    fn is_alive(&self) -> bool {
+        true
+    }
+}
+
+/// Runs the health server on a separate port.
+async fn run_health_server(
+    health_config: HealthConfig,
+    shutdown_state: Arc<ShutdownState>,
+    mut shutdown_rx: watch::Receiver<bool>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !health_config.enabled {
+        return Ok(());
+    }
+
+    let addr: SocketAddr = format!("0.0.0.0:{}", health_config.port)
+        .parse()
+        .map_err(|e| format!("invalid health address: {e}"))?;
+
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|e| format!("failed to bind health server to {addr}: {e}"))?;
+
+    tracing::info!(
+        address = %addr,
+        liveness = %health_config.liveness_path,
+        readiness = %health_config.readiness_path,
+        "health server listening"
+    );
+
+    loop {
+        tokio::select! {
+            accept_result = listener.accept() => {
+                let (stream, _remote_addr) = match accept_result {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "health server: failed to accept connection");
+                        continue;
+                    }
+                };
+
+                let state = shutdown_state.clone();
+                let liveness_path = health_config.liveness_path.clone();
+                let readiness_path = health_config.readiness_path.clone();
+
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let state = state.clone();
+                        let liveness_path = liveness_path.clone();
+                        let readiness_path = readiness_path.clone();
+                        async move {
+                            let path = req.uri().path();
+                            let response: Response<Full<Bytes>> = if path == liveness_path {
+                                // Liveness: is the process running?
+                                if state.is_alive() {
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(Full::new(Bytes::from("OK")))
+                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("OK"))))
+                                } else {
+                                    Response::builder()
+                                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                                        .body(Full::new(Bytes::from("NOT OK")))
+                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("NOT OK"))))
+                                }
+                            } else if path == readiness_path {
+                                // Readiness: is the process ready to accept traffic?
+                                if state.is_ready() {
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .header("X-Active-Connections", state.active_count().to_string())
+                                        .body(Full::new(Bytes::from("READY")))
+                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("READY"))))
+                                } else {
+                                    Response::builder()
+                                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                                        .header("X-Active-Connections", state.active_count().to_string())
+                                        .body(Full::new(Bytes::from("NOT READY")))
+                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("NOT READY"))))
+                                }
+                            } else {
+                                Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::from("NOT FOUND")))
+                                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("NOT FOUND"))))
+                            };
+
+                            Ok::<_, std::convert::Infallible>(response)
+                        }
+                    });
+
+                    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+                        tracing::debug!(error = %e, "health server: connection error");
+                    }
+                });
+            }
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    tracing::debug!("health server: received shutdown signal");
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Waits for shutdown signals (SIGTERM or SIGINT).
+async fn wait_for_shutdown_signal() {
+    let ctrl_c = async {
+        tokio::signal::ctrl_c()
+            .await
+            .ok();
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut signal) => {
+                signal.recv().await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {
+            tracing::info!("received SIGINT (Ctrl+C)");
+        }
+        _ = terminate => {
+            tracing::info!("received SIGTERM");
+        }
+    }
+}
 
 /// The proxy service that forwards requests to upstream servers.
 #[derive(Clone)]
@@ -220,8 +439,9 @@ impl Service<Request<Incoming>> for ProxyService {
 
             // Build the outgoing request
             let (parts, body) = req.into_parts();
-            let boxed_body: BoxBody<Bytes, std::convert::Infallible> =
-                body.map_err(|_| -> std::convert::Infallible { unreachable!() }).boxed();
+            let boxed_body: BoxBody<Bytes, std::convert::Infallible> = body
+                .map_err(|_| -> std::convert::Infallible { unreachable!() })
+                .boxed();
 
             let mut outgoing = Request::from_parts(parts, boxed_body);
             *outgoing.uri_mut() = target_uri;
@@ -235,8 +455,9 @@ impl Service<Request<Incoming>> for ProxyService {
 
             // Convert the response body
             let (parts, body) = response.into_parts();
-            let boxed_body: BoxBody<Bytes, std::convert::Infallible> =
-                body.map_err(|_| -> std::convert::Infallible { unreachable!() }).boxed();
+            let boxed_body: BoxBody<Bytes, std::convert::Infallible> = body
+                .map_err(|_| -> std::convert::Infallible { unreachable!() })
+                .boxed();
 
             Ok(Response::from_parts(parts, boxed_body))
         })
@@ -260,6 +481,23 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             .init();
     }
 
+    // Initialize metrics exporter if enabled
+    if args.metrics_enabled {
+        let metrics_addr: SocketAddr = format!("0.0.0.0:{}", args.metrics_port)
+            .parse()
+            .map_err(|e| format!("invalid metrics address: {e}"))?;
+
+        PrometheusBuilder::new()
+            .with_http_listener(metrics_addr)
+            .install()
+            .map_err(|e| format!("failed to install metrics exporter: {e}"))?;
+
+        tracing::info!(
+            address = %metrics_addr,
+            "metrics endpoint enabled at /metrics"
+        );
+    }
+
     // Build runtime and run
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -274,18 +512,55 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let key_store = KeyStore::with_primary(versioned);
         let crypto = Arc::new(TokenCrypto::new(key_store));
 
-        // Build config
+        // Build health config
+        let health_config = HealthConfig {
+            enabled: args.health_enabled,
+            port: args.health_port,
+            ..Default::default()
+        };
+
+        // Build shutdown config
+        let shutdown_config = ShutdownConfig {
+            timeout: Duration::from_secs(args.shutdown_timeout),
+            delay: Duration::from_secs(args.shutdown_delay),
+        };
+
+        // Build proxy config
         let config = ProxyConfig::builder()
             .bind_address(&args.bind)
             .port(args.port)
             .timeout(Duration::from_secs(args.timeout))
+            .health(health_config.clone())
+            .shutdown(shutdown_config.clone())
             .build();
 
         tracing::info!(
             bind = %config.bind_addr(),
             key_id = %args.key_id,
+            health_enabled = %health_config.enabled,
+            health_port = %health_config.port,
+            shutdown_timeout = ?shutdown_config.timeout,
             "starting icebreaker proxy"
         );
+
+        // Create shared shutdown state
+        let shutdown_state = Arc::new(ShutdownState::new());
+
+        // Create shutdown signal channel
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        // Start health server if enabled
+        let health_state = shutdown_state.clone();
+        let health_handle = if health_config.enabled {
+            let health_rx = shutdown_rx.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = run_health_server(health_config, health_state, health_rx).await {
+                    tracing::error!(error = %e, "health server error");
+                }
+            }))
+        } else {
+            None
+        };
 
         // Parse address
         let addr: SocketAddr = config
@@ -294,80 +569,145 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|e| format!("invalid bind address: {e}"))?;
 
         // Create TCP listener
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            format!("failed to bind to {addr}: {e}")
-        })?;
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("failed to bind to {addr}: {e}"))?;
 
         tracing::info!(
             address = %addr,
             "proxy server listening"
         );
 
-        // Accept connections
-        loop {
-            tokio::select! {
-                accept_result = listener.accept() => {
-                    let (stream, remote_addr) = match accept_result {
-                        Ok(conn) => conn,
-                        Err(e) => {
-                            tracing::warn!(error = %e, "failed to accept connection");
-                            continue;
-                        }
-                    };
-
-                    let crypto = crypto.clone();
-
-                    tokio::spawn(async move {
-                        let io = TokioIo::new(stream);
-
-                        // Create the proxy service for this connection
-                        let proxy_service = ProxyService::new();
-
-                        // Build the middleware stack
-                        let service = ServiceBuilder::new()
-                            .layer(TraceLayer::new_for_http())
-                            .layer(TokenInjectionLayer::new(crypto))
-                            .service(proxy_service);
-
-                        // Create a service function that handles the request
-                        let service_fn = hyper::service::service_fn(move |req: Request<Incoming>| {
-                            let mut svc = service.clone();
-                            async move {
-                                match svc.ready().await {
-                                    Ok(ready_svc) => {
-                                        ready_svc.call(req).await.map_err(|e| {
-                                            tracing::error!(error = %e, "request failed");
-                                            // Convert to a proper error response
-                                            e
-                                        })
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(error = %e, "service not ready");
-                                        Err(e)
-                                    }
-                                }
-                            }
-                        });
-
-                        if let Err(e) = http1::Builder::new()
-                            .serve_connection(io, service_fn)
-                            .await
-                        {
-                            tracing::debug!(
-                                error = %e,
-                                remote_addr = %remote_addr,
-                                "connection error"
-                            );
-                        }
-                    });
-                }
-                _ = tokio::signal::ctrl_c() => {
-                    tracing::info!("shutting down");
+        // Accept connections until shutdown signal
+        let accept_state = shutdown_state.clone();
+        let accept_handle = tokio::spawn(async move {
+            loop {
+                // Check if we should stop accepting
+                if accept_state.is_shutting_down() {
                     break;
                 }
+
+                let accept_result = tokio::select! {
+                    result = listener.accept() => result,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => continue,
+                };
+
+                let (stream, remote_addr) = match accept_result {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        if !accept_state.is_shutting_down() {
+                            tracing::warn!(error = %e, "failed to accept connection");
+                        }
+                        continue;
+                    }
+                };
+
+                let crypto = crypto.clone();
+                let conn_state = accept_state.clone();
+
+                // Track connection
+                conn_state.connection_started();
+
+                tokio::spawn(async move {
+                    let io = TokioIo::new(stream);
+
+                    // Create the proxy service for this connection
+                    let proxy_service = ProxyService::new();
+
+                    // Build the middleware stack
+                    let service = ServiceBuilder::new()
+                        .layer(TraceLayer::new_for_http())
+                        .layer(MetricsLayer::new())
+                        .layer(TokenInjectionLayer::new(crypto))
+                        .service(proxy_service);
+
+                    // Create a service function that handles the request
+                    let service_fn = hyper::service::service_fn(move |req: Request<Incoming>| {
+                        let mut svc = service.clone();
+                        async move {
+                            match svc.ready().await {
+                                Ok(ready_svc) => {
+                                    ready_svc.call(req).await.map_err(|e| {
+                                        tracing::error!(error = %e, "request failed");
+                                        e
+                                    })
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = %e, "service not ready");
+                                    Err(e)
+                                }
+                            }
+                        }
+                    });
+
+                    if let Err(e) = http1::Builder::new()
+                        .serve_connection(io, service_fn)
+                        .await
+                    {
+                        tracing::debug!(
+                            error = %e,
+                            remote_addr = %remote_addr,
+                            "connection error"
+                        );
+                    }
+
+                    // Connection finished
+                    conn_state.connection_ended();
+                });
             }
+        });
+
+        // Wait for shutdown signal
+        wait_for_shutdown_signal().await;
+
+        tracing::info!("initiating graceful shutdown");
+
+        // Apply shutdown delay if configured (for load balancer draining)
+        if !shutdown_config.delay.is_zero() {
+            tracing::info!(delay = ?shutdown_config.delay, "waiting before shutdown");
+            tokio::time::sleep(shutdown_config.delay).await;
         }
 
+        // Mark as shutting down
+        shutdown_state.initiate_shutdown();
+
+        // Signal all components to shut down
+        let _ = shutdown_tx.send(true);
+
+        // Wait for active connections to drain
+        let drain_start = std::time::Instant::now();
+        loop {
+            let active = shutdown_state.active_count();
+            if active == 0 {
+                tracing::info!("all connections drained");
+                break;
+            }
+
+            if drain_start.elapsed() >= shutdown_config.timeout {
+                tracing::warn!(
+                    active_connections = active,
+                    "shutdown timeout reached, forcing exit"
+                );
+                break;
+            }
+
+            tracing::debug!(
+                active_connections = active,
+                elapsed = ?drain_start.elapsed(),
+                "waiting for connections to drain"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        // Cancel the accept loop
+        accept_handle.abort();
+
+        // Wait for health server to stop
+        if let Some(handle) = health_handle {
+            let _ = handle.await;
+        }
+
+        tracing::info!("shutdown complete");
         Ok::<_, Box<dyn std::error::Error>>(())
     })?;
 

@@ -59,6 +59,10 @@ sha2 = "0.10"
 rand = "0.8"
 subtle = "2.6"
 
+# AWS signing
+aws-sigv4 = { version = "1", features = ["sign-http"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+
 # Secret management
 secrecy = { version = "0.10", features = ["serde"] }
 zeroize = { version = "1.8", features = ["derive"] }
@@ -77,6 +81,10 @@ clap = { version = "4.5", features = ["derive", "env"] }
 # Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
 
 # Error handling
 thiserror = "2.0"

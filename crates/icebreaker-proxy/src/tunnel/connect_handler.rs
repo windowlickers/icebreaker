@@ -138,9 +138,10 @@ impl ConnectHandler {
         }
 
         // Return the first valid address
-        let addr = addrs.into_iter().next().ok_or_else(|| {
-            TokenizerError::HttpError(format!("no valid addresses for {host}"))
-        })?;
+        let addr = addrs
+            .into_iter()
+            .next()
+            .ok_or_else(|| TokenizerError::HttpError(format!("no valid addresses for {host}")))?;
 
         tracing::debug!(
             host = %host,
@@ -153,13 +154,10 @@ impl ConnectHandler {
 
     /// Establishes a TCP connection to the target.
     pub async fn connect_upstream(&self, addr: SocketAddr) -> Result<TcpStream> {
-        let stream = tokio::time::timeout(
-            self.config.connect_timeout,
-            TcpStream::connect(addr),
-        )
-        .await
-        .map_err(|_| TokenizerError::Timeout)?
-        .map_err(|e| TokenizerError::HttpError(format!("failed to connect: {e}")))?;
+        let stream = tokio::time::timeout(self.config.connect_timeout, TcpStream::connect(addr))
+            .await
+            .map_err(|_| TokenizerError::Timeout)?
+            .map_err(|e| TokenizerError::HttpError(format!("failed to connect: {e}")))?;
 
         tracing::debug!(
             addr = %addr,
@@ -184,13 +182,11 @@ impl ConnectHandler {
         let (mut client_read, mut client_write) = tokio::io::split(client);
         let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream);
 
-        let client_to_upstream = async {
-            tokio::io::copy(&mut client_read, &mut upstream_write).await
-        };
+        let client_to_upstream =
+            async { tokio::io::copy(&mut client_read, &mut upstream_write).await };
 
-        let upstream_to_client = async {
-            tokio::io::copy(&mut upstream_read, &mut client_write).await
-        };
+        let upstream_to_client =
+            async { tokio::io::copy(&mut upstream_read, &mut client_write).await };
 
         let result = tokio::select! {
             result = client_to_upstream => {
@@ -212,9 +208,7 @@ impl ConnectHandler {
         Response::builder()
             .status(StatusCode::OK)
             .body("Connection Established".to_string())
-            .unwrap_or_else(|_| {
-                Response::new("Connection Established".to_string())
-            })
+            .unwrap_or_else(|_| Response::new("Connection Established".to_string()))
     }
 
     /// Creates an error response for a CONNECT request.
@@ -339,8 +333,10 @@ mod tests {
     async fn test_resolve_and_validate_public_ip() {
         let handler = ConnectHandler::new(
             create_mock_crypto(),
-            Arc::new(IpFilter::new(&icebreaker_common::NetworkProtectionConfig::default())
-                .expect("valid config")),
+            Arc::new(
+                IpFilter::new(&icebreaker_common::NetworkProtectionConfig::default())
+                    .expect("valid config"),
+            ),
         );
 
         // Test with a public hostname (this makes a real DNS query)
@@ -357,8 +353,10 @@ mod tests {
     async fn test_resolve_and_validate_blocks_loopback() {
         let handler = ConnectHandler::new(
             create_mock_crypto(),
-            Arc::new(IpFilter::new(&icebreaker_common::NetworkProtectionConfig::default())
-                .expect("valid config")),
+            Arc::new(
+                IpFilter::new(&icebreaker_common::NetworkProtectionConfig::default())
+                    .expect("valid config"),
+            ),
         );
 
         // localhost should be blocked

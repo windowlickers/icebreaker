@@ -7,7 +7,13 @@
 //! Note: This implementation cannot provide SigV4's replay protection guarantees since
 //! the signature is computed at proxy time, not at the original request time.
 
-use http::Request;
+use std::time::SystemTime;
+
+use aws_credential_types::Credentials;
+use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+use aws_sigv4::sign::v4;
+use http::{HeaderValue, Request};
+use secrecy::ExposeSecret;
 
 use icebreaker_common::{Result, Sigv4Config, TokenPayload, TokenizerError};
 
@@ -58,6 +64,74 @@ impl Sigv4Processor {
 
         Some(headers_str.split(';').map(String::from).collect())
     }
+
+    /// Parses the X-Amz-Date header into a SystemTime.
+    ///
+    /// The header format is ISO 8601 basic format: `YYYYMMDDTHHMMSSZ`
+    fn parse_amz_date(amz_date: &str) -> Option<SystemTime> {
+        // Format: 20130524T000000Z
+        if amz_date.len() != 16 {
+            return None;
+        }
+
+        let year: i32 = amz_date[0..4].parse().ok()?;
+        let month: u32 = amz_date[4..6].parse().ok()?;
+        let day: u32 = amz_date[6..8].parse().ok()?;
+
+        if amz_date.as_bytes().get(8)? != &b'T' {
+            return None;
+        }
+
+        let hour: u32 = amz_date[9..11].parse().ok()?;
+        let min: u32 = amz_date[11..13].parse().ok()?;
+        let sec: u32 = amz_date[13..15].parse().ok()?;
+
+        if amz_date.as_bytes().get(15)? != &b'Z' {
+            return None;
+        }
+
+        // Convert to days since Unix epoch
+        // This is a simplified calculation that handles common cases
+        let days_since_epoch = days_from_date(year, month, day)?;
+        let seconds_in_day = u64::from(hour) * 3600 + u64::from(min) * 60 + u64::from(sec);
+        let total_seconds = days_since_epoch * 86400 + seconds_in_day;
+
+        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(total_seconds))
+    }
+}
+
+/// Calculates days since Unix epoch for a given date.
+fn days_from_date(year: i32, month: u32, day: u32) -> Option<u64> {
+    // Basic validation
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
+        return None;
+    }
+
+    // Days in each month (non-leap year)
+    let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+
+    // Calculate leap years
+    let is_leap = |y: i32| -> bool { (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0) };
+
+    let mut days: i64 = 0;
+
+    // Add days for complete years since 1970
+    for y in 1970..year {
+        days += if is_leap(y) { 366 } else { 365 };
+    }
+
+    // Add days for complete months in current year
+    for m in 1..month {
+        days += i64::from(days_in_month[(m - 1) as usize]);
+        if m == 2 && is_leap(year) {
+            days += 1;
+        }
+    }
+
+    // Add days in current month
+    days += i64::from(day - 1);
+
+    u64::try_from(days).ok()
 }
 
 /// Parsed credential scope from an AWS Authorization header.
@@ -72,7 +146,7 @@ pub struct CredentialScope {
 }
 
 impl RequestProcessor for Sigv4Processor {
-    fn process<B>(&self, mut request: Request<B>, _payload: &TokenPayload) -> Result<Request<B>> {
+    fn process<B>(&self, mut request: Request<B>, payload: &TokenPayload) -> Result<Request<B>> {
         // Extract the original Authorization header
         let auth_header = request
             .headers()
@@ -97,12 +171,12 @@ impl RequestProcessor for Sigv4Processor {
         })?;
 
         // Extract the signed headers
-        let _signed_headers = Self::extract_signed_headers(auth_header).ok_or_else(|| {
+        let signed_headers = Self::extract_signed_headers(auth_header).ok_or_else(|| {
             TokenizerError::InvalidPayload("Failed to parse signed headers".to_string())
         })?;
 
         // Get the timestamp from X-Amz-Date header
-        let _amz_date = request
+        let amz_date = request
             .headers()
             .get("x-amz-date")
             .and_then(|v| v.to_str().ok())
@@ -112,8 +186,13 @@ impl RequestProcessor for Sigv4Processor {
                 )
             })?;
 
-        // Get the content hash if present (for S3)
-        let _content_sha256 = request
+        // Parse the timestamp
+        let signing_time = Self::parse_amz_date(amz_date).ok_or_else(|| {
+            TokenizerError::InvalidPayload(format!("Failed to parse X-Amz-Date: {amz_date}"))
+        })?;
+
+        // Get the content hash if present (for S3, may be "UNSIGNED-PAYLOAD")
+        let content_sha256 = request
             .headers()
             .get("x-amz-content-sha256")
             .and_then(|v| v.to_str().ok())
@@ -127,23 +206,105 @@ impl RequestProcessor for Sigv4Processor {
             "SigV4 signing request"
         );
 
-        // Note: Full SigV4 signing implementation requires aws-sigv4 crate.
-        // This is a placeholder that demonstrates the structure.
-        // In a production implementation, you would:
-        // 1. Build the canonical request
-        // 2. Create the string to sign
-        // 3. Derive the signing key from the secret key
-        // 4. Create the signature
-        // 5. Build the new Authorization header
-
-        // For now, we strip the proxy-specific headers and log the signing parameters
-        // The actual signing implementation will be added when aws-sigv4 dependency is configured.
-
         // Remove proxy-specific headers that shouldn't be forwarded
         request.headers_mut().remove("x-tokenizer-token");
 
-        tracing::warn!(
-            "SigV4 signing is not yet fully implemented - request will be forwarded without re-signing"
+        // Create AWS credentials from the config and payload
+        let secret_key = payload.secret.expose_secret();
+        let credentials = Credentials::new(
+            &self.config.access_key,
+            secret_key,
+            None, // session token
+            None, // expiration
+            "icebreaker-sigv4",
+        );
+
+        // Build signing settings
+        let signing_settings = SigningSettings::default();
+
+        // Convert credentials to identity (must be bound to avoid temporary drop)
+        let identity = credentials.into();
+
+        // Build signing parameters
+        let signing_params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(&scope.region)
+            .name(&scope.service)
+            .time(signing_time)
+            .settings(signing_settings)
+            .build()
+            .map_err(|e| {
+                TokenizerError::SigningError(format!("Failed to build signing params: {e}"))
+            })?
+            .into();
+
+        // Collect headers for signing
+        let headers: Vec<(&str, &str)> = signed_headers
+            .iter()
+            .filter_map(|name| {
+                let name_lower = name.to_lowercase();
+                // Skip authorization header (we're replacing it) and x-amz-content-sha256
+                // (handled separately)
+                if name_lower == "authorization" {
+                    return None;
+                }
+                request
+                    .headers()
+                    .get(name.as_str())
+                    .and_then(|v| v.to_str().ok())
+                    .map(|v| (name.as_str(), v))
+            })
+            .collect();
+
+        // Determine the body for signing
+        // For streaming requests, AWS uses "UNSIGNED-PAYLOAD" or "STREAMING-AWS4-HMAC-SHA256-PAYLOAD"
+        let signable_body = match content_sha256.as_deref() {
+            Some("UNSIGNED-PAYLOAD") => SignableBody::UnsignedPayload,
+            Some("STREAMING-AWS4-HMAC-SHA256-PAYLOAD") => {
+                SignableBody::StreamingUnsignedPayloadTrailer
+            }
+            Some(hash) => SignableBody::Precomputed(hash.to_string()),
+            None => {
+                // For non-S3 services without a content hash header, use unsigned payload
+                // since we don't have access to the body content at this point
+                SignableBody::UnsignedPayload
+            }
+        };
+
+        // Get the URI string from the request
+        let uri = request.uri().to_string();
+        let method = request.method().as_str();
+
+        // Create a signable request
+        let signable_request =
+            SignableRequest::new(method, &uri, headers.into_iter(), signable_body).map_err(
+                |e| TokenizerError::SigningError(format!("Failed to create signable request: {e}")),
+            )?;
+
+        // Sign the request
+        let (signing_instructions, _signature) = sign(signable_request, &signing_params)
+            .map_err(|e| TokenizerError::SigningError(format!("Failed to sign request: {e}")))?
+            .into_parts();
+
+        // Apply the signature to the request headers
+        // Remove the old authorization header first
+        request.headers_mut().remove("authorization");
+
+        // Apply the new headers from signing instructions
+        for (name, value) in signing_instructions.headers() {
+            let header_name = http::header::HeaderName::try_from(name).map_err(|e| {
+                TokenizerError::SigningError(format!("Invalid header name from signing: {e}"))
+            })?;
+            let header_value = HeaderValue::from_str(value).map_err(|e| {
+                TokenizerError::SigningError(format!("Invalid header value from signing: {e}"))
+            })?;
+            request.headers_mut().insert(header_name, header_value);
+        }
+
+        tracing::debug!(
+            region = %scope.region,
+            service = %scope.service,
+            "SigV4 request signed successfully"
         );
 
         Ok(request)
@@ -182,6 +343,43 @@ mod tests {
         let headers = Sigv4Processor::extract_signed_headers(auth).expect("should parse");
 
         assert_eq!(headers, vec!["host", "range", "x-amz-date"]);
+    }
+
+    #[test]
+    fn test_parse_amz_date_valid() {
+        // Test valid date parsing
+        let time = Sigv4Processor::parse_amz_date("20130524T000000Z").expect("should parse");
+
+        // Verify it's a valid SystemTime (doesn't panic)
+        let _duration = time
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("time should be after epoch");
+    }
+
+    #[test]
+    fn test_parse_amz_date_invalid_format() {
+        // Invalid formats should return None
+        assert!(Sigv4Processor::parse_amz_date("2013-05-24T00:00:00Z").is_none());
+        assert!(Sigv4Processor::parse_amz_date("20130524000000Z").is_none());
+        assert!(Sigv4Processor::parse_amz_date("2013052").is_none());
+        assert!(Sigv4Processor::parse_amz_date("").is_none());
+    }
+
+    #[test]
+    fn test_days_from_date() {
+        // Unix epoch
+        assert_eq!(days_from_date(1970, 1, 1), Some(0));
+
+        // One day after
+        assert_eq!(days_from_date(1970, 1, 2), Some(1));
+
+        // Year boundary
+        assert_eq!(days_from_date(1971, 1, 1), Some(365));
+
+        // Invalid dates
+        assert!(days_from_date(1969, 1, 1).is_none());
+        assert!(days_from_date(1970, 13, 1).is_none());
+        assert!(days_from_date(1970, 0, 1).is_none());
     }
 
     #[test]
@@ -243,9 +441,138 @@ mod tests {
             .body(())
             .expect("request should build");
 
-        let processed = processor.process(request, &payload).expect("should process");
+        let processed = processor
+            .process(request, &payload)
+            .expect("should process");
 
         // Verify proxy header was removed
         assert!(processed.headers().get("x-tokenizer-token").is_none());
+    }
+
+    #[test]
+    fn test_sigv4_request_gets_new_authorization_header() {
+        let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
+        let payload = create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+
+        let original_auth = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc";
+
+        let request = Request::builder()
+            .uri("https://s3.amazonaws.com/bucket/key")
+            .header("host", "s3.amazonaws.com")
+            .header("authorization", original_auth)
+            .header("x-amz-date", "20130524T000000Z")
+            .body(())
+            .expect("request should build");
+
+        let processed = processor
+            .process(request, &payload)
+            .expect("should process");
+
+        // Verify we have a new authorization header
+        let new_auth = processed
+            .headers()
+            .get("authorization")
+            .expect("should have authorization header")
+            .to_str()
+            .expect("should be valid string");
+
+        // Verify the new auth header is a valid SigV4 format
+        assert!(new_auth.starts_with("AWS4-HMAC-SHA256"));
+        assert!(new_auth.contains("Credential=AKIAIOSFODNN7EXAMPLE"));
+        assert!(new_auth.contains("Signature="));
+
+        // The signature should be different (because it's a real signature now)
+        assert!(!new_auth.contains("Signature=abc"));
+    }
+
+    #[test]
+    fn test_sigv4_with_unsigned_payload() {
+        let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
+        let payload = create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+
+        let request = Request::builder()
+            .uri("https://s3.amazonaws.com/bucket/key")
+            .header("host", "s3.amazonaws.com")
+            .header("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=abc")
+            .header("x-amz-date", "20130524T000000Z")
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .body(())
+            .expect("request should build");
+
+        let processed = processor
+            .process(request, &payload)
+            .expect("should process");
+
+        // Verify we got a signed response
+        let auth = processed
+            .headers()
+            .get("authorization")
+            .expect("should have authorization header");
+        assert!(auth
+            .to_str()
+            .expect("valid str")
+            .starts_with("AWS4-HMAC-SHA256"));
+    }
+
+    #[test]
+    fn test_sigv4_with_precomputed_hash() {
+        let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
+        let payload = create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+
+        // SHA256 of empty body
+        let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+        let request = Request::builder()
+            .uri("https://s3.amazonaws.com/bucket/key")
+            .header("host", "s3.amazonaws.com")
+            .header("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature=abc")
+            .header("x-amz-date", "20130524T000000Z")
+            .header("x-amz-content-sha256", empty_hash)
+            .body(())
+            .expect("request should build");
+
+        let processed = processor
+            .process(request, &payload)
+            .expect("should process");
+
+        // Verify we got a signed response
+        let auth = processed
+            .headers()
+            .get("authorization")
+            .expect("should have authorization header");
+        assert!(auth
+            .to_str()
+            .expect("valid str")
+            .starts_with("AWS4-HMAC-SHA256"));
+    }
+
+    #[test]
+    fn test_sigv4_different_services() {
+        let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
+        let payload = create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+
+        // Test with DynamoDB
+        let request = Request::builder()
+            .uri("https://dynamodb.us-west-2.amazonaws.com/")
+            .header("host", "dynamodb.us-west-2.amazonaws.com")
+            .header("authorization", "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-west-2/dynamodb/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc")
+            .header("x-amz-date", "20130524T000000Z")
+            .body(())
+            .expect("request should build");
+
+        let processed = processor
+            .process(request, &payload)
+            .expect("should process");
+
+        // Verify the new signature is for us-west-2/dynamodb
+        let auth = processed
+            .headers()
+            .get("authorization")
+            .expect("should have authorization header")
+            .to_str()
+            .expect("should be valid string");
+
+        assert!(auth.contains("us-west-2"));
+        assert!(auth.contains("dynamodb"));
     }
 }

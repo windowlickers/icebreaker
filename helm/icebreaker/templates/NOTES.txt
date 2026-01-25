@@ -1,0 +1,57 @@
+Icebreaker has been deployed!
+
+1. Get the proxy URL:
+{{- if .Values.ingress.enabled }}
+{{- range $host := .Values.ingress.hosts }}
+  {{- range .paths }}
+  http{{ if $.Values.ingress.tls }}s{{ end }}://{{ $host.host }}{{ .path }}
+  {{- end }}
+{{- end }}
+{{- else if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Release.Namespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "icebreaker.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Release.Namespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo http://$NODE_IP:$NODE_PORT
+{{- else if contains "LoadBalancer" .Values.service.type }}
+     NOTE: It may take a few minutes for the LoadBalancer IP to be available.
+           You can watch its status by running:
+           kubectl get --namespace {{ .Release.Namespace }} svc -w {{ include "icebreaker.fullname" . }}
+  export SERVICE_IP=$(kubectl get svc --namespace {{ .Release.Namespace }} {{ include "icebreaker.fullname" . }} --template "{{"{{ range (index .status.loadBalancer.ingress 0) }}{{.}}{{ end }}"}}")
+  echo http://$SERVICE_IP:{{ .Values.service.port }}
+{{- else if contains "ClusterIP" .Values.service.type }}
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "icebreaker.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  echo "Proxy available at: http://127.0.0.1:{{ .Values.service.port }}"
+{{- end }}
+
+{{- if .Values.icebreaker.metrics.enabled }}
+
+2. Access metrics:
+{{- if .Values.metricsService.enabled }}
+  kubectl --namespace {{ .Release.Namespace }} port-forward svc/{{ include "icebreaker.fullname" . }}-metrics {{ .Values.metricsService.port }}:{{ .Values.metricsService.port }}
+  echo "Metrics available at: http://127.0.0.1:{{ .Values.metricsService.port }}/metrics"
+{{- end }}
+{{- end }}
+
+3. Create a sealed token:
+   # First, generate a keypair (save the public key)
+   icebreaker keygen --format base64
+
+   # Create a token for your API
+   icebreaker seal \
+     --secret "your-api-key" \
+     --allowed-hosts "api.example.com" \
+     --public-key "$PUBLIC_KEY"
+
+4. Use the token with your requests:
+   curl -X POST https://{{ include "icebreaker.fullname" . }}/api/endpoint \
+     -H "X-Tokenizer-Token: <your-sealed-token>" \
+     -H "Content-Type: application/json" \
+     -d '{"key": "value"}'
+
+{{- if not .Values.icebreaker.existingSecret }}
+{{- if not .Values.icebreaker.secretKey }}
+
+WARNING: No secret key was provided!
+         Please set icebreaker.secretKey or icebreaker.existingSecret in your values.
+         Generate a key with: icebreaker keygen --format base64
+{{- end }}
+{{- end }}

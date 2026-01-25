@@ -11,6 +11,9 @@ use tower::{Layer, Service};
 use icebreaker_common::{SealedToken, TokenizerError};
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 
+use crate::metrics::{
+    record_host_rejection, record_processor_used, record_token_validation, TokenValidationResult,
+};
 use crate::processor::create_processor;
 
 /// The header name for the sealed token.
@@ -77,29 +80,69 @@ where
 
         Box::pin(async move {
             // Extract the token header
-            let token_header = request
-                .headers()
-                .get(TOKEN_HEADER)
-                .ok_or_else(|| TokenizerError::InvalidPayload("missing token header".to_string()))?
-                .to_str()
-                .map_err(|e| {
-                    TokenizerError::InvalidPayload(format!("invalid token header: {e}"))
-                })?;
+            let token_header = match request.headers().get(TOKEN_HEADER) {
+                Some(header) => match header.to_str() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        record_token_validation(TokenValidationResult::Invalid);
+                        return Err(TokenizerError::InvalidPayload(format!(
+                            "invalid token header: {e}"
+                        )));
+                    }
+                },
+                None => {
+                    record_token_validation(TokenValidationResult::Missing);
+                    return Err(TokenizerError::InvalidPayload(
+                        "missing token header".to_string(),
+                    ));
+                }
+            };
 
             // Parse the sealed token
-            let sealed_token = SealedToken::from_header(token_header)?;
+            let sealed_token = match SealedToken::from_header(token_header) {
+                Ok(token) => token,
+                Err(e) => {
+                    record_token_validation(TokenValidationResult::Invalid);
+                    return Err(e);
+                }
+            };
 
             // Decrypt the token
-            let payload = crypto.unseal(&sealed_token)?;
+            let payload = match crypto.unseal(&sealed_token) {
+                Ok(p) => p,
+                Err(e) => {
+                    // Distinguish between decryption failure and expiration
+                    let result = if matches!(e, TokenizerError::TokenExpired) {
+                        TokenValidationResult::Expired
+                    } else {
+                        TokenValidationResult::DecryptionFailed
+                    };
+                    record_token_validation(result);
+                    return Err(e);
+                }
+            };
 
             // Validate client authentication
             let tls_info = request.extensions().get::<TlsConnectionInfo>();
-            validate_auth(&payload.auth, &request, tls_info)?;
+            if let Err(e) = validate_auth(&payload.auth, &request, tls_info) {
+                record_token_validation(TokenValidationResult::Invalid);
+                return Err(e);
+            }
 
             // Validate the target host
             if let Some(host) = request.uri().host() {
-                payload.validate_host(host)?;
+                if let Err(e) = payload.validate_host(host) {
+                    record_token_validation(TokenValidationResult::Success);
+                    record_host_rejection(host);
+                    return Err(e);
+                }
             }
+
+            // Token validation successful
+            record_token_validation(TokenValidationResult::Success);
+
+            // Record processor type metric
+            record_processor_used(payload.processor.processor_type());
 
             // Remove the token header before forwarding
             request.headers_mut().remove(TOKEN_HEADER);

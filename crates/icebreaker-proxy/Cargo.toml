@@ -39,6 +39,7 @@ base64 = { workspace = true }
 
 # Observability
 tracing = { workspace = true }
+metrics = { workspace = true }
 
 # Utilities
 bytes = { workspace = true }
@@ -47,6 +48,10 @@ futures-util = { workspace = true }
 pin-project-lite = { workspace = true }
 regex = { workspace = true }
 ipnet = { workspace = true }
+
+# AWS signing
+aws-sigv4 = { workspace = true }
+aws-credential-types = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

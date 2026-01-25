@@ -74,6 +74,10 @@ pub enum TokenizerError {
     #[error("oauth refresh failed: {0}")]
     OAuthRefreshError(String),
 
+    /// Request signing failed.
+    #[error("signing error: {0}")]
+    SigningError(String),
+
     /// Configuration error.
     #[error("configuration error: {0}")]
     ConfigError(String),

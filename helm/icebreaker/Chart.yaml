@@ -1,0 +1,18 @@
+apiVersion: v2
+name: icebreaker
+description: A stateless tokenizer proxy for secure API credential injection
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - proxy
+  - tokenizer
+  - security
+  - api-gateway
+  - secrets
+home: https://github.com/windowlickers/icebreaker
+sources:
+  - https://github.com/windowlickers/icebreaker
+maintainers:
+  - name: Evan Dobry
+    email: evandobry@gmail.com

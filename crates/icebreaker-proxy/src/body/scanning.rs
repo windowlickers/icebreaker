@@ -12,15 +12,7 @@ use pin_project_lite::pin_project;
 use icebreaker_common::TokenizerError;
 
 use super::StreamScanner;
-
-/// The result of scanning a chunk.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ScanResult {
-    /// No secret detected.
-    Clean,
-    /// A secret was detected.
-    SecretDetected,
-}
+use crate::metrics::record_secret_leak_detected;
 
 pin_project! {
     /// A body wrapper that scans response chunks for secret leaks.
@@ -96,6 +88,7 @@ where
                     let is_last = false; // We don't know if it's the last until we get None
                     if this.scanner.scan_chunk(data, is_last) {
                         *this.detected = true;
+                        record_secret_leak_detected();
                         tracing::warn!("secret leak detected in response body");
                         return Poll::Ready(Some(Err(Box::new(
                             TokenizerError::SecretLeakDetected,
@@ -110,6 +103,7 @@ where
                 // Final scan with empty chunk to flush any remaining overlap
                 if this.scanner.scan_chunk(&Bytes::new(), true) {
                     *this.detected = true;
+                    record_secret_leak_detected();
                     tracing::warn!("secret leak detected in final response scan");
                     return Poll::Ready(Some(Err(Box::new(TokenizerError::SecretLeakDetected))));
                 }

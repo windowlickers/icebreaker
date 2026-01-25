@@ -280,11 +280,12 @@ fn validate_mtls(
     })?;
 
     // Check certificate fingerprint
-    let cert_fingerprint = tls.cert_fingerprint.as_ref().ok_or_else(|| {
-        TokenizerError::ProxyAuthRequired {
-            reason: "client certificate fingerprint not available".into(),
-        }
-    })?;
+    let cert_fingerprint =
+        tls.cert_fingerprint
+            .as_ref()
+            .ok_or_else(|| TokenizerError::ProxyAuthRequired {
+                reason: "client certificate fingerprint not available".into(),
+            })?;
 
     if !constant_time_eq(
         cert_fingerprint.as_bytes(),
@@ -298,11 +299,12 @@ fn validate_mtls(
 
     // Check subject pattern if configured
     if let Some(ref pattern) = config.subject_pattern {
-        let subject_dn = tls.subject_dn.as_ref().ok_or_else(|| {
-            TokenizerError::ProxyAuthRequired {
-                reason: "client certificate subject DN not available".into(),
-            }
-        })?;
+        let subject_dn =
+            tls.subject_dn
+                .as_ref()
+                .ok_or_else(|| TokenizerError::ProxyAuthRequired {
+                    reason: "client certificate subject DN not available".into(),
+                })?;
 
         // Simple substring match for now - could use regex for more complex patterns
         if !subject_dn.contains(pattern) {

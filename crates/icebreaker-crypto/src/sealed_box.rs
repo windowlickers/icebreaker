@@ -1,6 +1,9 @@
 //! NaCl sealed box operations for token encryption/decryption.
 
-use crypto_box::{aead::{Aead, AeadCore}, ChaChaBox, PublicKey};
+use crypto_box::{
+    aead::{Aead, AeadCore},
+    ChaChaBox, PublicKey,
+};
 use rand::rngs::OsRng;
 
 use icebreaker_common::{Result, SealedToken, TokenPayload, TokenizerError};

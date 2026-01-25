@@ -3,7 +3,6 @@
 use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use futures::StreamExt;
-use http_body::Body;
 use http_body_util::BodyExt;
 
 use icebreaker_bench::{generate_random_bytes, CHUNK_SIZES, PATTERN_SIZES};
@@ -234,9 +233,6 @@ fn bench_scanning_body(c: &mut Criterion) {
     let mut group = c.benchmark_group("scanning_body");
 
     for size in body_sizes {
-        let data = generate_random_bytes(size);
-        let body = http_body_util::Full::new(Bytes::from(data));
-
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(
             BenchmarkId::from_parameter(size),
@@ -267,7 +263,6 @@ fn bench_scanning_body_chunked(c: &mut Criterion) {
     let patterns = vec![b"secret_value".to_vec()];
     let chunk_count = 16;
     let chunk_size = 4096;
-    let total_size = chunk_count * chunk_size;
 
     c.bench_function("scanning_body_chunked_16x4kb", |b| {
         b.iter(|| {

@@ -6,13 +6,17 @@ A stateless tokenizer proxy following the Fly.io architecture pattern. Icebreake
 
 ```
 icebreaker/
-├── Cargo.toml                                  # Workspace root with neuromance-style lints
+├── Cargo.toml                                  # Workspace root with strict lints
+├── Dockerfile                                  # Multi-stage Nix + distroless build
+├── deploy/
+│   └── helm/icebreaker/                        # Helm chart for Kubernetes
 └── crates/
     ├── icebreaker/                             # Re-export facade crate
     ├── icebreaker-common/                      # Core types, errors, configuration
     ├── icebreaker-crypto/                      # NaCl sealed boxes, HKDF, HMAC
     ├── icebreaker-proxy/                       # Tower middleware, proxy logic
     ├── icebreaker-audit/                       # Optional SQLx audit logging
+    ├── icebreaker-bench/                       # Criterion benchmarks
     └── icebreaker-cli/                         # CLI binary
 ```
 
@@ -24,8 +28,8 @@ Core types shared across all crates.
 
 | File | Purpose |
 |------|---------|
-| `src/error.rs` | `TokenizerError` enum with `is_retryable()`, `is_client_error()`, `is_security_error()` |
-| `src/config.rs` | `ProxyConfig`, `RateLimitConfig`, `TlsConfig`, `NetworkProtectionConfig` |
+| `src/error.rs` | `TokenizerError` enum (includes `SigningError`, `BlockedAddress`) with `is_retryable()`, `is_client_error()`, `is_security_error()` |
+| `src/config.rs` | `ProxyConfig`, `RateLimitConfig`, `TlsConfig`, `NetworkProtectionConfig`, `HealthConfig`, `ShutdownConfig` |
 | `src/token.rs` | `SealedToken`, `TokenPayload` with `secrecy`/`zeroize` protection |
 | `src/processor.rs` | `ProcessorConfig` enum: `Inject`, `InjectHmac`, `OAuth`, `InjectBody`, `Sigv4` |
 | `src/auth.rs` | `AuthConfig` types: `None`, `ApiKey`, `MutualTls` |
@@ -60,6 +64,8 @@ Tower middleware stack for request/response transformation.
 | `src/processor/sigv4.rs` | `Sigv4Processor` - AWS Signature Version 4 re-signing |
 | `src/network/ip_filter.rs` | `IpFilter` - SSRF prevention via IP address filtering |
 | `src/tunnel/connect_handler.rs` | `ConnectHandler` - HTTP CONNECT tunneling support |
+| `src/metrics/mod.rs` | Prometheus metric definitions and recording functions |
+| `src/middleware/metrics.rs` | `MetricsLayer` - Tower middleware for request metrics |
 
 ### icebreaker-audit
 
@@ -144,12 +150,23 @@ let config = InjectBodyConfig::new("__SECRET__");
 
 ### Sigv4 Processor
 
-Re-signs AWS API requests with credentials from the sealed token. Extracts service, region, and timestamp from the incoming `Authorization` header.
+Re-signs AWS API requests with credentials from the sealed token. Uses the `aws-sigv4` crate for standards-compliant signature generation.
 
 ```rust
+// Access key in config, secret key in token payload
 let config = Sigv4Config::new("AKIAIOSFODNN7EXAMPLE");
-// Secret key provided in TokenPayload
 ```
+
+**How it works:**
+1. Parses incoming `Authorization` header to extract region, service, and signed headers
+2. Extracts timestamp from `X-Amz-Date` header
+3. Creates new signature using `aws-sigv4` with credentials from token
+4. Replaces the `Authorization` header with newly computed signature
+
+**Supported body types:**
+- `UNSIGNED-PAYLOAD` - For requests where body signing is not required
+- `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` - For streaming uploads
+- Precomputed SHA-256 hash - For requests with `x-amz-content-sha256` header
 
 **Note**: Cannot provide SigV4's replay protection guarantees since re-signing happens at proxy time.
 
@@ -242,6 +259,44 @@ unimplemented = "deny"
 dbg_macro = "deny"
 ```
 
+## Metrics (Prometheus)
+
+Icebreaker exposes Prometheus-format metrics when enabled with `--metrics-enabled`.
+
+### Available Metrics
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `icebreaker_requests_total` | Counter | method, status, processor | Total HTTP requests |
+| `icebreaker_request_duration_seconds` | Histogram | - | Request latency |
+| `icebreaker_token_validations_total` | Counter | result | Token validation (success/expired/invalid/missing) |
+| `icebreaker_host_rejections_total` | Counter | host | Host validation failures |
+| `icebreaker_secret_leaks_detected_total` | Counter | - | Response leak detections |
+| `icebreaker_blocked_addresses_total` | Counter | reason | SSRF prevention blocks |
+| `icebreaker_processor_invocations_total` | Counter | type | Processor type usage |
+
+### Enabling Metrics
+
+```bash
+# Start proxy with metrics on port 9090
+icebreaker serve --metrics-enabled --metrics-port 9090
+
+# Metrics endpoint
+curl http://localhost:9090/metrics
+```
+
+### Recording Metrics in Code
+
+```rust
+use icebreaker_proxy::metrics::{record_request, record_token_validation, TokenValidationResult};
+
+// Record a request
+record_request("POST", 200, Some("sigv4"));
+
+// Record token validation
+record_token_validation(TokenValidationResult::Success);
+```
+
 ## Dependencies
 
 | Crate | Purpose |
@@ -252,6 +307,10 @@ dbg_macro = "deny"
 | `hyper` | HTTP server/client |
 | `sqlx` | Database (optional, via feature flags) |
 | `ipnet` | IP network parsing for SSRF protection |
+| `aws-sigv4` | AWS Signature Version 4 request signing |
+| `aws-credential-types` | AWS credential handling for SigV4 |
+| `metrics` | Metrics recording facade |
+| `metrics-exporter-prometheus` | Prometheus HTTP exporter |
 
 ## Environment Variables
 
@@ -264,6 +323,57 @@ dbg_macro = "deny"
 | `ICEBREAKER_TIMEOUT` | Request timeout (seconds) | `30` |
 | `ICEBREAKER_LOG_LEVEL` | Log level | `info` |
 | `ICEBREAKER_LOG_JSON` | JSON log output | `false` |
+| `ICEBREAKER_HEALTH_ENABLED` | Enable health endpoint | `true` |
+| `ICEBREAKER_HEALTH_PORT` | Health endpoint port | `9091` |
+| `ICEBREAKER_SHUTDOWN_TIMEOUT` | Graceful shutdown timeout (seconds) | `30` |
+| `ICEBREAKER_SHUTDOWN_DELAY` | Delay before shutdown (seconds) | `0` |
+
+## Health Endpoints
+
+Icebreaker provides health endpoints for Kubernetes liveness and readiness probes:
+
+| Endpoint | Purpose | Success | Failure |
+|----------|---------|---------|---------|
+| `/healthz` | Liveness probe | `200 OK` if process is running | `503` if unhealthy |
+| `/readyz` | Readiness probe | `200 READY` if accepting traffic | `503 NOT READY` during shutdown |
+
+The readiness probe also returns an `X-Active-Connections` header with the current connection count.
+
+### Health Configuration
+
+```bash
+# Enable health endpoint (default: enabled)
+icebreaker serve --health-enabled --health-port 9091
+```
+
+## Graceful Shutdown
+
+Icebreaker supports graceful shutdown with connection draining:
+
+1. **Signal Handling**: Responds to SIGTERM (Kubernetes) and SIGINT (Ctrl+C)
+2. **Shutdown Delay**: Optional delay before marking as not ready (for load balancer draining)
+3. **Connection Draining**: Waits for active connections to complete (up to timeout)
+4. **Readiness Update**: Health endpoint returns `503 NOT READY` during shutdown
+
+### Shutdown Flow
+
+```
+1. Shutdown signal received (SIGTERM/SIGINT)
+2. Wait for shutdown delay (if configured)
+3. Mark as shutting down (readiness returns 503)
+4. Stop accepting new connections
+5. Wait for active connections to drain (up to timeout)
+6. Exit cleanly
+```
+
+### Configuration
+
+```bash
+# Configure shutdown behavior
+icebreaker serve \
+  --shutdown-timeout 30 \  # Wait up to 30s for connections to drain
+  --shutdown-delay 5       # Wait 5s before starting shutdown
+```
 
 ## Usage Examples
 
@@ -301,21 +411,86 @@ curl -X POST https://proxy.example.com/v1/charges \
   -d '{"amount": 1000, "currency": "usd"}'
 ```
 
-## Testing
+## Docker & Kubernetes
 
-The project uses a Nix flake with direnv (`.envrc`), so the development environment loads automatically.
+### Building the Docker Image
 
 ```bash
-# Run all tests
+# Build using Nix (produces distroless image)
+docker build -t icebreaker:latest .
+
+# Run locally
+docker run -p 8080:8080 -p 9090:9090 \
+  -e ICEBREAKER_SECRET_KEY="<your-base64-key>" \
+  icebreaker:latest
+```
+
+### Helm Chart
+
+The Helm chart is located at `deploy/helm/icebreaker/`.
+
+```bash
+# Install with inline secret (not recommended for production)
+helm install icebreaker deploy/helm/icebreaker \
+  --set icebreaker.secretKey="<your-base64-key>"
+
+# Install with existing Kubernetes secret (recommended)
+helm install icebreaker deploy/helm/icebreaker \
+  --set icebreaker.existingSecret="my-icebreaker-secret" \
+  --set icebreaker.existingSecretKey="secret-key"
+
+# Enable autoscaling
+helm install icebreaker deploy/helm/icebreaker \
+  --set autoscaling.enabled=true \
+  --set autoscaling.minReplicas=2 \
+  --set autoscaling.maxReplicas=10
+
+# Enable Prometheus ServiceMonitor
+helm install icebreaker deploy/helm/icebreaker \
+  --set serviceMonitor.enabled=true
+```
+
+### Helm Values
+
+| Value | Description | Default |
+|-------|-------------|---------|
+| `replicaCount` | Number of replicas | `2` |
+| `icebreaker.port` | Proxy port | `8080` |
+| `icebreaker.metrics.enabled` | Enable metrics | `true` |
+| `icebreaker.metrics.port` | Metrics port | `9090` |
+| `icebreaker.secretKey` | Base64 secret key | `""` |
+| `icebreaker.existingSecret` | Use existing secret | `""` |
+| `autoscaling.enabled` | Enable HPA | `false` |
+| `serviceMonitor.enabled` | Prometheus ServiceMonitor | `false` |
+
+## Development Environment
+
+The project uses a Nix flake with direnv (`.envrc`). The development environment loads automatically when entering the directory.
+
+If direnv is not configured, use `nix develop` to enter the shell:
+
+```bash
+# Enter nix shell (if direnv not available)
+nix develop
+
+# Or prefix commands with nix develop -c
+nix develop -c cargo test --workspace
+```
+
+## Testing
+
+```bash
+# Run all tests (155+ tests)
 cargo test --workspace
 
 # Run tests for a specific crate
 cargo test -p icebreaker-crypto
+cargo test -p icebreaker-proxy
 
 # Run tests for specific modules
 cargo test -p icebreaker-proxy -- network::ip_filter
-cargo test -p icebreaker-proxy -- inject_body
-cargo test -p icebreaker-proxy -- sigv4
+cargo test -p icebreaker-proxy -- processor::inject_body
+cargo test -p icebreaker-proxy -- processor::sigv4
 cargo test -p icebreaker-proxy -- tunnel
 
 # Run with logging
@@ -326,6 +501,9 @@ cargo build --workspace
 
 # Run clippy
 cargo clippy --workspace
+
+# Run benchmarks
+cargo bench -p icebreaker-bench
 ```
 
 ## Security Considerations
@@ -348,6 +526,34 @@ cargo clippy --workspace
 - **Extensible Processors**: Easy to add new injection strategies
 - **CONNECT Support**: Transparent tunneling for HTTPS connections
 
+## Adding New Processors
+
+To add a new processor type:
+
+1. **Define config** in `icebreaker-common/src/processor.rs`:
+   ```rust
+   pub struct MyProcessorConfig { /* fields */ }
+   ```
+
+2. **Add variant** to `ProcessorConfig` enum:
+   ```rust
+   pub enum ProcessorConfig {
+       // ...existing variants...
+       MyProcessor(MyProcessorConfig),
+   }
+   ```
+
+3. **Implement processor** in `icebreaker-proxy/src/processor/`:
+   ```rust
+   impl RequestProcessor for MyProcessor {
+       fn process<B>(&self, request: Request<B>, payload: &TokenPayload) -> Result<Request<B>> {
+           // Transform request using payload.secret
+       }
+   }
+   ```
+
+4. **Register** in `Processor` enum and `create_processor()` function
+
 ## Feature Parity with superfly/tokenizer
 
 ### Implemented
@@ -361,16 +567,18 @@ cargo clippy --workspace
 | Response scanning | ✅ | Streaming with overlap buffer |
 | Host validation | ✅ | Allowlist + regex patterns |
 | Body injection | ✅ | Placeholder replacement |
-| SigV4 signing | ✅ | Structure in place, needs AWS SDK |
+| SigV4 signing | ✅ | Full `aws-sigv4` integration |
 | SSRF protection | ✅ | Private network blocking |
 | CONNECT tunneling | ✅ | Transparent HTTPS proxy |
+| Metrics/Prometheus | ✅ | Request, token, security metrics |
+| Docker/Kubernetes | ✅ | Dockerfile + Helm chart |
+| Graceful shutdown | ✅ | SIGTERM/SIGINT, connection draining |
+| Health endpoints | ✅ | `/healthz` and `/readyz` for Kubernetes |
 
 ### Remaining Work
 
 | Feature | Priority | Notes |
 |---------|----------|-------|
-| Full SigV4 implementation | Medium | Integrate `aws-sigv4` crate |
 | Streaming body injection | Low | Current impl buffers body |
 | TLS MITM for CONNECT | Low | Optional for full inspection |
-| Metrics/Prometheus | Medium | Add observability |
-| Graceful shutdown | Medium | Drain connections |
+| Request/Response logging | Low | Structured logging with correlation IDs |

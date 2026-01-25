@@ -1,7 +1,7 @@
 //! Common utilities for Icebreaker benchmarks.
 
 use icebreaker_common::{InjectConfig, ProcessorConfig, TokenPayload};
-use icebreaker_crypto::{Keypair, TokenCrypto, VersionedKeypair};
+use icebreaker_crypto::{Keypair, TokenCrypto};
 use secrecy::SecretString;
 
 /// Creates a test keypair for benchmarking.

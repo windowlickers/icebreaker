@@ -1,0 +1,119 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "icebreaker.fullname" . }}
+  labels:
+    {{- include "icebreaker.labels" . | nindent 4 }}
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "icebreaker.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      annotations:
+        checksum/secret: {{ include (print $.Template.BasePath "/secret.yaml") . | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      labels:
+        {{- include "icebreaker.labels" . | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "icebreaker.serviceAccountName" . }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      containers:
+        - name: {{ .Chart.Name }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - serve
+            - --bind
+            - "0.0.0.0"
+            - --port
+            - {{ .Values.icebreaker.port | quote }}
+            - --key-id
+            - {{ .Values.icebreaker.keyId | quote }}
+            - --timeout
+            - {{ .Values.icebreaker.timeout | quote }}
+            - --log-level
+            - {{ .Values.icebreaker.logLevel | quote }}
+            {{- if .Values.icebreaker.logJson }}
+            - --log-json
+            {{- end }}
+            {{- if .Values.icebreaker.metrics.enabled }}
+            - --metrics-enabled
+            - --metrics-port
+            - {{ .Values.icebreaker.metrics.port | quote }}
+            {{- end }}
+            {{- if .Values.icebreaker.health.enabled }}
+            - --health-enabled
+            - --health-port
+            - {{ .Values.icebreaker.health.port | quote }}
+            {{- end }}
+            - --shutdown-timeout
+            - {{ .Values.icebreaker.shutdown.timeout | quote }}
+            - --shutdown-delay
+            - {{ .Values.icebreaker.shutdown.delay | quote }}
+          env:
+            - name: ICEBREAKER_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "icebreaker.secretName" . }}
+                  key: {{ .Values.icebreaker.existingSecretKey }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.icebreaker.port }}
+              protocol: TCP
+            {{- if .Values.icebreaker.metrics.enabled }}
+            - name: metrics
+              containerPort: {{ .Values.icebreaker.metrics.port }}
+              protocol: TCP
+            {{- end }}
+            {{- if .Values.icebreaker.health.enabled }}
+            - name: health
+              containerPort: {{ .Values.icebreaker.health.port }}
+              protocol: TCP
+            {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          lifecycle:
+            preStop:
+              exec:
+                # Sleep to allow load balancer to remove pod from service endpoints
+                # The shutdown delay is also configured in the application itself
+                command:
+                  - /bin/sh
+                  - -c
+                  - sleep {{ .Values.icebreaker.shutdown.delay }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

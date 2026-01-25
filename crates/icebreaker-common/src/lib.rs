@@ -15,7 +15,10 @@ pub mod processor;
 pub mod token;
 
 pub use auth::{ApiKeyConfig, AuthConfig, MutualTlsConfig};
-pub use config::{LoggingConfig, NetworkProtectionConfig, ProxyConfig, RateLimitConfig, TlsConfig};
+pub use config::{
+    HealthConfig, LoggingConfig, NetworkProtectionConfig, ProxyConfig, RateLimitConfig,
+    ShutdownConfig, TlsConfig,
+};
 pub use error::{Result, TokenizerError};
 pub use processor::{
     CachedOAuthToken, HmacAlgorithm, HmacConfig, InjectBodyConfig, InjectConfig, OAuthConfig,

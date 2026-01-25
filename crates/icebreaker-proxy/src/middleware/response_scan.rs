@@ -10,8 +10,6 @@ use http::{Request, Response};
 use http_body::Body;
 use tower::{Layer, Service};
 
-use icebreaker_common::TokenizerError;
-
 use crate::body::{ScanningBody, SecretScannerConfig};
 
 /// Layer that scans responses for secret leaks.

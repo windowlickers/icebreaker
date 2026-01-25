@@ -10,7 +10,10 @@ use crate::{auth::AuthConfig, error::Result, processor::ProcessorConfig};
 mod secret_string_serde {
     use super::*;
 
-    pub fn serialize<S>(secret: &SecretString, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    pub fn serialize<S>(
+        secret: &SecretString,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
     where
         S: Serializer,
     {

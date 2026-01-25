@@ -70,9 +70,11 @@ where
     let (parts, body) = request.into_parts();
 
     // Collect the body
-    let body_bytes = body.collect().await.map_err(|e| {
-        TokenizerError::HttpError(format!("failed to read request body: {e}"))
-    })?.to_bytes();
+    let body_bytes = body
+        .collect()
+        .await
+        .map_err(|e| TokenizerError::HttpError(format!("failed to read request body: {e}")))?
+        .to_bytes();
 
     // Replace placeholder with secret
     let body_str = String::from_utf8_lossy(&body_bytes);
@@ -83,9 +85,11 @@ where
     let mut request = Request::from_parts(parts, http_body_util::Full::new(new_body.clone()));
     request.headers_mut().insert(
         header::CONTENT_LENGTH,
-        new_body.len().to_string().parse().map_err(|e| {
-            TokenizerError::ConfigError(format!("invalid content-length: {e}"))
-        })?,
+        new_body
+            .len()
+            .to_string()
+            .parse()
+            .map_err(|e| TokenizerError::ConfigError(format!("invalid content-length: {e}")))?,
     );
 
     tracing::debug!(

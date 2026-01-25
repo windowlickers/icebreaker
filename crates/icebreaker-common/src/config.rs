@@ -27,6 +27,12 @@ pub struct ProxyConfig {
 
     /// Logging configuration.
     pub logging: LoggingConfig,
+
+    /// Health endpoint configuration.
+    pub health: HealthConfig,
+
+    /// Graceful shutdown configuration.
+    pub shutdown: ShutdownConfig,
 }
 
 impl Default for ProxyConfig {
@@ -39,6 +45,8 @@ impl Default for ProxyConfig {
             rate_limit: None,
             tls: None,
             logging: LoggingConfig::default(),
+            health: HealthConfig::default(),
+            shutdown: ShutdownConfig::default(),
         }
     }
 }
@@ -67,6 +75,8 @@ pub struct ProxyConfigBuilder {
     rate_limit: Option<RateLimitConfig>,
     tls: Option<TlsConfig>,
     logging: Option<LoggingConfig>,
+    health: Option<HealthConfig>,
+    shutdown: Option<ShutdownConfig>,
 }
 
 impl ProxyConfigBuilder {
@@ -119,6 +129,20 @@ impl ProxyConfigBuilder {
         self
     }
 
+    /// Sets the health endpoint configuration.
+    #[must_use]
+    pub fn health(mut self, config: HealthConfig) -> Self {
+        self.health = Some(config);
+        self
+    }
+
+    /// Sets the graceful shutdown configuration.
+    #[must_use]
+    pub fn shutdown(mut self, config: ShutdownConfig) -> Self {
+        self.shutdown = Some(config);
+        self
+    }
+
     /// Builds the `ProxyConfig`.
     #[must_use]
     pub fn build(self) -> ProxyConfig {
@@ -131,6 +155,8 @@ impl ProxyConfigBuilder {
             rate_limit: self.rate_limit,
             tls: self.tls,
             logging: self.logging.unwrap_or(default.logging),
+            health: self.health.unwrap_or(default.health),
+            shutdown: self.shutdown.unwrap_or(default.shutdown),
         }
     }
 }
@@ -187,6 +213,63 @@ impl Default for LoggingConfig {
             level: "info".to_string(),
             json: false,
             log_bodies: false,
+        }
+    }
+}
+
+/// Health endpoint configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthConfig {
+    /// Whether the health endpoint is enabled.
+    pub enabled: bool,
+
+    /// Port for the health endpoint.
+    pub port: u16,
+
+    /// Path for liveness probe (returns 200 if server is running).
+    pub liveness_path: String,
+
+    /// Path for readiness probe (returns 200 if ready to accept traffic).
+    pub readiness_path: String,
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            port: 9091,
+            liveness_path: "/healthz".to_string(),
+            readiness_path: "/readyz".to_string(),
+        }
+    }
+}
+
+impl HealthConfig {
+    /// Creates a disabled health configuration.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            enabled: false,
+            ..Default::default()
+        }
+    }
+}
+
+/// Graceful shutdown configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShutdownConfig {
+    /// Timeout for graceful shutdown (how long to wait for connections to drain).
+    pub timeout: Duration,
+
+    /// Delay before starting shutdown (allows load balancers to remove the pod).
+    pub delay: Duration,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(30),
+            delay: Duration::from_secs(0),
         }
     }
 }
