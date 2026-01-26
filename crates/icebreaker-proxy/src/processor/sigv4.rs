@@ -14,6 +14,8 @@ use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettin
 use aws_sigv4::sign::v4;
 use http::{HeaderValue, Request};
 use secrecy::ExposeSecret;
+use time::macros::format_description;
+use time::PrimitiveDateTime;
 
 use icebreaker_common::{Result, Sigv4Config, TokenPayload, TokenizerError};
 
@@ -69,69 +71,15 @@ impl Sigv4Processor {
     ///
     /// The header format is ISO 8601 basic format: `YYYYMMDDTHHMMSSZ`
     fn parse_amz_date(amz_date: &str) -> Option<SystemTime> {
-        // Format: 20130524T000000Z
-        if amz_date.len() != 16 {
+        let format = format_description!("[year][month][day]T[hour][minute][second]Z");
+        let dt = PrimitiveDateTime::parse(amz_date, &format).ok()?;
+        let unix_ts = dt.assume_utc().unix_timestamp();
+        if unix_ts < 0 {
             return None;
         }
-
-        let year: i32 = amz_date[0..4].parse().ok()?;
-        let month: u32 = amz_date[4..6].parse().ok()?;
-        let day: u32 = amz_date[6..8].parse().ok()?;
-
-        if amz_date.as_bytes().get(8)? != &b'T' {
-            return None;
-        }
-
-        let hour: u32 = amz_date[9..11].parse().ok()?;
-        let min: u32 = amz_date[11..13].parse().ok()?;
-        let sec: u32 = amz_date[13..15].parse().ok()?;
-
-        if amz_date.as_bytes().get(15)? != &b'Z' {
-            return None;
-        }
-
-        // Convert to days since Unix epoch
-        // This is a simplified calculation that handles common cases
-        let days_since_epoch = days_from_date(year, month, day)?;
-        let seconds_in_day = u64::from(hour) * 3600 + u64::from(min) * 60 + u64::from(sec);
-        let total_seconds = days_since_epoch * 86400 + seconds_in_day;
-
-        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(total_seconds))
+        #[allow(clippy::cast_sign_loss)]
+        Some(SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(unix_ts as u64))
     }
-}
-
-/// Calculates days since Unix epoch for a given date.
-fn days_from_date(year: i32, month: u32, day: u32) -> Option<u64> {
-    // Basic validation
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || year < 1970 {
-        return None;
-    }
-
-    // Days in each month (non-leap year)
-    let days_in_month = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
-
-    // Calculate leap years
-    let is_leap = |y: i32| -> bool { (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0) };
-
-    let mut days: i64 = 0;
-
-    // Add days for complete years since 1970
-    for y in 1970..year {
-        days += if is_leap(y) { 366 } else { 365 };
-    }
-
-    // Add days for complete months in current year
-    for m in 1..month {
-        days += i64::from(days_in_month[(m - 1) as usize]);
-        if m == 2 && is_leap(year) {
-            days += 1;
-        }
-    }
-
-    // Add days in current month
-    days += i64::from(day - 1);
-
-    u64::try_from(days).ok()
 }
 
 /// Parsed credential scope from an AWS Authorization header.
@@ -314,15 +262,11 @@ impl RequestProcessor for Sigv4Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::processor::test_utils::create_test_payload;
     use icebreaker_common::ProcessorConfig;
-    use secrecy::SecretString;
 
-    fn create_test_payload(secret: &str) -> TokenPayload {
-        TokenPayload::builder(
-            SecretString::from(secret),
-            ProcessorConfig::Sigv4(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE")),
-        )
-        .build()
+    fn sigv4_config() -> ProcessorConfig {
+        ProcessorConfig::Sigv4(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"))
     }
 
     #[test]
@@ -366,26 +310,9 @@ mod tests {
     }
 
     #[test]
-    fn test_days_from_date() {
-        // Unix epoch
-        assert_eq!(days_from_date(1970, 1, 1), Some(0));
-
-        // One day after
-        assert_eq!(days_from_date(1970, 1, 2), Some(1));
-
-        // Year boundary
-        assert_eq!(days_from_date(1971, 1, 1), Some(365));
-
-        // Invalid dates
-        assert!(days_from_date(1969, 1, 1).is_none());
-        assert!(days_from_date(1970, 13, 1).is_none());
-        assert!(days_from_date(1970, 0, 1).is_none());
-    }
-
-    #[test]
     fn test_invalid_auth_header() {
         let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
-        let payload = create_test_payload("secret");
+        let payload = create_test_payload("secret", sigv4_config());
 
         // Request with wrong auth type
         let request = Request::builder()
@@ -402,7 +329,7 @@ mod tests {
     #[test]
     fn test_missing_auth_header() {
         let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
-        let payload = create_test_payload("secret");
+        let payload = create_test_payload("secret", sigv4_config());
 
         let request = Request::builder()
             .uri("https://s3.amazonaws.com/bucket/key")
@@ -416,7 +343,7 @@ mod tests {
     #[test]
     fn test_missing_amz_date() {
         let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
-        let payload = create_test_payload("secret");
+        let payload = create_test_payload("secret", sigv4_config());
 
         let request = Request::builder()
             .uri("https://s3.amazonaws.com/bucket/key")
@@ -431,7 +358,8 @@ mod tests {
     #[test]
     fn test_valid_sigv4_request() {
         let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
-        let payload = create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        let payload =
+            create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sigv4_config());
 
         let request = Request::builder()
             .uri("https://s3.amazonaws.com/bucket/key")
@@ -452,7 +380,8 @@ mod tests {
     #[test]
     fn test_sigv4_request_gets_new_authorization_header() {
         let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
-        let payload = create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        let payload =
+            create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sigv4_config());
 
         let original_auth = "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc";
 
@@ -488,7 +417,8 @@ mod tests {
     #[test]
     fn test_sigv4_with_unsigned_payload() {
         let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
-        let payload = create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        let payload =
+            create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sigv4_config());
 
         let request = Request::builder()
             .uri("https://s3.amazonaws.com/bucket/key")
@@ -517,7 +447,8 @@ mod tests {
     #[test]
     fn test_sigv4_with_precomputed_hash() {
         let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
-        let payload = create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        let payload =
+            create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sigv4_config());
 
         // SHA256 of empty body
         let empty_hash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
@@ -549,7 +480,8 @@ mod tests {
     #[test]
     fn test_sigv4_different_services() {
         let processor = Sigv4Processor::new(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
-        let payload = create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY");
+        let payload =
+            create_test_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sigv4_config());
 
         // Test with DynamoDB
         let request = Request::builder()

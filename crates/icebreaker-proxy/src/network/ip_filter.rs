@@ -1,9 +1,73 @@
 //! IP address filtering for SSRF prevention.
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::OnceLock;
 
 use icebreaker_common::{NetworkProtectionConfig, Result, TokenizerError};
 use ipnet::{IpNet, Ipv4Net};
+
+/// Pre-parsed IPv4 reserved CIDRs for efficient lookups.
+/// These are initialized once on first use.
+mod reserved_cidrs {
+    use super::*;
+
+    // RFC 1918 private networks
+    static PRIVATE_10: OnceLock<Ipv4Net> = OnceLock::new();
+    static PRIVATE_172: OnceLock<Ipv4Net> = OnceLock::new();
+    static PRIVATE_192: OnceLock<Ipv4Net> = OnceLock::new();
+
+    // Link-local
+    static LINK_LOCAL: OnceLock<Ipv4Net> = OnceLock::new();
+
+    // Reserved ranges
+    static CGN: OnceLock<Ipv4Net> = OnceLock::new();
+    static IETF: OnceLock<Ipv4Net> = OnceLock::new();
+    static TEST_NET_1: OnceLock<Ipv4Net> = OnceLock::new();
+    static TEST_NET_2: OnceLock<Ipv4Net> = OnceLock::new();
+    static TEST_NET_3: OnceLock<Ipv4Net> = OnceLock::new();
+
+    /// Helper to create an Ipv4Net, panics only if the hardcoded values are wrong.
+    fn make_net(addr: [u8; 4], prefix: u8) -> Ipv4Net {
+        Ipv4Net::new(Ipv4Addr::from(addr), prefix)
+            .unwrap_or_else(|_| unreachable!("hardcoded CIDR values are valid"))
+    }
+
+    pub fn private_10() -> &'static Ipv4Net {
+        PRIVATE_10.get_or_init(|| make_net([10, 0, 0, 0], 8))
+    }
+
+    pub fn private_172() -> &'static Ipv4Net {
+        PRIVATE_172.get_or_init(|| make_net([172, 16, 0, 0], 12))
+    }
+
+    pub fn private_192() -> &'static Ipv4Net {
+        PRIVATE_192.get_or_init(|| make_net([192, 168, 0, 0], 16))
+    }
+
+    pub fn link_local() -> &'static Ipv4Net {
+        LINK_LOCAL.get_or_init(|| make_net([169, 254, 0, 0], 16))
+    }
+
+    pub fn cgn() -> &'static Ipv4Net {
+        CGN.get_or_init(|| make_net([100, 64, 0, 0], 10))
+    }
+
+    pub fn ietf() -> &'static Ipv4Net {
+        IETF.get_or_init(|| make_net([192, 0, 0, 0], 24))
+    }
+
+    pub fn test_net_1() -> &'static Ipv4Net {
+        TEST_NET_1.get_or_init(|| make_net([192, 0, 2, 0], 24))
+    }
+
+    pub fn test_net_2() -> &'static Ipv4Net {
+        TEST_NET_2.get_or_init(|| make_net([198, 51, 100, 0], 24))
+    }
+
+    pub fn test_net_3() -> &'static Ipv4Net {
+        TEST_NET_3.get_or_init(|| make_net([203, 0, 113, 0], 24))
+    }
+}
 
 /// Reason why an IP address was blocked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -175,18 +239,10 @@ impl IpFilter {
     }
 
     fn is_private_v4(&self, ip: &Ipv4Addr) -> bool {
-        // RFC 1918 private networks
-        let private_10: Ipv4Net = "10.0.0.0/8".parse().unwrap_or_else(|_| {
-            Ipv4Net::new(Ipv4Addr::new(10, 0, 0, 0), 8).expect("valid network")
-        });
-        let private_172: Ipv4Net = "172.16.0.0/12".parse().unwrap_or_else(|_| {
-            Ipv4Net::new(Ipv4Addr::new(172, 16, 0, 0), 12).expect("valid network")
-        });
-        let private_192: Ipv4Net = "192.168.0.0/16".parse().unwrap_or_else(|_| {
-            Ipv4Net::new(Ipv4Addr::new(192, 168, 0, 0), 16).expect("valid network")
-        });
-
-        private_10.contains(ip) || private_172.contains(ip) || private_192.contains(ip)
+        // RFC 1918 private networks (pre-parsed)
+        reserved_cidrs::private_10().contains(ip)
+            || reserved_cidrs::private_172().contains(ip)
+            || reserved_cidrs::private_192().contains(ip)
     }
 
     fn is_private_v6(&self, ip: &Ipv6Addr) -> bool {
@@ -203,11 +259,8 @@ impl IpFilter {
     }
 
     fn is_link_local_v4(&self, ip: &Ipv4Addr) -> bool {
-        // 169.254.0.0/16
-        let link_local: Ipv4Net = "169.254.0.0/16".parse().unwrap_or_else(|_| {
-            Ipv4Net::new(Ipv4Addr::new(169, 254, 0, 0), 16).expect("valid network")
-        });
-        link_local.contains(ip)
+        // 169.254.0.0/16 (pre-parsed)
+        reserved_cidrs::link_local().contains(ip)
     }
 
     fn is_link_local_v6(&self, ip: &Ipv6Addr) -> bool {
@@ -224,48 +277,10 @@ impl IpFilter {
     }
 
     fn is_reserved_v4(&self, ip: &Ipv4Addr) -> bool {
+        let octets = ip.octets();
+
         // 0.0.0.0/8 - Current network
-        if ip.octets()[0] == 0 {
-            return true;
-        }
-
-        // 100.64.0.0/10 - Shared address space (CGN)
-        let cgn: Ipv4Net = "100.64.0.0/10".parse().unwrap_or_else(|_| {
-            Ipv4Net::new(Ipv4Addr::new(100, 64, 0, 0), 10).expect("valid network")
-        });
-        if cgn.contains(ip) {
-            return true;
-        }
-
-        // 192.0.0.0/24 - IETF Protocol Assignments
-        let ietf: Ipv4Net = "192.0.0.0/24".parse().unwrap_or_else(|_| {
-            Ipv4Net::new(Ipv4Addr::new(192, 0, 0, 0), 24).expect("valid network")
-        });
-        if ietf.contains(ip) {
-            return true;
-        }
-
-        // 192.0.2.0/24 - TEST-NET-1
-        let test1: Ipv4Net = "192.0.2.0/24".parse().unwrap_or_else(|_| {
-            Ipv4Net::new(Ipv4Addr::new(192, 0, 2, 0), 24).expect("valid network")
-        });
-        if test1.contains(ip) {
-            return true;
-        }
-
-        // 198.51.100.0/24 - TEST-NET-2
-        let test2: Ipv4Net = "198.51.100.0/24".parse().unwrap_or_else(|_| {
-            Ipv4Net::new(Ipv4Addr::new(198, 51, 100, 0), 24).expect("valid network")
-        });
-        if test2.contains(ip) {
-            return true;
-        }
-
-        // 203.0.113.0/24 - TEST-NET-3
-        let test3: Ipv4Net = "203.0.113.0/24".parse().unwrap_or_else(|_| {
-            Ipv4Net::new(Ipv4Addr::new(203, 0, 113, 0), 24).expect("valid network")
-        });
-        if test3.contains(ip) {
+        if octets[0] == 0 {
             return true;
         }
 
@@ -274,17 +289,17 @@ impl IpFilter {
             return true;
         }
 
-        // 240.0.0.0/4 - Reserved for future use
-        if ip.octets()[0] >= 240 {
+        // 240.0.0.0/4 - Reserved for future use (includes broadcast)
+        if octets[0] >= 240 {
             return true;
         }
 
-        // 255.255.255.255 - Broadcast
-        if ip == &Ipv4Addr::BROADCAST {
-            return true;
-        }
-
-        false
+        // Pre-parsed CIDR checks
+        reserved_cidrs::cgn().contains(ip)           // 100.64.0.0/10 - CGN
+            || reserved_cidrs::ietf().contains(ip)       // 192.0.0.0/24 - IETF
+            || reserved_cidrs::test_net_1().contains(ip) // 192.0.2.0/24 - TEST-NET-1
+            || reserved_cidrs::test_net_2().contains(ip) // 198.51.100.0/24 - TEST-NET-2
+            || reserved_cidrs::test_net_3().contains(ip) // 203.0.113.0/24 - TEST-NET-3
     }
 
     fn is_reserved_v6(&self, ip: &Ipv6Addr) -> bool {

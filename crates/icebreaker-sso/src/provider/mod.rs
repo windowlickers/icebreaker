@@ -9,6 +9,9 @@ mod google;
 mod microsoft;
 pub mod profile;
 
+#[cfg(test)]
+pub(crate) mod test_utils;
+
 pub use generic::GenericProfile;
 pub use github::GitHubProfile;
 pub use google::GoogleProfile;

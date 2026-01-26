@@ -52,21 +52,14 @@ impl RequestProcessor for InjectProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::processor::test_utils::create_test_payload;
     use icebreaker_common::ProcessorConfig;
-    use secrecy::SecretString;
-
-    fn create_test_payload(secret: &str) -> TokenPayload {
-        TokenPayload::builder(
-            SecretString::from(secret),
-            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
-        )
-        .build()
-    }
 
     #[test]
     fn test_bearer_injection() {
         let processor = InjectProcessor::new(InjectConfig::bearer("Authorization"));
-        let payload = create_test_payload("my-api-token");
+        let config = ProcessorConfig::Inject(InjectConfig::bearer("Authorization"));
+        let payload = create_test_payload("my-api-token", config);
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -88,7 +81,8 @@ mod tests {
     #[test]
     fn test_basic_injection() {
         let processor = InjectProcessor::new(InjectConfig::basic("Authorization"));
-        let payload = create_test_payload("dXNlcjpwYXNz");
+        let config = ProcessorConfig::Inject(InjectConfig::basic("Authorization"));
+        let payload = create_test_payload("dXNlcjpwYXNz", config);
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -110,7 +104,8 @@ mod tests {
     #[test]
     fn test_raw_injection() {
         let processor = InjectProcessor::new(InjectConfig::raw("X-Api-Key"));
-        let payload = create_test_payload("secret-api-key-123");
+        let config = ProcessorConfig::Inject(InjectConfig::raw("X-Api-Key"));
+        let payload = create_test_payload("secret-api-key-123", config);
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -131,13 +126,13 @@ mod tests {
 
     #[test]
     fn test_custom_prefix_suffix() {
-        let config = InjectConfig {
+        let inject_config = InjectConfig {
             header_name: "X-Custom".to_string(),
             prefix: Some("Token ".to_string()),
             suffix: Some(" v2".to_string()),
         };
-        let processor = InjectProcessor::new(config);
-        let payload = create_test_payload("abc123");
+        let processor = InjectProcessor::new(inject_config.clone());
+        let payload = create_test_payload("abc123", ProcessorConfig::Inject(inject_config));
 
         let request = Request::builder()
             .uri("https://api.example.com/data")

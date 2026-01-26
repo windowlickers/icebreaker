@@ -13,6 +13,7 @@ use http::{Request, Response, StatusCode, Uri};
 use http_body_util::{combinators::BoxBody, BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
+use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use metrics_exporter_prometheus::PrometheusBuilder;
@@ -22,9 +23,14 @@ use tower::{Service, ServiceBuilder, ServiceExt};
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use icebreaker_common::{HealthConfig, InjectConfig, ProcessorConfig, ProxyConfig, ShutdownConfig};
-use icebreaker_crypto::{KeyStore, Keypair, TokenCrypto, VersionedKeypair};
-use icebreaker_proxy::{MetricsLayer, TokenInjectionLayer};
+use icebreaker_common::{
+    ClientAuthMode, HealthConfig, InjectConfig, ProcessorConfig, ProxyConfig, ShutdownConfig,
+    TlsConfig,
+};
+use icebreaker_crypto::{KeyStore, Keypair, TlsConnectionInfo, TokenCrypto, VersionedKeypair};
+use icebreaker_proxy::{
+    create_tls_acceptor, extract_client_cert_info, MetricsLayer, TokenInjectionLayer,
+};
 
 /// Icebreaker - A stateless tokenizer proxy
 #[derive(Parser)]
@@ -106,6 +112,22 @@ struct ServeArgs {
     /// Delay before shutdown in seconds (for load balancer draining)
     #[arg(long, default_value = "0", env = "ICEBREAKER_SHUTDOWN_DELAY")]
     shutdown_delay: u64,
+
+    /// Path to the TLS certificate file
+    #[arg(long, env = "ICEBREAKER_TLS_CERT")]
+    tls_cert: Option<String>,
+
+    /// Path to the TLS private key file
+    #[arg(long, env = "ICEBREAKER_TLS_KEY")]
+    tls_key: Option<String>,
+
+    /// Path to the client CA certificate file for mutual TLS
+    #[arg(long, env = "ICEBREAKER_TLS_CLIENT_CA")]
+    tls_client_ca: Option<String>,
+
+    /// Client authentication mode: none, optional, or required
+    #[arg(long, default_value = "none", env = "ICEBREAKER_TLS_CLIENT_AUTH")]
+    tls_client_auth: String,
 }
 
 #[derive(Parser)]
@@ -173,6 +195,11 @@ struct SsoArgs {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Install rustls crypto provider (required for rustls 0.23+)
+    rustls::crypto::ring::default_provider()
+        .install_default()
+        .map_err(|_| "Failed to install rustls crypto provider")?;
+
     let cli = Cli::parse();
 
     match cli.command {
@@ -184,11 +211,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Type alias for the HTTP client.
-type HttpClient = Client<
-    hyper_util::client::legacy::connect::HttpConnector,
-    BoxBody<Bytes, std::convert::Infallible>,
->;
+/// Type alias for the HTTPS connector.
+type HttpsConnector =
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
+
+/// Type alias for the HTTP client with TLS support.
+type HttpClient = Client<HttpsConnector, BoxBody<Bytes, std::convert::Infallible>>;
 
 /// Shared state for graceful shutdown coordination.
 #[derive(Debug)]
@@ -351,9 +379,7 @@ async fn run_health_server(
 /// Waits for shutdown signals (SIGTERM or SIGINT).
 async fn wait_for_shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c()
-            .await
-            .ok();
+        tokio::signal::ctrl_c().await.ok();
     };
 
     #[cfg(unix)]
@@ -389,9 +415,16 @@ struct ProxyService {
 }
 
 impl ProxyService {
-    /// Creates a new proxy service.
+    /// Creates a new proxy service with HTTPS support.
     fn new() -> Self {
-        let client: HttpClient = Client::builder(TokioExecutor::new()).build_http();
+        // Build HTTPS connector with native root certificates
+        let https = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .build();
+
+        let client: HttpClient = Client::builder(TokioExecutor::new()).build(https);
         Self { client }
     }
 }
@@ -483,6 +516,57 @@ impl Service<Request<Incoming>> for ProxyService {
     }
 }
 
+/// Handles an HTTP connection, applying the middleware stack and serving requests.
+async fn handle_connection<I>(
+    io: I,
+    crypto: Arc<TokenCrypto>,
+    tls_info: Option<TlsConnectionInfo>,
+    remote_addr: SocketAddr,
+) where
+    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
+{
+    // Create the proxy service for this connection
+    let proxy_service = ProxyService::new();
+
+    // Build the middleware stack
+    let service = ServiceBuilder::new()
+        .layer(TraceLayer::new_for_http())
+        .layer(MetricsLayer::new())
+        .layer(TokenInjectionLayer::new(crypto))
+        .service(proxy_service);
+
+    // Create a service function that handles the request and injects TLS info
+    let service_fn = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+        let mut svc = service.clone();
+        let tls_info = tls_info.clone();
+        async move {
+            // Inject TLS connection info into request extensions if available
+            if let Some(info) = tls_info {
+                req.extensions_mut().insert(info);
+            }
+
+            match svc.ready().await {
+                Ok(ready_svc) => ready_svc.call(req).await.map_err(|e| {
+                    tracing::error!(error = %e, "request failed");
+                    e
+                }),
+                Err(e) => {
+                    tracing::error!(error = %e, "service not ready");
+                    Err(e)
+                }
+            }
+        }
+    });
+
+    if let Err(e) = http1::Builder::new().serve_connection(io, service_fn).await {
+        tracing::debug!(
+            error = %e,
+            remote_addr = %remote_addr,
+            "connection error"
+        );
+    }
+}
+
 fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -553,12 +637,40 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             .shutdown(shutdown_config.clone())
             .build();
 
+        // Build TLS acceptor if configured
+        let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
+            (Some(cert), Some(key)) => {
+                let client_auth = match args.tls_client_auth.as_str() {
+                    "optional" => ClientAuthMode::Optional,
+                    "required" => ClientAuthMode::Required,
+                    _ => ClientAuthMode::None,
+                };
+                let tls_config = TlsConfig::new(cert, key).with_client_auth(client_auth);
+                let tls_config = if let Some(ca_path) = &args.tls_client_ca {
+                    tls_config.with_client_ca(ca_path)
+                } else {
+                    tls_config
+                };
+                Some(
+                    create_tls_acceptor(&tls_config)
+                        .map_err(|e| format!("failed to create TLS acceptor: {e}"))?,
+                )
+            }
+            (Some(_), None) | (None, Some(_)) => {
+                return Err("both --tls-cert and --tls-key must be provided together".into());
+            }
+            (None, None) => None,
+        };
+
+        let tls_enabled = tls_acceptor.is_some();
+
         tracing::info!(
             bind = %config.bind_addr(),
             key_id = %args.key_id,
             health_enabled = %health_config.enabled,
             health_port = %health_config.port,
             shutdown_timeout = ?shutdown_config.timeout,
+            tls_enabled = %tls_enabled,
             "starting icebreaker proxy"
         );
 
@@ -623,51 +735,33 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
                 let crypto = crypto.clone();
                 let conn_state = accept_state.clone();
+                let tls_acceptor = tls_acceptor.clone();
 
                 // Track connection
                 conn_state.connection_started();
 
                 tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-
-                    // Create the proxy service for this connection
-                    let proxy_service = ProxyService::new();
-
-                    // Build the middleware stack
-                    let service = ServiceBuilder::new()
-                        .layer(TraceLayer::new_for_http())
-                        .layer(MetricsLayer::new())
-                        .layer(TokenInjectionLayer::new(crypto))
-                        .service(proxy_service);
-
-                    // Create a service function that handles the request
-                    let service_fn = hyper::service::service_fn(move |req: Request<Incoming>| {
-                        let mut svc = service.clone();
-                        async move {
-                            match svc.ready().await {
-                                Ok(ready_svc) => {
-                                    ready_svc.call(req).await.map_err(|e| {
-                                        tracing::error!(error = %e, "request failed");
-                                        e
-                                    })
-                                }
-                                Err(e) => {
-                                    tracing::error!(error = %e, "service not ready");
-                                    Err(e)
-                                }
+                    // Handle TLS or plain TCP
+                    if let Some(acceptor) = tls_acceptor {
+                        // TLS connection
+                        match acceptor.accept(stream).await {
+                            Ok(tls_stream) => {
+                                let tls_info = extract_client_cert_info(&tls_stream);
+                                let io = TokioIo::new(tls_stream);
+                                handle_connection(io, crypto, tls_info, remote_addr).await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    error = %e,
+                                    remote_addr = %remote_addr,
+                                    "TLS handshake failed"
+                                );
                             }
                         }
-                    });
-
-                    if let Err(e) = http1::Builder::new()
-                        .serve_connection(io, service_fn)
-                        .await
-                    {
-                        tracing::debug!(
-                            error = %e,
-                            remote_addr = %remote_addr,
-                            "connection error"
-                        );
+                    } else {
+                        // Plain TCP connection
+                        let io = TokioIo::new(stream);
+                        handle_connection(io, crypto, None, remote_addr).await;
                     }
 
                     // Connection finished
@@ -813,15 +907,10 @@ fn run_sso(args: SsoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
                 let service_fn = hyper::service::service_fn(move |req: Request<Incoming>| {
                     let service = service.clone();
-                    async move {
-                        handle_sso_request(&service, req).await
-                    }
+                    async move { handle_sso_request(&service, req).await }
                 });
 
-                if let Err(e) = http1::Builder::new()
-                    .serve_connection(io, service_fn)
-                    .await
-                {
+                if let Err(e) = http1::Builder::new().serve_connection(io, service_fn).await {
                     tracing::debug!(
                         error = %e,
                         remote_addr = %remote_addr,
@@ -883,8 +972,22 @@ async fn handle_sso_request(
                         let http_resp = resp.into_response();
                         Ok(Response::builder()
                             .status(http_resp.status())
-                            .header("Location", http_resp.headers().get("Location").and_then(|h| h.to_str().ok()).unwrap_or(""))
-                            .header("Set-Cookie", http_resp.headers().get("Set-Cookie").and_then(|h| h.to_str().ok()).unwrap_or(""))
+                            .header(
+                                "Location",
+                                http_resp
+                                    .headers()
+                                    .get("Location")
+                                    .and_then(|h| h.to_str().ok())
+                                    .unwrap_or(""),
+                            )
+                            .header(
+                                "Set-Cookie",
+                                http_resp
+                                    .headers()
+                                    .get("Set-Cookie")
+                                    .and_then(|h| h.to_str().ok())
+                                    .unwrap_or(""),
+                            )
                             .header("Cache-Control", "no-store")
                             .body(Full::new(Bytes::new()))
                             .unwrap_or_default())
@@ -899,32 +1002,46 @@ async fn handle_sso_request(
                         let http_resp = resp.into_response();
                         let mut builder = Response::builder()
                             .status(http_resp.status())
-                            .header("Set-Cookie", http_resp.headers().get("Set-Cookie").and_then(|h| h.to_str().ok()).unwrap_or(""))
+                            .header(
+                                "Set-Cookie",
+                                http_resp
+                                    .headers()
+                                    .get("Set-Cookie")
+                                    .and_then(|h| h.to_str().ok())
+                                    .unwrap_or(""),
+                            )
                             .header("Cache-Control", "no-store");
 
                         if let Some(location) = http_resp.headers().get("Location") {
                             builder = builder.header("Location", location);
                         }
 
-                        Ok(builder.body(Full::new(Bytes::from(http_resp.into_body()))).unwrap_or_default())
-                    }
-                    Err(e) => error_response(e),
-                }
-            }
-            ("POST", "refresh") => {
-                match handle_refresh(service, provider_id, auth_header).await {
-                    Ok(resp) => {
-                        let http_resp = resp.into_response();
-                        Ok(Response::builder()
-                            .status(http_resp.status())
-                            .header("Content-Type", "application/json")
-                            .header("Cache-Control", http_resp.headers().get("Cache-Control").and_then(|h| h.to_str().ok()).unwrap_or("no-store"))
+                        Ok(builder
                             .body(Full::new(Bytes::from(http_resp.into_body())))
                             .unwrap_or_default())
                     }
                     Err(e) => error_response(e),
                 }
             }
+            ("POST", "refresh") => match handle_refresh(service, provider_id, auth_header).await {
+                Ok(resp) => {
+                    let http_resp = resp.into_response();
+                    Ok(Response::builder()
+                        .status(http_resp.status())
+                        .header("Content-Type", "application/json")
+                        .header(
+                            "Cache-Control",
+                            http_resp
+                                .headers()
+                                .get("Cache-Control")
+                                .and_then(|h| h.to_str().ok())
+                                .unwrap_or("no-store"),
+                        )
+                        .body(Full::new(Bytes::from(http_resp.into_body())))
+                        .unwrap_or_default())
+                }
+                Err(e) => error_response(e),
+            },
             _ => not_found_response(),
         }
     } else {
@@ -946,7 +1063,9 @@ fn parse_provider_path(path: &str) -> Option<(&str, &str)> {
 }
 
 /// Creates an error response for SSO errors.
-fn error_response(error: icebreaker_sso::SsoError) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+fn error_response(
+    error: icebreaker_sso::SsoError,
+) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let status = error.status_code();
     let body = serde_json::json!({
         "error": error.to_string()

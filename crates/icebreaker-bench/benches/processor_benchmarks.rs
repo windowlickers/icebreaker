@@ -9,8 +9,8 @@ use icebreaker_common::{
     HmacConfig, InjectBodyConfig, InjectConfig, ProcessorConfig, Sigv4Config, TokenPayload,
 };
 use icebreaker_proxy::{
-    create_processor, process_body, HmacProcessor, InjectBodyProcessor, InjectProcessor,
-    RequestProcessor, Sigv4Processor,
+    create_processor, HmacProcessor, InjectBodyProcessor, InjectProcessor, RequestProcessor,
+    Sigv4Processor,
 };
 use secrecy::SecretString;
 
@@ -50,7 +50,10 @@ fn bench_inject_processor(c: &mut Criterion) {
     // Basic auth injection
     let basic_config = InjectConfig::basic("Authorization");
     let basic_processor = InjectProcessor::new(basic_config.clone());
-    let basic_payload = create_payload("dXNlcjpwYXNzd29yZA==", ProcessorConfig::Inject(basic_config));
+    let basic_payload = create_payload(
+        "dXNlcjpwYXNzd29yZA==",
+        ProcessorConfig::Inject(basic_config),
+    );
 
     group.bench_function("basic", |b| {
         b.iter(|| {
@@ -65,10 +68,7 @@ fn bench_inject_processor(c: &mut Criterion) {
     // Raw header injection
     let raw_config = InjectConfig::raw("X-Api-Key");
     let raw_processor = InjectProcessor::new(raw_config.clone());
-    let raw_payload = create_payload(
-        "api-key-12345-abcdef",
-        ProcessorConfig::Inject(raw_config),
-    );
+    let raw_payload = create_payload("api-key-12345-abcdef", ProcessorConfig::Inject(raw_config));
 
     group.bench_function("raw", |b| {
         b.iter(|| {
@@ -133,26 +133,22 @@ fn bench_inject_body_placeholder(c: &mut Criterion) {
         let body_bytes = body.into_bytes();
 
         group.throughput(Throughput::Bytes(body_bytes.len() as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(size),
-            &body_bytes,
-            |b, body| {
-                b.iter(|| black_box(processor.replace_placeholder(black_box(body), black_box(secret))))
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(size), &body_bytes, |b, body| {
+            b.iter(|| black_box(processor.replace_placeholder(black_box(body), black_box(secret))))
+        });
     }
 
     group.finish();
 }
 
-/// Benchmarks the full process_body async function.
+/// Benchmarks the full process_body async method.
 fn bench_process_body_async(c: &mut Criterion) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .unwrap();
 
-    let config = InjectBodyConfig::default();
+    let processor = InjectBodyProcessor::new(InjectBodyConfig::default());
     let secret = "sk_live_secret_key_12345";
 
     let body_sizes = [256, 1024, 4096, 16384];
@@ -174,7 +170,11 @@ fn bench_process_body_async(c: &mut Criterion) {
                         .uri("https://api.example.com/v1/data")
                         .body(req_body)
                         .unwrap();
-                    black_box(process_body(black_box(request), black_box(&config), black_box(secret)).await)
+                    black_box(
+                        processor
+                            .process_body(black_box(request), black_box(secret))
+                            .await,
+                    )
                 })
             })
         });
@@ -329,10 +329,7 @@ fn bench_processor_dispatch(c: &mut Criterion) {
     let sigv4_processor = create_processor(&sigv4_config);
 
     let inject_payload = create_payload("sk_live_token_12345", inject_config);
-    let sigv4_payload = create_payload(
-        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
-        sigv4_config,
-    );
+    let sigv4_payload = create_payload("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", sigv4_config);
 
     let mut group = c.benchmark_group("processor_dispatch");
 

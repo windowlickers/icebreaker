@@ -1,4 +1,20 @@
 //! Token injection middleware.
+//!
+//! This middleware decrypts sealed tokens and injects secrets into requests.
+//!
+//! # Processor Types
+//!
+//! There are two types of processors:
+//!
+//! - **Header processors**: Modify request headers synchronously. Work with any body type.
+//! - **Body processors**: Modify request bodies asynchronously. Require body collection.
+//!
+//! This middleware handles header processors directly. For body processors, the middleware
+//! logs a warning and passes the request through - body modification must be handled
+//! separately where the body type is concrete.
+//!
+//! To properly handle body processors, compose the middleware with a body-collecting
+//! layer or use [`Processor::process_body`] directly in your service.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -149,6 +165,19 @@ where
 
             // Create the processor and inject the secret
             let processor = create_processor(&payload.processor);
+
+            // Check if this is a body processor - body processing requires special handling
+            // that can't be done with a generic body type. Log a warning if detected.
+            if processor.is_body_processor() {
+                tracing::warn!(
+                    processor_type = %payload.processor.processor_type(),
+                    "body processor detected but body modification not supported in this middleware; \
+                     body will be passed through unchanged. Use Processor::process_body() directly \
+                     or compose with a body-collecting layer."
+                );
+            }
+
+            // Process headers (no-op for body processors)
             let processed_request = processor.process(request, &payload)?;
 
             // Forward to inner service

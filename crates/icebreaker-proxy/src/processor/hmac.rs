@@ -68,7 +68,7 @@ impl RequestProcessor for HmacProcessor {
 
         // Build canonical request and sign
         let canonical = self.build_canonical_request(&request);
-        let signature = signer.sign_hex(canonical.as_bytes());
+        let signature = signer.sign_hex(canonical.as_bytes())?;
 
         // Inject signature header
         let sig_header_name: HeaderName = self.config.signature_header.parse().map_err(|e| {
@@ -95,15 +95,11 @@ impl RequestProcessor for HmacProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::processor::test_utils::create_test_payload;
     use icebreaker_common::{HmacAlgorithm, ProcessorConfig};
-    use secrecy::SecretString;
 
-    fn create_test_payload(secret: &str) -> TokenPayload {
-        TokenPayload::builder(
-            SecretString::from(secret),
-            ProcessorConfig::InjectHmac(HmacConfig::default()),
-        )
-        .build()
+    fn hmac_config() -> ProcessorConfig {
+        ProcessorConfig::InjectHmac(HmacConfig::default())
     }
 
     #[test]
@@ -116,7 +112,7 @@ mod tests {
             sign_body: false,
         };
         let processor = HmacProcessor::new(config);
-        let payload = create_test_payload("hmac-secret-key");
+        let payload = create_test_payload("hmac-secret-key", hmac_config());
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -152,7 +148,7 @@ mod tests {
             sign_body: false,
         };
         let processor = HmacProcessor::new(config);
-        let payload = create_test_payload("hmac-secret-key");
+        let payload = create_test_payload("hmac-secret-key", hmac_config());
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -188,8 +184,8 @@ mod tests {
         };
         let processor = HmacProcessor::new(config);
 
-        let payload1 = create_test_payload("secret1");
-        let payload2 = create_test_payload("secret2");
+        let payload1 = create_test_payload("secret1", hmac_config());
+        let payload2 = create_test_payload("secret2", hmac_config());
 
         let request1 = Request::builder()
             .uri("https://api.example.com/data")

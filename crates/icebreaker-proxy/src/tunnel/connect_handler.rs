@@ -239,26 +239,9 @@ pub fn is_connect_request<B>(request: &Request<B>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icebreaker_common::{InjectConfig, ProcessorConfig};
-    use secrecy::SecretString;
 
     fn create_mock_crypto() -> Arc<TokenCrypto> {
-        // Create a mock crypto service for testing
-        // In a real test, you would use a proper test fixture
         Arc::new(TokenCrypto::generate())
-    }
-
-    fn create_mock_filter() -> Arc<IpFilter> {
-        Arc::new(IpFilter::permissive())
-    }
-
-    fn create_test_payload() -> TokenPayload {
-        TokenPayload::builder(
-            SecretString::from("secret"),
-            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
-        )
-        .allowed_host("api.example.com")
-        .build()
     }
 
     #[test]

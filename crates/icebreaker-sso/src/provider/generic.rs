@@ -43,29 +43,19 @@ impl ProviderProfile for GenericProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
+    use crate::provider::test_utils::TestConfigBuilder;
 
-    fn test_config() -> ProviderConfig {
-        ProviderConfig {
-            profile: "generic".to_string(),
-            client_id: "client-id".to_string(),
-            client_secret: SecretString::from("secret"),
-            callback_url: None,
-            scopes: vec![],
-            auth_url: Some("https://auth.example.com/authorize".to_string()),
-            token_url: Some("https://auth.example.com/token".to_string()),
-            pkce: true,
-            allowed_hosts: vec![],
-            allowed_host_pattern: None,
-            forwarded_params: vec![],
-            token_expires_in: None,
-        }
+    fn generic_config_with_urls() -> ProviderConfig {
+        TestConfigBuilder::new("generic")
+            .auth_url("https://auth.example.com/authorize")
+            .token_url("https://auth.example.com/token")
+            .build()
     }
 
     #[test]
     fn test_generic_with_urls() {
         let profile = GenericProfile;
-        let config = test_config();
+        let config = generic_config_with_urls();
 
         assert_eq!(
             profile.auth_url(&config).unwrap(),
@@ -80,7 +70,7 @@ mod tests {
     #[test]
     fn test_generic_without_urls() {
         let profile = GenericProfile;
-        let mut config = test_config();
+        let mut config = generic_config_with_urls();
         config.auth_url = None;
         config.token_url = None;
 

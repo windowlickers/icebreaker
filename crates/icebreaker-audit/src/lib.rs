@@ -1,3 +1,6 @@
+// Allow common test patterns in test code
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
+
 //! Audit logging for the Icebreaker tokenizer proxy.
 //!
 //! This crate provides audit logging capabilities:

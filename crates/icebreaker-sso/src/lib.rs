@@ -1,3 +1,6 @@
+// Allow common test patterns in test code
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
+
 //! OAuth orchestration service for the Icebreaker tokenizer proxy.
 //!
 //! This crate provides a standalone SSO service that handles OAuth flows

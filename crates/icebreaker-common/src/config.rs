@@ -184,6 +184,19 @@ impl Default for RateLimitConfig {
     }
 }
 
+/// Client authentication mode for TLS connections.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientAuthMode {
+    /// No client certificate required.
+    #[default]
+    None,
+    /// Client certificate optional (verify if provided).
+    Optional,
+    /// Client certificate required.
+    Required,
+}
+
 /// TLS configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
@@ -192,6 +205,40 @@ pub struct TlsConfig {
 
     /// Path to the private key file.
     pub key_path: String,
+
+    /// Path to the client CA certificate file for mutual TLS.
+    pub client_ca_path: Option<String>,
+
+    /// Client authentication mode.
+    #[serde(default)]
+    pub client_auth: ClientAuthMode,
+}
+
+impl TlsConfig {
+    /// Creates a new TLS config with just server certificate.
+    #[must_use]
+    pub fn new(cert_path: impl Into<String>, key_path: impl Into<String>) -> Self {
+        Self {
+            cert_path: cert_path.into(),
+            key_path: key_path.into(),
+            client_ca_path: None,
+            client_auth: ClientAuthMode::None,
+        }
+    }
+
+    /// Sets the client CA path for mutual TLS.
+    #[must_use]
+    pub fn with_client_ca(mut self, path: impl Into<String>) -> Self {
+        self.client_ca_path = Some(path.into());
+        self
+    }
+
+    /// Sets the client authentication mode.
+    #[must_use]
+    pub fn with_client_auth(mut self, mode: ClientAuthMode) -> Self {
+        self.client_auth = mode;
+        self
+    }
 }
 
 /// Logging configuration.

@@ -75,21 +75,19 @@ fn bench_hmac_compute(c: &mut Criterion) {
 
     group.bench_function("sha256", |b| {
         b.iter(|| {
-            black_box(compute_signature(
-                black_box(key),
-                black_box(message),
-                HmacAlgorithm::Sha256,
-            ))
+            black_box(
+                compute_signature(black_box(key), black_box(message), HmacAlgorithm::Sha256)
+                    .unwrap(),
+            )
         })
     });
 
     group.bench_function("sha512", |b| {
         b.iter(|| {
-            black_box(compute_signature(
-                black_box(key),
-                black_box(message),
-                HmacAlgorithm::Sha512,
-            ))
+            black_box(
+                compute_signature(black_box(key), black_box(message), HmacAlgorithm::Sha512)
+                    .unwrap(),
+            )
         })
     });
 
@@ -100,7 +98,7 @@ fn bench_hmac_compute(c: &mut Criterion) {
 fn bench_hmac_verify(c: &mut Criterion) {
     let key = b"secret-hmac-key-for-benchmarks!";
     let message = b"The quick brown fox jumps over the lazy dog";
-    let signature = compute_signature(key, message, HmacAlgorithm::Sha256);
+    let signature = compute_signature(key, message, HmacAlgorithm::Sha256).unwrap();
 
     let mut group = c.benchmark_group("hmac_verify");
 
@@ -140,15 +138,15 @@ fn bench_request_signer(c: &mut Criterion) {
     let mut group = c.benchmark_group("request_signer");
 
     group.bench_function("sign", |b| {
-        b.iter(|| black_box(signer.sign(black_box(message))))
+        b.iter(|| black_box(signer.sign(black_box(message)).unwrap()))
     });
 
     group.bench_function("sign_hex", |b| {
-        b.iter(|| black_box(signer.sign_hex(black_box(message))))
+        b.iter(|| black_box(signer.sign_hex(black_box(message)).unwrap()))
     });
 
     group.bench_function("sign_base64", |b| {
-        b.iter(|| black_box(signer.sign_base64(black_box(message))))
+        b.iter(|| black_box(signer.sign_base64(black_box(message)).unwrap()))
     });
 
     group.finish();
@@ -184,11 +182,10 @@ fn bench_hmac_message_sizes(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(size as u64));
         group.bench_with_input(BenchmarkId::from_parameter(size), &message, |b, msg| {
             b.iter(|| {
-                black_box(compute_signature(
-                    black_box(key),
-                    black_box(msg),
-                    HmacAlgorithm::Sha256,
-                ))
+                black_box(
+                    compute_signature(black_box(key), black_box(msg), HmacAlgorithm::Sha256)
+                        .unwrap(),
+                )
             })
         });
     }

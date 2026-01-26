@@ -3,10 +3,11 @@
 use serde::{Deserialize, Serialize};
 
 /// Authentication configuration for the proxy client.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AuthConfig {
     /// No authentication required.
+    #[default]
     None,
 
     /// API key authentication.
@@ -14,12 +15,6 @@ pub enum AuthConfig {
 
     /// Mutual TLS authentication.
     MutualTls(MutualTlsConfig),
-}
-
-impl Default for AuthConfig {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl AuthConfig {

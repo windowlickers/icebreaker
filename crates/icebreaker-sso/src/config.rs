@@ -43,7 +43,12 @@ fn expand_env_var(s: &str) -> String {
         if let Some(end) = result[start..].find('}') {
             let var_name = &result[start + 2..start + end];
             let value = std::env::var(var_name).unwrap_or_default();
-            result = format!("{}{}{}", &result[..start], value, &result[start + end + 1..]);
+            result = format!(
+                "{}{}{}",
+                &result[..start],
+                value,
+                &result[start + end + 1..]
+            );
         } else {
             break;
         }
@@ -89,9 +94,8 @@ fn default_port() -> u16 {
 impl SsoConfig {
     /// Loads configuration from a YAML file.
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
-        let content = std::fs::read_to_string(path.as_ref()).map_err(|e| {
-            SsoError::ConfigError(format!("failed to read config file: {e}"))
-        })?;
+        let content = std::fs::read_to_string(path.as_ref())
+            .map_err(|e| SsoError::ConfigError(format!("failed to read config file: {e}")))?;
         Self::from_yaml(&content)
     }
 

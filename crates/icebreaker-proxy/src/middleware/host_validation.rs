@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 
 use http::Request;
@@ -11,6 +11,18 @@ use regex::Regex;
 use tower::{Layer, Service};
 
 use icebreaker_common::TokenizerError;
+
+/// Returns a regex that matches any string (used for allow_all).
+fn match_all_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(".*").unwrap_or_else(|_| unreachable!()))
+}
+
+/// Returns a regex that matches nothing (used as fallback for invalid patterns).
+fn match_none_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new("^$").unwrap_or_else(|_| unreachable!()))
+}
 
 /// Layer that validates request hosts against an allowlist.
 #[derive(Clone)]
@@ -94,7 +106,7 @@ where
 }
 
 /// Configuration for host validation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct HostValidationConfig {
     /// Explicitly allowed hosts.
     allowed_hosts: HashSet<String>,
@@ -109,17 +121,6 @@ pub struct HostValidationConfig {
     blocked_patterns: Vec<Regex>,
 }
 
-impl Default for HostValidationConfig {
-    fn default() -> Self {
-        Self {
-            allowed_hosts: HashSet::new(),
-            allowed_patterns: Vec::new(),
-            blocked_hosts: HashSet::new(),
-            blocked_patterns: Vec::new(),
-        }
-    }
-}
-
 impl HostValidationConfig {
     /// Creates a new host validation configuration.
     #[must_use]
@@ -131,7 +132,7 @@ impl HostValidationConfig {
     #[must_use]
     pub fn allow_all() -> Self {
         Self {
-            allowed_patterns: vec![Regex::new(".*").expect("valid regex")],
+            allowed_patterns: vec![match_all_regex().clone()],
             ..Self::default()
         }
     }
@@ -154,15 +155,14 @@ impl HostValidationConfig {
 
     /// Adds an allowed host pattern.
     ///
-    /// # Panics
-    ///
-    /// Panics if the pattern is not a valid regex.
+    /// If the pattern is not a valid regex, logs an error and uses a pattern
+    /// that matches nothing.
     #[must_use]
     pub fn allow_pattern(mut self, pattern: &str) -> Self {
         self.allowed_patterns
             .push(Regex::new(pattern).unwrap_or_else(|e| {
                 tracing::error!(pattern, error = %e, "invalid host pattern");
-                Regex::new("^$").expect("empty pattern")
+                match_none_regex().clone()
             }));
         self
     }
@@ -175,12 +175,15 @@ impl HostValidationConfig {
     }
 
     /// Adds a blocked host pattern.
+    ///
+    /// If the pattern is not a valid regex, logs an error and uses a pattern
+    /// that matches nothing.
     #[must_use]
     pub fn block_pattern(mut self, pattern: &str) -> Self {
         self.blocked_patterns
             .push(Regex::new(pattern).unwrap_or_else(|e| {
                 tracing::error!(pattern, error = %e, "invalid host pattern");
-                Regex::new("^$").expect("empty pattern")
+                match_none_regex().clone()
             }));
         self
     }

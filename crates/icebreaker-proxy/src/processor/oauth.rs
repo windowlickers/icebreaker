@@ -80,15 +80,12 @@ impl RequestProcessor for OAuthProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::processor::test_utils::create_test_payload;
     use icebreaker_common::{OAuthGrantType, OAuthMetadata, ProcessorConfig};
     use secrecy::SecretString;
 
-    fn create_test_payload(secret: &str) -> TokenPayload {
-        TokenPayload::builder(
-            SecretString::from(secret),
-            ProcessorConfig::OAuth(OAuthConfig::default()),
-        )
-        .build()
+    fn oauth_config() -> ProcessorConfig {
+        ProcessorConfig::OAuth(OAuthConfig::default())
     }
 
     fn create_default_config() -> OAuthConfig {
@@ -106,7 +103,7 @@ mod tests {
     fn test_oauth_token_injection() {
         let config = create_default_config();
         let processor = OAuthProcessor::new(config);
-        let payload = create_test_payload("access-token-123");
+        let payload = create_test_payload("access-token-123", oauth_config());
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -136,7 +133,7 @@ mod tests {
             header_name: "X-Access-Token".to_string(),
         };
         let processor = OAuthProcessor::new(config);
-        let payload = create_test_payload("my-token");
+        let payload = create_test_payload("my-token", oauth_config());
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -161,8 +158,7 @@ mod tests {
         let processor = OAuthProcessor::new(config);
 
         // Token with OAuth metadata, not expired (far future)
-        let oauth_metadata = OAuthMetadata::new("google")
-            .with_expires_at(u64::MAX);
+        let oauth_metadata = OAuthMetadata::new("google").with_expires_at(u64::MAX);
 
         let payload = TokenPayload::builder(
             SecretString::from("valid-access-token"),
@@ -194,8 +190,7 @@ mod tests {
         let processor = OAuthProcessor::new(config);
 
         // Token with OAuth metadata, expired (timestamp 0 = 1970)
-        let oauth_metadata = OAuthMetadata::new("google")
-            .with_expires_at(0);
+        let oauth_metadata = OAuthMetadata::new("google").with_expires_at(0);
 
         let payload = TokenPayload::builder(
             SecretString::from("expired-access-token"),
@@ -222,7 +217,7 @@ mod tests {
         // should still work - no expiry check is performed
         let config = create_default_config();
         let processor = OAuthProcessor::new(config);
-        let payload = create_test_payload("simple-token");
+        let payload = create_test_payload("simple-token", oauth_config());
 
         let request = Request::builder()
             .uri("https://api.example.com/data")

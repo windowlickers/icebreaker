@@ -44,21 +44,21 @@ pub fn handle_start(
     params: StartParams,
 ) -> Result<StartResponse> {
     // Look up provider configuration
-    let provider_config = service
-        .config()
-        .get_provider(provider_id)
-        .ok_or_else(|| SsoError::ProviderNotFound {
-            provider_id: provider_id.to_string(),
-        })?;
+    let provider_config =
+        service
+            .config()
+            .get_provider(provider_id)
+            .ok_or_else(|| SsoError::ProviderNotFound {
+                provider_id: provider_id.to_string(),
+            })?;
 
     // Get the provider profile
     let profile = service
         .providers()
         .get(&provider_config.profile)
-        .ok_or_else(|| SsoError::ConfigError(format!(
-            "unknown profile: {}",
-            provider_config.profile
-        )))?;
+        .ok_or_else(|| {
+            SsoError::ConfigError(format!("unknown profile: {}", provider_config.profile))
+        })?;
 
     // Generate callback URL
     let callback_url = provider_config.callback_url(&service.config().base_url, provider_id);
@@ -175,7 +175,10 @@ mod tests {
 
         assert_eq!(http_response.status(), StatusCode::FOUND);
         assert_eq!(
-            http_response.headers().get("Location").and_then(|h| h.to_str().ok()),
+            http_response
+                .headers()
+                .get("Location")
+                .and_then(|h| h.to_str().ok()),
             Some("https://auth.example.com/authorize")
         );
     }

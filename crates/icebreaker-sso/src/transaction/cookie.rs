@@ -65,8 +65,8 @@ impl CookieManager {
         let data = rmp_serde::to_vec(state)?;
 
         // Compute HMAC signature
-        let mut mac =
-            HmacSha256::new_from_slice(&self.hmac_key).map_err(|e| SsoError::CryptoError(format!("hmac init failed: {e}")))?;
+        let mut mac = HmacSha256::new_from_slice(&self.hmac_key)
+            .map_err(|e| SsoError::CryptoError(format!("hmac init failed: {e}")))?;
         mac.update(&data);
         let signature = mac.finalize().into_bytes();
 
@@ -94,8 +94,8 @@ impl CookieManager {
         let (signature, data) = combined.split_at(32);
 
         // Verify HMAC signature with constant-time comparison
-        let mut mac =
-            HmacSha256::new_from_slice(&self.hmac_key).map_err(|e| SsoError::CryptoError(format!("hmac init failed: {e}")))?;
+        let mut mac = HmacSha256::new_from_slice(&self.hmac_key)
+            .map_err(|e| SsoError::CryptoError(format!("hmac init failed: {e}")))?;
         mac.update(data);
         let expected = mac.finalize().into_bytes();
 
@@ -297,7 +297,9 @@ mod tests {
             3600,
         );
 
-        let cookie = manager.build_set_cookie(&state).expect("should build cookie");
+        let cookie = manager
+            .build_set_cookie(&state)
+            .expect("should build cookie");
 
         assert!(cookie.contains("test_sso="));
         assert!(cookie.contains("HttpOnly"));

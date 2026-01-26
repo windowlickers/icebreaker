@@ -1,3 +1,6 @@
+// Allow common test patterns in test code
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
+
 //! Common types, errors, and configuration for the Icebreaker tokenizer proxy.
 //!
 //! This crate provides the shared types used across all Icebreaker components:
@@ -16,8 +19,8 @@ pub mod token;
 
 pub use auth::{ApiKeyConfig, AuthConfig, MutualTlsConfig};
 pub use config::{
-    HealthConfig, LoggingConfig, NetworkProtectionConfig, ProxyConfig, RateLimitConfig,
-    ShutdownConfig, TlsConfig,
+    ClientAuthMode, HealthConfig, LoggingConfig, NetworkProtectionConfig, ProxyConfig,
+    RateLimitConfig, ShutdownConfig, TlsConfig,
 };
 pub use error::{Result, TokenizerError};
 pub use processor::{

@@ -1,3 +1,6 @@
+// Allow common test patterns in test code
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
+
 //! Tower middleware and proxy logic for the Icebreaker tokenizer proxy.
 //!
 //! This crate provides the core proxy functionality:
@@ -14,6 +17,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod network;
 pub mod processor;
+pub mod tls;
 pub mod tunnel;
 
 // Re-exports for convenience
@@ -25,9 +29,10 @@ pub use middleware::{
 };
 pub use network::{BlockReason, IpFilter};
 pub use processor::{
-    create_processor, process_body, HmacProcessor, InjectBodyProcessor, InjectProcessor,
-    OAuthProcessor, Processor, RequestProcessor, Sigv4Processor,
+    create_processor, HmacProcessor, InjectBodyProcessor, InjectProcessor, OAuthProcessor,
+    Processor, ProcessorFactory, RequestProcessor, Sigv4Processor,
 };
+pub use tls::{create_tls_acceptor, extract_client_cert_info, TlsAcceptorError};
 pub use tunnel::{is_connect_request, ConnectHandler, TunnelConfig};
 
 // Metrics re-exports

@@ -131,10 +131,7 @@ mod tests {
             Some("https://example.com/callback".to_string())
         );
         assert_eq!(params.state, Some("mystate".to_string()));
-        assert_eq!(
-            params.extra.get("hd"),
-            Some(&"example.com".to_string())
-        );
+        assert_eq!(params.extra.get("hd"), Some(&"example.com".to_string()));
     }
 
     #[test]

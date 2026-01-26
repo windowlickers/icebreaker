@@ -167,7 +167,7 @@ pub struct OAuthErrorResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
+    use crate::provider::test_utils::TestConfigBuilder;
 
     #[derive(Debug)]
     struct TestProfile;
@@ -186,27 +186,12 @@ mod tests {
         }
     }
 
-    fn test_config() -> ProviderConfig {
-        ProviderConfig {
-            profile: "test".to_string(),
-            client_id: "test-client".to_string(),
-            client_secret: SecretString::from("secret"),
-            callback_url: None,
-            scopes: vec![],
-            auth_url: None,
-            token_url: None,
-            pkce: true,
-            allowed_hosts: vec![],
-            allowed_host_pattern: None,
-            forwarded_params: vec![],
-            token_expires_in: None,
-        }
-    }
-
     #[test]
     fn test_build_auth_url() {
         let profile = TestProfile;
-        let config = test_config();
+        let config = TestConfigBuilder::new("test")
+            .client_id("test-client")
+            .build();
 
         let url = profile
             .build_auth_url(
@@ -230,7 +215,9 @@ mod tests {
     #[test]
     fn test_token_exchange_params() {
         let profile = TestProfile;
-        let config = test_config();
+        let config = TestConfigBuilder::new("test")
+            .client_id("test-client")
+            .build();
 
         let params = profile.token_exchange_params(
             &config,

@@ -58,29 +58,12 @@ impl ProviderProfile for GitHubProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
-
-    fn test_config() -> ProviderConfig {
-        ProviderConfig {
-            profile: "github".to_string(),
-            client_id: "github-client-id".to_string(),
-            client_secret: SecretString::from("secret"),
-            callback_url: None,
-            scopes: vec![],
-            auth_url: None,
-            token_url: None,
-            pkce: true,
-            allowed_hosts: vec![],
-            allowed_host_pattern: None,
-            forwarded_params: vec![],
-            token_expires_in: None,
-        }
-    }
+    use crate::provider::test_utils::test_config;
 
     #[test]
     fn test_github_urls() {
         let profile = GitHubProfile;
-        let config = test_config();
+        let config = test_config("github");
 
         assert_eq!(
             profile.auth_url(&config).unwrap(),

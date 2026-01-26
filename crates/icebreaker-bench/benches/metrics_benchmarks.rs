@@ -10,8 +10,8 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use icebreaker_proxy::metrics::{
     record_blocked_address, record_connect_tunnel, record_host_rejection, record_processor_used,
     record_request, record_request_bytes, record_request_duration, record_response_bytes,
-    record_secret_leak_detected, record_token_validation, set_active_connections,
-    BlockReason, TokenValidationResult,
+    record_secret_leak_detected, record_token_validation, set_active_connections, BlockReason,
+    TokenValidationResult,
 };
 
 // ============================================================================

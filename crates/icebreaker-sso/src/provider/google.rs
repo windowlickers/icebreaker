@@ -64,30 +64,13 @@ impl ProviderProfile for GoogleProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
+    use crate::provider::test_utils::test_config;
     use std::collections::HashMap;
-
-    fn test_config() -> ProviderConfig {
-        ProviderConfig {
-            profile: "google".to_string(),
-            client_id: "google-client-id".to_string(),
-            client_secret: SecretString::from("secret"),
-            callback_url: None,
-            scopes: vec![],
-            auth_url: None,
-            token_url: None,
-            pkce: true,
-            allowed_hosts: vec![],
-            allowed_host_pattern: None,
-            forwarded_params: vec![],
-            token_expires_in: None,
-        }
-    }
 
     #[test]
     fn test_google_urls() {
         let profile = GoogleProfile;
-        let config = test_config();
+        let config = test_config("google");
 
         assert_eq!(
             profile.auth_url(&config).unwrap(),
@@ -112,7 +95,7 @@ mod tests {
     #[test]
     fn test_google_forwarded_params() {
         let profile = GoogleProfile;
-        let config = test_config();
+        let config = test_config("google");
 
         let mut extra = HashMap::new();
         extra.insert("hd".to_string(), "example.com".to_string());

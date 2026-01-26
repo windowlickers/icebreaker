@@ -1,3 +1,6 @@
+// Allow common test patterns in test code
+#![cfg_attr(test, allow(clippy::expect_used, clippy::unwrap_used, clippy::panic))]
+
 //! # Icebreaker
 //!
 //! A stateless tokenizer proxy for secure secret injection.

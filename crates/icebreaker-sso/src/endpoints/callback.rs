@@ -91,21 +91,21 @@ pub async fn handle_callback(
     })?;
 
     // Look up provider configuration
-    let provider_config = service
-        .config()
-        .get_provider(provider_id)
-        .ok_or_else(|| SsoError::ProviderNotFound {
-            provider_id: provider_id.to_string(),
-        })?;
+    let provider_config =
+        service
+            .config()
+            .get_provider(provider_id)
+            .ok_or_else(|| SsoError::ProviderNotFound {
+                provider_id: provider_id.to_string(),
+            })?;
 
     // Get the provider profile
     let profile = service
         .providers()
         .get(&provider_config.profile)
-        .ok_or_else(|| SsoError::ConfigError(format!(
-            "unknown profile: {}",
-            provider_config.profile
-        )))?;
+        .ok_or_else(|| {
+            SsoError::ConfigError(format!("unknown profile: {}", provider_config.profile))
+        })?;
 
     // Exchange code for tokens
     let token_url = profile.token_url(provider_config)?;
@@ -189,9 +189,12 @@ async fn exchange_code(
         });
     }
 
-    response.json().await.map_err(|e| SsoError::TokenExchangeFailed {
-        reason: format!("failed to parse response: {e}"),
-    })
+    response
+        .json()
+        .await
+        .map_err(|e| SsoError::TokenExchangeFailed {
+            reason: format!("failed to parse response: {e}"),
+        })
 }
 
 /// Seals OAuth tokens into an icebreaker token.
@@ -229,12 +232,13 @@ fn seal_oauth_token(
     builder = builder.metadata(metadata);
 
     // Add OAuth metadata with refresh token if available
-    let mut oauth_metadata = OAuthMetadata::new(provider_id)
-        .with_token_type(token_response.token_type.clone());
+    let mut oauth_metadata =
+        OAuthMetadata::new(provider_id).with_token_type(token_response.token_type.clone());
 
     // Include refresh token if provided by the OAuth provider
     if let Some(ref refresh_token) = token_response.refresh_token {
-        oauth_metadata = oauth_metadata.with_refresh_token(SecretString::from(refresh_token.clone()));
+        oauth_metadata =
+            oauth_metadata.with_refresh_token(SecretString::from(refresh_token.clone()));
     }
 
     // Set access token expiration from OAuth response

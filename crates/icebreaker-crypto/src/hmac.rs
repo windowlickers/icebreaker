@@ -7,33 +7,40 @@ use subtle::ConstantTimeEq;
 use icebreaker_common::{HmacAlgorithm, Result, TokenizerError};
 
 /// Computes an HMAC signature.
-pub fn compute_signature(key: &[u8], message: &[u8], algorithm: HmacAlgorithm) -> Vec<u8> {
+///
+/// # Errors
+///
+/// Returns an error if the HMAC key is invalid (this should not happen
+/// for SHA-256/SHA-512 which accept any key length).
+pub fn compute_signature(key: &[u8], message: &[u8], algorithm: HmacAlgorithm) -> Result<Vec<u8>> {
     match algorithm {
         HmacAlgorithm::Sha256 => {
-            let mut mac =
-                Hmac::<Sha256>::new_from_slice(key).expect("HMAC can take key of any size");
+            let mut mac = Hmac::<Sha256>::new_from_slice(key)
+                .map_err(|e| TokenizerError::CryptoError(format!("HMAC key error: {e}")))?;
             mac.update(message);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
         HmacAlgorithm::Sha512 => {
-            let mut mac =
-                Hmac::<Sha512>::new_from_slice(key).expect("HMAC can take key of any size");
+            let mut mac = Hmac::<Sha512>::new_from_slice(key)
+                .map_err(|e| TokenizerError::CryptoError(format!("HMAC key error: {e}")))?;
             mac.update(message);
-            mac.finalize().into_bytes().to_vec()
+            Ok(mac.finalize().into_bytes().to_vec())
         }
     }
 }
 
 /// Verifies an HMAC signature using constant-time comparison.
 ///
-/// Returns `true` if the signature is valid.
+/// Returns `true` if the signature is valid, `false` if invalid or on error.
 pub fn verify_signature(
     key: &[u8],
     message: &[u8],
     signature: &[u8],
     algorithm: HmacAlgorithm,
 ) -> bool {
-    let expected = compute_signature(key, message, algorithm);
+    let Ok(expected) = compute_signature(key, message, algorithm) else {
+        return false;
+    };
 
     // Constant-time comparison to prevent timing attacks
     expected.ct_eq(signature).into()
@@ -93,24 +100,35 @@ impl RequestSigner {
     }
 
     /// Signs a message and returns the signature bytes.
-    #[must_use]
-    pub fn sign(&self, message: &[u8]) -> Vec<u8> {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if HMAC computation fails (should not happen for valid keys).
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         compute_signature(&self.key, message, self.algorithm)
     }
 
     /// Signs a message and returns the signature as hex.
-    #[must_use]
-    pub fn sign_hex(&self, message: &[u8]) -> String {
-        signature_to_hex(&self.sign(message))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if HMAC computation fails.
+    pub fn sign_hex(&self, message: &[u8]) -> Result<String> {
+        Ok(signature_to_hex(&self.sign(message)?))
     }
 
     /// Signs a message and returns the signature as base64.
-    #[must_use]
-    pub fn sign_base64(&self, message: &[u8]) -> String {
-        signature_to_base64(&self.sign(message))
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if HMAC computation fails.
+    pub fn sign_base64(&self, message: &[u8]) -> Result<String> {
+        Ok(signature_to_base64(&self.sign(message)?))
     }
 
     /// Verifies a signature.
+    ///
+    /// Returns `true` if the signature is valid, `false` otherwise.
     #[must_use]
     pub fn verify(&self, message: &[u8], signature: &[u8]) -> bool {
         verify_signature(&self.key, message, signature, self.algorithm)
@@ -231,7 +249,8 @@ mod tests {
         let key = b"secret-key";
         let message = b"hello world";
 
-        let signature = compute_signature(key, message, HmacAlgorithm::Sha256);
+        let signature =
+            compute_signature(key, message, HmacAlgorithm::Sha256).expect("should sign");
 
         assert!(verify_signature(
             key,
@@ -258,7 +277,8 @@ mod tests {
         let key = b"secret-key";
         let message = b"hello world";
 
-        let signature = compute_signature(key, message, HmacAlgorithm::Sha512);
+        let signature =
+            compute_signature(key, message, HmacAlgorithm::Sha512).expect("should sign");
 
         assert!(verify_signature(
             key,
@@ -294,7 +314,7 @@ mod tests {
         let signer = RequestSigner::new(b"secret", HmacAlgorithm::Sha256);
 
         let message = b"sign this";
-        let signature = signer.sign(message);
+        let signature = signer.sign(message).expect("should sign");
 
         assert!(signer.verify(message, &signature));
         assert!(!signer.verify(b"wrong", &signature));
@@ -305,7 +325,7 @@ mod tests {
         let signer = RequestSigner::new(b"secret", HmacAlgorithm::Sha256);
 
         let message = b"sign this";
-        let hex_sig = signer.sign_hex(message);
+        let hex_sig = signer.sign_hex(message).expect("should sign");
 
         assert!(signer.verify_hex(message, &hex_sig).expect("should verify"));
     }
@@ -332,7 +352,8 @@ mod tests {
     fn test_constant_time_comparison() {
         let key = b"secret";
         let message = b"test";
-        let signature = compute_signature(key, message, HmacAlgorithm::Sha256);
+        let signature =
+            compute_signature(key, message, HmacAlgorithm::Sha256).expect("should sign");
 
         // Valid signature
         assert!(verify_signature(

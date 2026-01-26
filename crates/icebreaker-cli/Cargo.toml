@@ -49,6 +49,12 @@ http-body = { workspace = true }
 # HTTP client
 reqwest = { workspace = true }
 
+# TLS
+hyper-rustls = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+webpki-roots = { workspace = true }
+
 # Cryptography (for seal command)
 crypto_box = { workspace = true }
 

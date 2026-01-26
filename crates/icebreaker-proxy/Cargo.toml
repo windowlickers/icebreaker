@@ -41,6 +41,9 @@ base64 = { workspace = true }
 tracing = { workspace = true }
 metrics = { workspace = true }
 
+# Date/time
+time = { workspace = true }
+
 # Utilities
 bytes = { workspace = true }
 futures = { workspace = true }
@@ -52,6 +55,17 @@ ipnet = { workspace = true }
 # AWS signing
 aws-sigv4 = { workspace = true }
 aws-credential-types = { workspace = true }
+
+# TLS
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+x509-parser = { workspace = true }
+sha2 = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+hex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

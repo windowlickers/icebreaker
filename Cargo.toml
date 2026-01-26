@@ -92,6 +92,9 @@ metrics-exporter-prometheus = "0.16"
 # Error handling
 thiserror = "2.0"
 
+# Date/time
+time = { version = "0.3", features = ["macros", "parsing"] }
+
 # Utilities
 bytes = "1.9"
 futures = "0.3"
@@ -106,6 +109,14 @@ urlencoding = "2.1"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+
+# TLS
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "tls12", "native-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2.2"
+x509-parser = "0.17"
+webpki-roots = "0.26"
 
 # Testing
 wiremock = "0.6"

@@ -3,15 +3,21 @@
 //! This processor replaces placeholder strings in request bodies with secrets,
 //! enabling token injection for APIs that require credentials in the request
 //! body rather than headers.
+//!
+//! Unlike header processors, body processing requires:
+//! - Async execution to collect the body stream
+//! - A concrete body type that can be consumed and replaced
+//!
+//! This processor does not implement [`RequestProcessor`] because body
+//! modification cannot be done with a generic body type. Instead, use
+//! [`InjectBodyProcessor::process_body`] directly or through [`Processor::process_body`].
 
 use bytes::Bytes;
 use http::{header, Request};
 use http_body::Body;
 use http_body_util::BodyExt;
 
-use icebreaker_common::{InjectBodyConfig, Result, TokenPayload, TokenizerError};
-
-use super::RequestProcessor;
+use icebreaker_common::{InjectBodyConfig, Result, TokenizerError};
 
 /// Processor that injects secrets by replacing placeholders in request bodies.
 #[derive(Debug, Clone)]
@@ -26,6 +32,12 @@ impl InjectBodyProcessor {
         Self { config }
     }
 
+    /// Returns a reference to the processor configuration.
+    #[must_use]
+    pub fn config(&self) -> &InjectBodyConfig {
+        &self.config
+    }
+
     /// Replaces all occurrences of the placeholder with the secret.
     #[must_use]
     pub fn replace_placeholder(&self, body: &[u8], secret: &str) -> Bytes {
@@ -33,86 +45,62 @@ impl InjectBodyProcessor {
         let replaced = body_str.replace(&self.config.placeholder, secret);
         Bytes::from(replaced.into_bytes())
     }
-}
 
-impl RequestProcessor for InjectBodyProcessor {
-    fn process<B>(&self, request: Request<B>, _payload: &TokenPayload) -> Result<Request<B>> {
-        // Note: This implementation has a limitation - it cannot actually modify
-        // the body due to the generic body type constraint. The actual body
-        // modification needs to happen at a different layer where we have access
-        // to the concrete body type.
-        //
-        // For now, we mark the request for body processing by adding a header.
-        // The actual replacement happens in the middleware layer.
+    /// Processes a request body, replacing placeholders with the secret.
+    ///
+    /// This is the primary method for body injection. It collects the body,
+    /// performs replacement, and updates the Content-Length header.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the body cannot be collected or the Content-Length
+    /// header cannot be set.
+    pub async fn process_body<B>(
+        &self,
+        request: Request<B>,
+        secret: &str,
+    ) -> Result<Request<http_body_util::Full<Bytes>>>
+    where
+        B: Body,
+        B::Error: std::fmt::Display,
+    {
+        let (parts, body) = request.into_parts();
+
+        // Collect the body
+        let body_bytes = body
+            .collect()
+            .await
+            .map_err(|e| TokenizerError::HttpError(format!("failed to read request body: {e}")))?
+            .to_bytes();
+
+        // Replace placeholder with secret
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        let replaced = body_str.replace(&self.config.placeholder, secret);
+        let new_body = Bytes::from(replaced.into_bytes());
+
+        // Update content-length header
+        let mut request = Request::from_parts(parts, http_body_util::Full::new(new_body.clone()));
+        request.headers_mut().insert(
+            header::CONTENT_LENGTH,
+            new_body
+                .len()
+                .to_string()
+                .parse()
+                .map_err(|e| TokenizerError::ConfigError(format!("invalid content-length: {e}")))?,
+        );
 
         tracing::debug!(
             placeholder = %self.config.placeholder,
-            "inject body processor configured (body replacement pending)"
+            "replaced placeholder in request body"
         );
 
         Ok(request)
     }
 }
 
-/// Process a request body, replacing placeholders with the secret.
-///
-/// This function is meant to be called from middleware where we have access
-/// to the concrete body type.
-pub async fn process_body<B>(
-    request: Request<B>,
-    config: &InjectBodyConfig,
-    secret: &str,
-) -> Result<Request<http_body_util::Full<Bytes>>>
-where
-    B: Body,
-    B::Error: std::fmt::Display,
-{
-    let (parts, body) = request.into_parts();
-
-    // Collect the body
-    let body_bytes = body
-        .collect()
-        .await
-        .map_err(|e| TokenizerError::HttpError(format!("failed to read request body: {e}")))?
-        .to_bytes();
-
-    // Replace placeholder with secret
-    let body_str = String::from_utf8_lossy(&body_bytes);
-    let replaced = body_str.replace(&config.placeholder, secret);
-    let new_body = Bytes::from(replaced.into_bytes());
-
-    // Update content-length header
-    let mut request = Request::from_parts(parts, http_body_util::Full::new(new_body.clone()));
-    request.headers_mut().insert(
-        header::CONTENT_LENGTH,
-        new_body
-            .len()
-            .to_string()
-            .parse()
-            .map_err(|e| TokenizerError::ConfigError(format!("invalid content-length: {e}")))?,
-    );
-
-    tracing::debug!(
-        placeholder = %config.placeholder,
-        "replaced placeholder in request body"
-    );
-
-    Ok(request)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icebreaker_common::ProcessorConfig;
-    use secrecy::SecretString;
-
-    fn create_test_payload(secret: &str) -> TokenPayload {
-        TokenPayload::builder(
-            SecretString::from(secret),
-            ProcessorConfig::InjectBody(InjectBodyConfig::default()),
-        )
-        .build()
-    }
 
     #[test]
     fn test_placeholder_replacement() {
@@ -147,16 +135,24 @@ mod tests {
         assert_eq!(replaced.as_ref(), b"{\"api_key\": \"my-api-key\"}");
     }
 
+    #[test]
+    fn test_config_accessor() {
+        let config = InjectBodyConfig::new("{{CUSTOM}}");
+        let processor = InjectBodyProcessor::new(config);
+        assert_eq!(processor.config().placeholder, "{{CUSTOM}}");
+    }
+
     #[tokio::test]
     async fn test_process_body() {
-        let config = InjectBodyConfig::default();
+        let processor = InjectBodyProcessor::new(InjectBodyConfig::default());
         let body = http_body_util::Full::new(Bytes::from("{\"token\": \"{{ACCESS_TOKEN}}\"}"));
         let request = Request::builder()
             .uri("https://api.example.com/data")
             .body(body)
             .expect("request should build");
 
-        let processed = process_body(request, &config, "secret123")
+        let processed = processor
+            .process_body(request, "secret123")
             .await
             .expect("should process");
 
@@ -172,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_process_body_updates_content_length() {
-        let config = InjectBodyConfig::new("X");
+        let processor = InjectBodyProcessor::new(InjectBodyConfig::new("X"));
         let body = http_body_util::Full::new(Bytes::from("X"));
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -180,7 +176,8 @@ mod tests {
             .body(body)
             .expect("request should build");
 
-        let processed = process_body(request, &config, "LONG_SECRET")
+        let processed = processor
+            .process_body(request, "LONG_SECRET")
             .await
             .expect("should process");
 

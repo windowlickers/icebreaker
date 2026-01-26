@@ -46,7 +46,9 @@ mod option_secret_string_serde {
         }
     }
 
-    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<Option<SecretString>, D::Error>
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<Option<SecretString>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -350,7 +352,11 @@ pub struct OAuthMetadata {
     /// The refresh token for obtaining new access tokens.
     ///
     /// Stored as a SecretString for secure handling.
-    #[serde(with = "option_secret_string_serde", skip_serializing_if = "Option::is_none", default)]
+    #[serde(
+        with = "option_secret_string_serde",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
     pub refresh_token: Option<SecretString>,
 
     /// The token type (usually "Bearer").
@@ -373,7 +379,10 @@ impl std::fmt::Debug for OAuthMetadata {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OAuthMetadata")
             .field("provider_id", &self.provider_id)
-            .field("refresh_token", &self.refresh_token.as_ref().map(|_| "[REDACTED]"))
+            .field(
+                "refresh_token",
+                &self.refresh_token.as_ref().map(|_| "[REDACTED]"),
+            )
             .field("token_type", &self.token_type)
             .field("scopes", &self.scopes)
             .field("access_token_expires_at", &self.access_token_expires_at)

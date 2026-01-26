@@ -99,10 +99,45 @@ Use proper error handling with `?` and `Result` types.
 
 ## Adding New Processors
 
-1. Define config in `icebreaker-common/src/processor.rs`
-2. Add variant to `ProcessorConfig` enum
-3. Implement `RequestProcessor` trait in `icebreaker-proxy/src/processor/`
-4. Register in `Processor` enum and `create_processor()` function
+The processor system uses a two-phase architecture:
+
+- **Header processors**: Implement `RequestProcessor` trait for synchronous header modifications
+- **Body processors**: Use `Processor::process_body()` for async body modifications
+
+### Adding a Header Processor
+
+1. **Define config** in `icebreaker-common/src/processor.rs`:
+   - Add config struct (e.g., `MyProcessorConfig`)
+   - Add variant to `ProcessorConfig` enum
+   - Add match arm to `processor_type()` method
+
+2. **Create processor module** in `icebreaker-proxy/src/processor/`:
+   - Implement `RequestProcessor` trait for your processor
+
+3. **Register in factory** in `icebreaker-proxy/src/processor/mod.rs`:
+   - Implement `ProcessorFactory` for your config type
+   - Add variant to `Processor` enum
+   - Add match arm in `create_processor()` function
+
+Example `ProcessorFactory` implementation:
+```rust
+impl ProcessorFactory for MyConfig {
+    type Processor = MyProcessor;
+    fn create_processor(&self) -> Self::Processor {
+        MyProcessor::new(self.clone())
+    }
+}
+```
+
+### Adding a Body Processor
+
+Body processors require special handling because body modification is async and requires
+a concrete body type. See `InjectBodyProcessor` for the pattern:
+
+1. Don't implement `RequestProcessor` (body modification can't be done generically)
+2. Add a `process_body()` async method on the processor
+3. Update `Processor::is_body_processor()` and `Processor::process_body()` to handle your variant
+4. Note: The standard middleware warns when body processors are used - compose with a body-collecting layer or call `process_body()` directly
 
 ## Key Files by Feature
 
@@ -110,11 +145,14 @@ Use proper error handling with `?` and `Result` types.
 |---------|----------|
 | Token types | `icebreaker-common/src/token.rs` |
 | Error handling | `icebreaker-common/src/error.rs` |
+| Processor configs | `icebreaker-common/src/processor.rs` |
 | Cryptographic ops | `icebreaker-crypto/src/sealed_box.rs`, `keypair.rs`, `hmac.rs` |
 | Token injection | `icebreaker-proxy/src/middleware/token_injection.rs` |
+| Processor factory | `icebreaker-proxy/src/processor/mod.rs` |
 | Response scanning | `icebreaker-proxy/src/middleware/response_scan.rs`, `body/scanning.rs` |
 | SSRF prevention | `icebreaker-proxy/src/network/ip_filter.rs` |
 | CONNECT tunneling | `icebreaker-proxy/src/tunnel/connect_handler.rs` |
+| TLS/mTLS support | `icebreaker-proxy/src/tls/acceptor.rs`, `tls/cert_extract.rs` |
 | Metrics | `icebreaker-proxy/src/metrics/mod.rs` |
 | CLI entry point | `icebreaker-cli/src/main.rs` |
 
@@ -148,3 +186,27 @@ helm install icebreaker deploy/helm/icebreaker --set icebreaker.existingSecret="
 ```
 
 Health endpoints: `/healthz` (liveness), `/readyz` (readiness)
+
+## mTLS Client Authentication
+
+mTLS is fully supported with the following CLI arguments:
+
+```bash
+icebreaker serve --tls-cert server.crt --tls-key server.key \
+    --tls-client-ca ca.crt --tls-client-auth required
+```
+
+| Argument | Environment Variable | Description |
+|----------|---------------------|-------------|
+| `--tls-cert` | `ICEBREAKER_TLS_CERT` | Path to server certificate |
+| `--tls-key` | `ICEBREAKER_TLS_KEY` | Path to server private key |
+| `--tls-client-ca` | `ICEBREAKER_TLS_CLIENT_CA` | Path to client CA certificate |
+| `--tls-client-auth` | `ICEBREAKER_TLS_CLIENT_AUTH` | Client auth mode: `none`, `optional`, `required` |
+
+The `TlsConnectionInfo` (containing cert fingerprint and subject DN) is automatically extracted and passed to the middleware stack for token validation.
+
+## Known Limitations
+
+### CONNECT Tunnel Limitations
+
+The CONNECT tunnel handler (`icebreaker-proxy/src/tunnel/connect_handler.rs`) supports HTTPS destinations but only validates tokens - it cannot inject credentials since the tunnel is encrypted end-to-end. For credential injection, use the proxy's request forwarding mode instead.

@@ -9,6 +9,7 @@ use bytes::Bytes;
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use http_body_util::BodyExt;
 
+use http::Request;
 use icebreaker_bench::{
     create_test_crypto, create_test_payload_with_secret, generate_random_bytes,
 };
@@ -21,7 +22,6 @@ use icebreaker_proxy::{
     create_processor, HostValidationConfig, IpFilter, OverlapBuffer, RateLimiter, ScanningBody,
     StreamScanner,
 };
-use http::Request;
 use secrecy::SecretString;
 use std::net::IpAddr;
 
@@ -442,14 +442,9 @@ fn bench_network_protection_pipeline(c: &mut Criterion) {
     let filter = IpFilter::new(&NetworkProtectionConfig::default()).unwrap();
 
     // Simulate DNS resolution results
-    let public_ips: Vec<IpAddr> = vec![
-        "8.8.8.8".parse().unwrap(),
-        "8.8.4.4".parse().unwrap(),
-    ];
-    let private_ips: Vec<IpAddr> = vec![
-        "10.0.0.1".parse().unwrap(),
-        "192.168.1.1".parse().unwrap(),
-    ];
+    let public_ips: Vec<IpAddr> = vec!["8.8.8.8".parse().unwrap(), "8.8.4.4".parse().unwrap()];
+    let private_ips: Vec<IpAddr> =
+        vec!["10.0.0.1".parse().unwrap(), "192.168.1.1".parse().unwrap()];
 
     let mut group = c.benchmark_group("network_protection_pipeline");
 
@@ -464,7 +459,11 @@ fn bench_network_protection_pipeline(c: &mut Criterion) {
 
     // Validate a batch with mixed IPs (should catch private)
     group.bench_function("validate_mixed_batch", |b| {
-        let mixed: Vec<IpAddr> = public_ips.iter().chain(private_ips.iter()).copied().collect();
+        let mixed: Vec<IpAddr> = public_ips
+            .iter()
+            .chain(private_ips.iter())
+            .copied()
+            .collect();
         b.iter(|| {
             for ip in &mixed {
                 let _ = black_box(filter.validate_ip(black_box(ip)));

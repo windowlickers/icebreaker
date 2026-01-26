@@ -68,32 +68,21 @@ impl ProviderProfile for MicrosoftProfile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use secrecy::SecretString;
-
-    fn test_config() -> ProviderConfig {
-        ProviderConfig {
-            profile: "microsoft".to_string(),
-            client_id: "microsoft-client-id".to_string(),
-            client_secret: SecretString::from("secret"),
-            callback_url: None,
-            scopes: vec![],
-            auth_url: None,
-            token_url: None,
-            pkce: true,
-            allowed_hosts: vec![],
-            allowed_host_pattern: None,
-            forwarded_params: vec![],
-            token_expires_in: None,
-        }
-    }
+    use crate::provider::test_utils::test_config;
 
     #[test]
     fn test_microsoft_urls() {
         let profile = MicrosoftProfile;
-        let config = test_config();
+        let config = test_config("microsoft");
 
-        assert!(profile.auth_url(&config).unwrap().contains("microsoftonline.com"));
-        assert!(profile.token_url(&config).unwrap().contains("microsoftonline.com"));
+        assert!(profile
+            .auth_url(&config)
+            .unwrap()
+            .contains("microsoftonline.com"));
+        assert!(profile
+            .token_url(&config)
+            .unwrap()
+            .contains("microsoftonline.com"));
     }
 
     #[test]
@@ -107,10 +96,9 @@ mod tests {
     #[test]
     fn test_custom_tenant() {
         let profile = MicrosoftProfile;
-        let mut config = test_config();
-        config.auth_url = Some(
-            "https://login.microsoftonline.com/mytenant/oauth2/v2.0/authorize".to_string(),
-        );
+        let mut config = test_config("microsoft");
+        config.auth_url =
+            Some("https://login.microsoftonline.com/mytenant/oauth2/v2.0/authorize".to_string());
 
         assert!(profile.auth_url(&config).unwrap().contains("mytenant"));
     }

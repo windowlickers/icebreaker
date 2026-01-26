@@ -48,12 +48,7 @@ pub struct TransactionState {
 impl TransactionState {
     /// Creates a new transaction state.
     #[must_use]
-    pub fn new(
-        nonce: String,
-        provider_id: String,
-        redirect_uri: String,
-        ttl_seconds: u64,
-    ) -> Self {
+    pub fn new(nonce: String, provider_id: String, redirect_uri: String, ttl_seconds: u64) -> Self {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
