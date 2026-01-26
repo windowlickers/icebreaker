@@ -19,6 +19,14 @@ use http_body_util::BodyExt;
 
 use icebreaker_common::{InjectBodyConfig, Result, TokenizerError};
 
+/// Checks if `haystack` contains `needle` as a subsequence.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
 /// Processor that injects secrets by replacing placeholders in request bodies.
 #[derive(Debug, Clone)]
 pub struct InjectBodyProcessor {
@@ -39,11 +47,35 @@ impl InjectBodyProcessor {
     }
 
     /// Replaces all occurrences of the placeholder with the secret.
+    ///
+    /// This operates at the byte level to preserve binary data integrity.
+    /// Only the placeholder bytes are replaced; surrounding binary content
+    /// (protobuf, multipart, etc.) is left untouched.
     #[must_use]
     pub fn replace_placeholder(&self, body: &[u8], secret: &str) -> Bytes {
-        let body_str = String::from_utf8_lossy(body);
-        let replaced = body_str.replace(&self.config.placeholder, secret);
-        Bytes::from(replaced.into_bytes())
+        let placeholder = self.config.placeholder.as_bytes();
+        let replacement = secret.as_bytes();
+
+        // Fast path: no placeholder found
+        if !contains_bytes(body, placeholder) {
+            return Bytes::copy_from_slice(body);
+        }
+
+        // Replace all occurrences at byte level
+        let mut result = Vec::with_capacity(body.len());
+        let mut i = 0;
+
+        while i < body.len() {
+            if body[i..].starts_with(placeholder) {
+                result.extend_from_slice(replacement);
+                i += placeholder.len();
+            } else {
+                result.push(body[i]);
+                i += 1;
+            }
+        }
+
+        Bytes::from(result)
     }
 
     /// Processes a request body, replacing placeholders with the secret.
@@ -73,10 +105,8 @@ impl InjectBodyProcessor {
             .map_err(|e| TokenizerError::HttpError(format!("failed to read request body: {e}")))?
             .to_bytes();
 
-        // Replace placeholder with secret
-        let body_str = String::from_utf8_lossy(&body_bytes);
-        let replaced = body_str.replace(&self.config.placeholder, secret);
-        let new_body = Bytes::from(replaced.into_bytes());
+        // Replace placeholder with secret at byte level to preserve binary data
+        let new_body = self.replace_placeholder(&body_bytes, secret);
 
         // Update content-length header
         let mut request = Request::from_parts(parts, http_body_util::Full::new(new_body.clone()));
@@ -133,6 +163,45 @@ mod tests {
         let body = b"{\"api_key\": \"__SECRET__\"}";
         let replaced = processor.replace_placeholder(body, "my-api-key");
         assert_eq!(replaced.as_ref(), b"{\"api_key\": \"my-api-key\"}");
+    }
+
+    #[test]
+    fn test_binary_data_preserved() {
+        // Binary data with invalid UTF-8 sequences mixed with a placeholder
+        let processor = InjectBodyProcessor::new(InjectBodyConfig::default());
+
+        // 0x80-0xFF are invalid UTF-8 lead bytes
+        let binary_prefix: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A]; // PNG magic bytes
+        let placeholder = b"{{ACCESS_TOKEN}}";
+        let binary_suffix: &[u8] = &[0xFF, 0xD8, 0xFF, 0xE0]; // JPEG magic bytes
+
+        let mut body = Vec::new();
+        body.extend_from_slice(binary_prefix);
+        body.extend_from_slice(placeholder);
+        body.extend_from_slice(binary_suffix);
+
+        let replaced = processor.replace_placeholder(&body, "secret");
+
+        // Verify binary portions are preserved exactly
+        let expected_len = binary_prefix.len() + b"secret".len() + binary_suffix.len();
+        assert_eq!(replaced.len(), expected_len);
+        assert_eq!(&replaced[..binary_prefix.len()], binary_prefix);
+        assert_eq!(
+            &replaced[binary_prefix.len()..binary_prefix.len() + 6],
+            b"secret"
+        );
+        assert_eq!(&replaced[binary_prefix.len() + 6..], binary_suffix);
+    }
+
+    #[test]
+    fn test_pure_binary_no_placeholder() {
+        // Pure binary data without any placeholder should pass through unchanged
+        let processor = InjectBodyProcessor::new(InjectBodyConfig::default());
+        let binary_data: &[u8] = &[0x00, 0x01, 0x80, 0xFF, 0xFE, 0x89, 0x50, 0x4E, 0x47];
+
+        let replaced = processor.replace_placeholder(binary_data, "secret");
+
+        assert_eq!(replaced.as_ref(), binary_data);
     }
 
     #[test]
