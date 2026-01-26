@@ -74,9 +74,9 @@ impl Service<Uri> for ValidatingConnector {
             });
 
             // Validate hostname first (blocked hostnames check)
-            ip_filter.validate_hostname(host).map_err(|e| {
-                io::Error::new(io::ErrorKind::PermissionDenied, e.to_string())
-            })?;
+            ip_filter
+                .validate_hostname(host)
+                .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e.to_string()))?;
 
             // Resolve DNS (following ConnectHandler pattern)
             let addr_string = format!("{host}:{port}");
@@ -309,7 +309,9 @@ mod tests {
         let filter = Arc::new(IpFilter::new(&config).expect("valid config"));
         let connector = ValidatingConnector::new(filter);
 
-        let uri: Uri = "http://evil.example.com:8080/test".parse().expect("valid URI");
+        let uri: Uri = "http://evil.example.com:8080/test"
+            .parse()
+            .expect("valid URI");
 
         let mut svc = connector;
         let result = svc.call(uri).await;
