@@ -27,6 +27,7 @@ use tower::{Layer, Service};
 use icebreaker_common::{SealedToken, TokenizerError};
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 
+use crate::middleware::response_scan::ScanPatterns;
 use crate::metrics::{
     record_host_rejection, record_processor_used, record_token_validation, TokenValidationResult,
 };
@@ -39,12 +40,24 @@ pub const TOKEN_HEADER: &str = "X-Tokenizer-Token";
 #[derive(Clone)]
 pub struct TokenInjectionLayer {
     crypto: Arc<TokenCrypto>,
+    response_scan_enabled: bool,
 }
 
 impl TokenInjectionLayer {
-    /// Creates a new token injection layer.
+    /// Creates a new token injection layer with response scanning enabled.
     pub fn new(crypto: Arc<TokenCrypto>) -> Self {
-        Self { crypto }
+        Self {
+            crypto,
+            response_scan_enabled: true,
+        }
+    }
+
+    /// Creates a new token injection layer with configurable response scanning.
+    pub fn with_response_scan(crypto: Arc<TokenCrypto>, enabled: bool) -> Self {
+        Self {
+            crypto,
+            response_scan_enabled: enabled,
+        }
     }
 }
 
@@ -55,6 +68,7 @@ impl<S> Layer<S> for TokenInjectionLayer {
         TokenInjectionService {
             inner,
             crypto: self.crypto.clone(),
+            response_scan_enabled: self.response_scan_enabled,
         }
     }
 }
@@ -64,12 +78,26 @@ impl<S> Layer<S> for TokenInjectionLayer {
 pub struct TokenInjectionService<S> {
     inner: S,
     crypto: Arc<TokenCrypto>,
+    response_scan_enabled: bool,
 }
 
 impl<S> TokenInjectionService<S> {
-    /// Creates a new token injection service.
+    /// Creates a new token injection service with response scanning enabled.
     pub fn new(inner: S, crypto: Arc<TokenCrypto>) -> Self {
-        Self { inner, crypto }
+        Self {
+            inner,
+            crypto,
+            response_scan_enabled: true,
+        }
+    }
+
+    /// Creates a new token injection service with configurable response scanning.
+    pub fn with_response_scan(inner: S, crypto: Arc<TokenCrypto>, enabled: bool) -> Self {
+        Self {
+            inner,
+            crypto,
+            response_scan_enabled: enabled,
+        }
     }
 }
 
@@ -93,6 +121,7 @@ where
     fn call(&mut self, mut request: Request<ReqBody>) -> Self::Future {
         let crypto = self.crypto.clone();
         let mut inner = self.inner.clone();
+        let response_scan_enabled = self.response_scan_enabled;
 
         Box::pin(async move {
             // Extract the token header
@@ -178,7 +207,17 @@ where
             }
 
             // Process headers (no-op for body processors)
-            let processed_request = processor.process(request, &payload)?;
+            let mut processed_request = processor.process(request, &payload)?;
+
+            // Store the secret in request extensions for response scanning.
+            // This enables DynamicResponseScanLayer to scan response bodies
+            // for accidental leaks of the injected secret.
+            if response_scan_enabled {
+                let secret_bytes = payload.expose_secret().as_bytes().to_vec();
+                processed_request
+                    .extensions_mut()
+                    .insert(ScanPatterns(vec![secret_bytes]));
+            }
 
             // Forward to inner service
             inner

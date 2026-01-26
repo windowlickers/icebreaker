@@ -29,8 +29,8 @@ use icebreaker_common::{
 };
 use icebreaker_crypto::{KeyStore, Keypair, TlsConnectionInfo, TokenCrypto, VersionedKeypair};
 use icebreaker_proxy::{
-    create_tls_acceptor, extract_client_cert_info, IpFilter, MetricsLayer, TokenInjectionLayer,
-    ValidatingConnector,
+    create_tls_acceptor, extract_client_cert_info, DynamicResponseScanLayer, IpFilter,
+    MetricsLayer, TokenInjectionLayer, ValidatingConnector,
 };
 
 /// Icebreaker - A stateless tokenizer proxy
@@ -129,6 +129,10 @@ struct ServeArgs {
     /// Client authentication mode: none, optional, or required
     #[arg(long, default_value = "none", env = "ICEBREAKER_TLS_CLIENT_AUTH")]
     tls_client_auth: String,
+
+    /// Enable response body scanning for secret leaks
+    #[arg(long, default_value = "true", env = "ICEBREAKER_RESPONSE_SCAN_ENABLED")]
+    response_scan_enabled: bool,
 }
 
 #[derive(Parser)]
@@ -526,6 +530,7 @@ async fn handle_connection<I>(
     ip_filter: Arc<IpFilter>,
     tls_info: Option<TlsConnectionInfo>,
     remote_addr: SocketAddr,
+    response_scan_enabled: bool,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -533,10 +538,19 @@ async fn handle_connection<I>(
     let proxy_service = ProxyService::new(ip_filter);
 
     // Build the middleware stack
+    // Note: DynamicResponseScanLayer must come after TokenInjectionLayer
+    // so it can read the ScanPatterns stored by token injection.
+    // When response_scan_enabled is true, TokenInjectionLayer stores the secret
+    // as ScanPatterns, and DynamicResponseScanLayer wraps response bodies
+    // to detect accidental leaks of the injected secret.
     let service = ServiceBuilder::new()
         .layer(TraceLayer::new_for_http())
         .layer(MetricsLayer::new())
-        .layer(TokenInjectionLayer::new(crypto))
+        .layer(TokenInjectionLayer::with_response_scan(
+            crypto,
+            response_scan_enabled,
+        ))
+        .layer(DynamicResponseScanLayer::new())
         .service(proxy_service);
 
     // Create a service function that handles the request and injects TLS info
@@ -674,6 +688,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         let tls_enabled = tls_acceptor.is_some();
+        let response_scan_enabled = args.response_scan_enabled;
 
         tracing::info!(
             bind = %config.bind_addr(),
@@ -682,6 +697,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             health_port = %health_config.port,
             shutdown_timeout = ?shutdown_config.timeout,
             tls_enabled = %tls_enabled,
+            response_scan_enabled = %response_scan_enabled,
             "starting icebreaker proxy"
         );
 
@@ -760,8 +776,15 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                             Ok(tls_stream) => {
                                 let tls_info = extract_client_cert_info(&tls_stream);
                                 let io = TokioIo::new(tls_stream);
-                                handle_connection(io, crypto, ip_filter, tls_info, remote_addr)
-                                    .await;
+                                handle_connection(
+                                    io,
+                                    crypto,
+                                    ip_filter,
+                                    tls_info,
+                                    remote_addr,
+                                    response_scan_enabled,
+                                )
+                                .await;
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -774,7 +797,15 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         // Plain TCP connection
                         let io = TokioIo::new(stream);
-                        handle_connection(io, crypto, ip_filter, None, remote_addr).await;
+                        handle_connection(
+                            io,
+                            crypto,
+                            ip_filter,
+                            None,
+                            remote_addr,
+                            response_scan_enabled,
+                        )
+                        .await;
                     }
 
                     // Connection finished
