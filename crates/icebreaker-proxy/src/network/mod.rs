@@ -23,5 +23,7 @@
 //! ```
 
 mod ip_filter;
+mod validating_connector;
 
 pub use ip_filter::{BlockReason, IpFilter};
+pub use validating_connector::{ValidatingConnector, ValidatingStream};

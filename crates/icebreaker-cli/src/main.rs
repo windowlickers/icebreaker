@@ -24,12 +24,13 @@ use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use icebreaker_common::{
-    ClientAuthMode, HealthConfig, InjectConfig, ProcessorConfig, ProxyConfig, ShutdownConfig,
-    TlsConfig,
+    ClientAuthMode, HealthConfig, InjectConfig, NetworkProtectionConfig, ProcessorConfig,
+    ProxyConfig, ShutdownConfig, TlsConfig,
 };
 use icebreaker_crypto::{KeyStore, Keypair, TlsConnectionInfo, TokenCrypto, VersionedKeypair};
 use icebreaker_proxy::{
-    create_tls_acceptor, extract_client_cert_info, MetricsLayer, TokenInjectionLayer,
+    create_tls_acceptor, extract_client_cert_info, IpFilter, MetricsLayer, TokenInjectionLayer,
+    ValidatingConnector,
 };
 
 /// Icebreaker - A stateless tokenizer proxy
@@ -211,11 +212,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Type alias for the HTTPS connector.
-type HttpsConnector =
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>;
+/// Type alias for the HTTPS connector with SSRF protection.
+type HttpsConnector = hyper_rustls::HttpsConnector<ValidatingConnector>;
 
-/// Type alias for the HTTP client with TLS support.
+/// Type alias for the HTTP client with TLS support and SSRF protection.
 type HttpClient = Client<HttpsConnector, BoxBody<Bytes, std::convert::Infallible>>;
 
 /// Shared state for graceful shutdown coordination.
@@ -415,14 +415,17 @@ struct ProxyService {
 }
 
 impl ProxyService {
-    /// Creates a new proxy service with HTTPS support.
-    fn new() -> Self {
-        // Build HTTPS connector with native root certificates
+    /// Creates a new proxy service with HTTPS support and SSRF protection.
+    fn new(ip_filter: Arc<IpFilter>) -> Self {
+        // Build validating connector with SSRF protection
+        let validating = ValidatingConnector::new(ip_filter);
+
+        // Wrap with HTTPS support using native root certificates
         let https = HttpsConnectorBuilder::new()
             .with_webpki_roots()
             .https_or_http()
             .enable_http1()
-            .build();
+            .wrap_connector(validating);
 
         let client: HttpClient = Client::builder(TokioExecutor::new()).build(https);
         Self { client }
@@ -520,13 +523,14 @@ impl Service<Request<Incoming>> for ProxyService {
 async fn handle_connection<I>(
     io: I,
     crypto: Arc<TokenCrypto>,
+    ip_filter: Arc<IpFilter>,
     tls_info: Option<TlsConnectionInfo>,
     remote_addr: SocketAddr,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
-    // Create the proxy service for this connection
-    let proxy_service = ProxyService::new();
+    // Create the proxy service for this connection with SSRF protection
+    let proxy_service = ProxyService::new(ip_filter);
 
     // Build the middleware stack
     let service = ServiceBuilder::new()
@@ -614,6 +618,13 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let versioned = VersionedKeypair::new(&args.key_id, keypair, 1);
         let key_store = KeyStore::with_primary(versioned);
         let crypto = Arc::new(TokenCrypto::new(key_store));
+
+        // Create network protection filter for SSRF prevention
+        let network_config = NetworkProtectionConfig::default();
+        let ip_filter = Arc::new(
+            IpFilter::new(&network_config)
+                .map_err(|e| format!("failed to create IP filter: {e}"))?,
+        );
 
         // Build health config
         let health_config = HealthConfig {
@@ -734,6 +745,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 let crypto = crypto.clone();
+                let ip_filter = ip_filter.clone();
                 let conn_state = accept_state.clone();
                 let tls_acceptor = tls_acceptor.clone();
 
@@ -748,7 +760,8 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                             Ok(tls_stream) => {
                                 let tls_info = extract_client_cert_info(&tls_stream);
                                 let io = TokioIo::new(tls_stream);
-                                handle_connection(io, crypto, tls_info, remote_addr).await;
+                                handle_connection(io, crypto, ip_filter, tls_info, remote_addr)
+                                    .await;
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -761,7 +774,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         // Plain TCP connection
                         let io = TokioIo::new(stream);
-                        handle_connection(io, crypto, None, remote_addr).await;
+                        handle_connection(io, crypto, ip_filter, None, remote_addr).await;
                     }
 
                     // Connection finished

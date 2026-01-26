@@ -27,7 +27,7 @@ pub use middleware::{
     MetricsService, RateLimitLayer, RateLimiter, ResponseScanLayer, ScanPatterns,
     TokenInjectionLayer, TOKEN_HEADER,
 };
-pub use network::{BlockReason, IpFilter};
+pub use network::{BlockReason, IpFilter, ValidatingConnector, ValidatingStream};
 pub use processor::{
     create_processor, HmacProcessor, InjectBodyProcessor, InjectProcessor, OAuthProcessor,
     Processor, ProcessorFactory, RequestProcessor, Sigv4Processor,
