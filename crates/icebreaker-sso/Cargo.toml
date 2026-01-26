@@ -1,0 +1,67 @@
+[package]
+name = "icebreaker-sso"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "OAuth orchestration service for Icebreaker tokenizer proxy"
+
+[lints]
+workspace = true
+
+[dependencies]
+# Internal crates
+icebreaker-common = { path = "../icebreaker-common" }
+icebreaker-crypto = { path = "../icebreaker-crypto" }
+
+# Async runtime
+tokio.workspace = true
+
+# HTTP
+hyper.workspace = true
+hyper-util.workspace = true
+http.workspace = true
+http-body.workspace = true
+http-body-util.workspace = true
+
+# HTTP client
+reqwest.workspace = true
+
+# Serialization
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+rmp-serde.workspace = true
+base64.workspace = true
+
+# Cryptography
+sha2.workspace = true
+hmac.workspace = true
+rand.workspace = true
+subtle.workspace = true
+
+# Secret management
+secrecy.workspace = true
+zeroize.workspace = true
+
+# URL handling
+url.workspace = true
+
+# Observability
+tracing.workspace = true
+
+# Error handling
+thiserror.workspace = true
+
+# Utilities
+bytes.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+pin-project-lite.workspace = true
+cookie.workspace = true
+urlencoding.workspace = true
+
+[dev-dependencies]
+wiremock.workspace = true
+tokio-test.workspace = true

@@ -19,6 +19,7 @@ icebreaker-common = { path = "../icebreaker-common" }
 icebreaker-crypto = { path = "../icebreaker-crypto" }
 icebreaker-proxy = { path = "../icebreaker-proxy" }
 icebreaker-audit = { path = "../icebreaker-audit" }
+icebreaker-sso = { path = "../icebreaker-sso" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -39,10 +40,14 @@ clap = { workspace = true }
 # Serialization
 serde = { workspace = true }
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 base64 = { workspace = true }
 hex = { workspace = true }
 bytes = { workspace = true }
 http-body = { workspace = true }
+
+# HTTP client
+reqwest = { workspace = true }
 
 # Cryptography (for seal command)
 crypto_box = { workspace = true }

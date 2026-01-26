@@ -24,4 +24,4 @@ pub use processor::{
     CachedOAuthToken, HmacAlgorithm, HmacConfig, InjectBodyConfig, InjectConfig, OAuthConfig,
     OAuthGrantType, ProcessorConfig, Sigv4Config,
 };
-pub use token::{SealedToken, TokenMetadata, TokenPayload};
+pub use token::{OAuthMetadata, SealedToken, TokenMetadata, TokenPayload};

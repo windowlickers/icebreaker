@@ -1,8 +1,12 @@
-//! OAuth token refresh processor.
+//! OAuth token injection processor.
 //!
-//! Note: This is a placeholder implementation. Full OAuth token refresh
-//! requires async HTTP client which would need to be injected or handled
-//! at a higher level.
+//! This processor injects OAuth access tokens into requests. The sealed token
+//! contains the access token (as the secret) and optional OAuth metadata with
+//! refresh token and expiration information.
+//!
+//! Token refresh is handled out-of-band by the SSO service's `/refresh` endpoint.
+//! When an access token is expired, this processor returns an error indicating
+//! the client should refresh the token via the SSO service.
 
 use http::{header::HeaderName, HeaderValue, Request};
 
@@ -12,9 +16,10 @@ use super::RequestProcessor;
 
 /// Processor that handles OAuth token injection.
 ///
-/// For the initial implementation, this injects the secret directly as the
-/// access token. Full OAuth token refresh with client credentials flow
-/// would require async HTTP client support.
+/// The sealed token's secret is treated as the access token and injected
+/// as a Bearer token. If the token contains OAuth metadata indicating
+/// the access token has expired, an error is returned so the client
+/// can refresh the token via the SSO service.
 #[derive(Debug, Clone)]
 pub struct OAuthProcessor {
     config: OAuthConfig,
@@ -30,12 +35,21 @@ impl OAuthProcessor {
 
 impl RequestProcessor for OAuthProcessor {
     fn process<B>(&self, mut request: Request<B>, payload: &TokenPayload) -> Result<Request<B>> {
-        // For now, we treat the secret as the access token
-        // A full implementation would:
-        // 1. Check if we have a cached token
-        // 2. If expired, refresh using the OAuth flow
-        // 3. Inject the fresh token
+        // Check if the OAuth access token has expired
+        // This happens when the sealed token contains OAuthMetadata with expiration info
+        if let Some(ref oauth) = payload.oauth {
+            if oauth.is_access_token_expired() {
+                tracing::warn!(
+                    provider_id = %oauth.provider_id,
+                    "OAuth access token has expired, client should refresh via SSO service"
+                );
+                return Err(TokenizerError::OAuthRefreshError(
+                    "access token expired, refresh required".to_string(),
+                ));
+            }
+        }
 
+        // The secret in the payload is the access token
         let token_value = format!("Bearer {}", payload.expose_secret());
 
         // Parse header name
@@ -55,6 +69,7 @@ impl RequestProcessor for OAuthProcessor {
 
         tracing::debug!(
             header = %self.config.header_name,
+            has_oauth_metadata = %payload.oauth.is_some(),
             "injected OAuth token into request header"
         );
 
@@ -65,7 +80,7 @@ impl RequestProcessor for OAuthProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use icebreaker_common::{OAuthGrantType, ProcessorConfig};
+    use icebreaker_common::{OAuthGrantType, OAuthMetadata, ProcessorConfig};
     use secrecy::SecretString;
 
     fn create_test_payload(secret: &str) -> TokenPayload {
@@ -76,16 +91,20 @@ mod tests {
         .build()
     }
 
-    #[test]
-    fn test_oauth_token_injection() {
-        let config = OAuthConfig {
+    fn create_default_config() -> OAuthConfig {
+        OAuthConfig {
             token_url: "https://auth.example.com/token".to_string(),
             client_id: "my-client".to_string(),
             client_secret_in_payload: true,
             grant_type: OAuthGrantType::ClientCredentials,
             scopes: vec!["read".to_string(), "write".to_string()],
             header_name: "Authorization".to_string(),
-        };
+        }
+    }
+
+    #[test]
+    fn test_oauth_token_injection() {
+        let config = create_default_config();
         let processor = OAuthProcessor::new(config);
         let payload = create_test_payload("access-token-123");
 
@@ -134,5 +153,91 @@ mod tests {
             .expect("should have custom header");
 
         assert_eq!(header, "Bearer my-token");
+    }
+
+    #[test]
+    fn test_oauth_with_valid_metadata() {
+        let config = create_default_config();
+        let processor = OAuthProcessor::new(config);
+
+        // Token with OAuth metadata, not expired (far future)
+        let oauth_metadata = OAuthMetadata::new("google")
+            .with_expires_at(u64::MAX);
+
+        let payload = TokenPayload::builder(
+            SecretString::from("valid-access-token"),
+            ProcessorConfig::OAuth(OAuthConfig::default()),
+        )
+        .oauth(oauth_metadata)
+        .build();
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        let processed = processor
+            .process(request, &payload)
+            .expect("should process");
+
+        let auth_header = processed
+            .headers()
+            .get("Authorization")
+            .expect("should have auth header");
+
+        assert_eq!(auth_header, "Bearer valid-access-token");
+    }
+
+    #[test]
+    fn test_oauth_with_expired_token() {
+        let config = create_default_config();
+        let processor = OAuthProcessor::new(config);
+
+        // Token with OAuth metadata, expired (timestamp 0 = 1970)
+        let oauth_metadata = OAuthMetadata::new("google")
+            .with_expires_at(0);
+
+        let payload = TokenPayload::builder(
+            SecretString::from("expired-access-token"),
+            ProcessorConfig::OAuth(OAuthConfig::default()),
+        )
+        .oauth(oauth_metadata)
+        .build();
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        let result = processor.process(request, &payload);
+
+        assert!(result.is_err());
+        let error = result.unwrap_err();
+        assert!(matches!(error, TokenizerError::OAuthRefreshError(_)));
+    }
+
+    #[test]
+    fn test_oauth_without_metadata_no_expiry_check() {
+        // Tokens without OAuth metadata (e.g., from non-SSO sources)
+        // should still work - no expiry check is performed
+        let config = create_default_config();
+        let processor = OAuthProcessor::new(config);
+        let payload = create_test_payload("simple-token");
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        let processed = processor
+            .process(request, &payload)
+            .expect("should process without oauth metadata");
+
+        let auth_header = processed
+            .headers()
+            .get("Authorization")
+            .expect("should have auth header");
+
+        assert_eq!(auth_header, "Bearer simple-token");
     }
 }

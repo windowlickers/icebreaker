@@ -40,6 +40,9 @@ enum Commands {
     /// Run the proxy server
     Serve(ServeArgs),
 
+    /// Run the SSO OAuth orchestration server
+    Sso(SsoArgs),
+
     /// Generate a new keypair
     Keygen(KeygenArgs),
 
@@ -154,11 +157,27 @@ struct InspectArgs {
     token: String,
 }
 
+#[derive(Parser)]
+struct SsoArgs {
+    /// Path to SSO configuration file
+    #[arg(short, long, env = "ICEBREAKER_SSO_CONFIG")]
+    config: String,
+
+    /// Log level
+    #[arg(long, default_value = "info", env = "ICEBREAKER_LOG_LEVEL")]
+    log_level: String,
+
+    /// Output logs as JSON
+    #[arg(long, env = "ICEBREAKER_LOG_JSON")]
+    log_json: bool,
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
     match cli.command {
         Commands::Serve(args) => run_server(args),
+        Commands::Sso(args) => run_sso(args),
         Commands::Keygen(args) => keygen(args),
         Commands::Seal(args) => seal(args),
         Commands::Inspect(args) => inspect(args),
@@ -712,6 +731,241 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     Ok(())
+}
+
+fn run_sso(args: SsoArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // Initialize tracing
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level));
+
+    if args.log_json {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer().json())
+            .init();
+    } else {
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(tracing_subscriber::fmt::layer())
+            .init();
+    }
+
+    // Load configuration
+    let config = icebreaker_sso::SsoConfig::from_file(&args.config)
+        .map_err(|e| format!("failed to load config: {e}"))?;
+
+    tracing::info!(
+        config_path = %args.config,
+        bind = %config.bind_addr(),
+        providers = %config.providers.len(),
+        "starting icebreaker sso service"
+    );
+
+    // Build runtime and run
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async move {
+        // Create SSO service
+        let service = icebreaker_sso::SsoService::new(config.clone())
+            .map_err(|e| format!("failed to create sso service: {e}"))?;
+        let service = Arc::new(service);
+
+        // Parse address
+        let addr: SocketAddr = config
+            .bind_addr()
+            .parse()
+            .map_err(|e| format!("invalid bind address: {e}"))?;
+
+        // Create TCP listener
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|e| format!("failed to bind to {addr}: {e}"))?;
+
+        tracing::info!(
+            address = %addr,
+            "sso server listening"
+        );
+
+        // Accept connections
+        loop {
+            let accept_result = tokio::select! {
+                result = listener.accept() => result,
+                _ = tokio::signal::ctrl_c() => {
+                    tracing::info!("received shutdown signal");
+                    break;
+                }
+            };
+
+            let (stream, remote_addr) = match accept_result {
+                Ok(conn) => conn,
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to accept connection");
+                    continue;
+                }
+            };
+
+            let service = service.clone();
+
+            tokio::spawn(async move {
+                let io = TokioIo::new(stream);
+
+                let service_fn = hyper::service::service_fn(move |req: Request<Incoming>| {
+                    let service = service.clone();
+                    async move {
+                        handle_sso_request(&service, req).await
+                    }
+                });
+
+                if let Err(e) = http1::Builder::new()
+                    .serve_connection(io, service_fn)
+                    .await
+                {
+                    tracing::debug!(
+                        error = %e,
+                        remote_addr = %remote_addr,
+                        "connection error"
+                    );
+                }
+            });
+        }
+
+        tracing::info!("sso server shutdown complete");
+        Ok::<_, Box<dyn std::error::Error>>(())
+    })?;
+
+    Ok(())
+}
+
+/// Handles SSO HTTP requests by routing to the appropriate endpoint.
+async fn handle_sso_request(
+    service: &icebreaker_sso::SsoService,
+    req: Request<Incoming>,
+) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    use icebreaker_sso::endpoints::{
+        handle_callback, handle_health, handle_refresh, handle_start, CallbackParams, StartParams,
+    };
+
+    let path = req.uri().path();
+    let method = req.method();
+    let query = req.uri().query();
+
+    // Extract cookie header for callback
+    let cookie_header = req
+        .headers()
+        .get(http::header::COOKIE)
+        .and_then(|h| h.to_str().ok());
+
+    // Extract authorization header for refresh
+    let auth_header = req
+        .headers()
+        .get("Proxy-Authorization")
+        .and_then(|h| h.to_str().ok());
+
+    // Route requests
+    let response = if path == "/health" || path == "/healthz" {
+        let health_response = handle_health();
+        Ok(Response::builder()
+            .status(health_response.status)
+            .header("Content-Type", "text/plain")
+            .body(Full::new(Bytes::from(health_response.body)))
+            .unwrap_or_default())
+    } else if let Some(captures) = parse_provider_path(path) {
+        let provider_id = captures.0;
+        let action = captures.1;
+
+        match (method.as_str(), action) {
+            ("GET", "start") => {
+                let params = StartParams::from_query(query);
+                match handle_start(service, provider_id, params) {
+                    Ok(resp) => {
+                        let http_resp = resp.into_response();
+                        Ok(Response::builder()
+                            .status(http_resp.status())
+                            .header("Location", http_resp.headers().get("Location").and_then(|h| h.to_str().ok()).unwrap_or(""))
+                            .header("Set-Cookie", http_resp.headers().get("Set-Cookie").and_then(|h| h.to_str().ok()).unwrap_or(""))
+                            .header("Cache-Control", "no-store")
+                            .body(Full::new(Bytes::new()))
+                            .unwrap_or_default())
+                    }
+                    Err(e) => error_response(e),
+                }
+            }
+            ("GET", "callback") => {
+                let params = CallbackParams::from_query(query);
+                match handle_callback(service, provider_id, params, cookie_header).await {
+                    Ok(resp) => {
+                        let http_resp = resp.into_response();
+                        let mut builder = Response::builder()
+                            .status(http_resp.status())
+                            .header("Set-Cookie", http_resp.headers().get("Set-Cookie").and_then(|h| h.to_str().ok()).unwrap_or(""))
+                            .header("Cache-Control", "no-store");
+
+                        if let Some(location) = http_resp.headers().get("Location") {
+                            builder = builder.header("Location", location);
+                        }
+
+                        Ok(builder.body(Full::new(Bytes::from(http_resp.into_body()))).unwrap_or_default())
+                    }
+                    Err(e) => error_response(e),
+                }
+            }
+            ("POST", "refresh") => {
+                match handle_refresh(service, provider_id, auth_header).await {
+                    Ok(resp) => {
+                        let http_resp = resp.into_response();
+                        Ok(Response::builder()
+                            .status(http_resp.status())
+                            .header("Content-Type", "application/json")
+                            .header("Cache-Control", http_resp.headers().get("Cache-Control").and_then(|h| h.to_str().ok()).unwrap_or("no-store"))
+                            .body(Full::new(Bytes::from(http_resp.into_body())))
+                            .unwrap_or_default())
+                    }
+                    Err(e) => error_response(e),
+                }
+            }
+            _ => not_found_response(),
+        }
+    } else {
+        not_found_response()
+    };
+
+    response
+}
+
+/// Parses a provider path like "/google/start" into ("google", "start").
+fn parse_provider_path(path: &str) -> Option<(&str, &str)> {
+    let path = path.strip_prefix('/')?;
+    let parts: Vec<&str> = path.splitn(2, '/').collect();
+    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
+        Some((parts[0], parts[1]))
+    } else {
+        None
+    }
+}
+
+/// Creates an error response for SSO errors.
+fn error_response(error: icebreaker_sso::SsoError) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    let status = error.status_code();
+    let body = serde_json::json!({
+        "error": error.to_string()
+    });
+
+    Ok(Response::builder()
+        .status(status)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(body.to_string())))
+        .unwrap_or_default())
+}
+
+/// Creates a 404 Not Found response.
+fn not_found_response() -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
+    Ok(Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(r#"{"error":"not found"}"#)))
+        .unwrap_or_default())
 }
 
 fn keygen(args: KeygenArgs) -> Result<(), Box<dyn std::error::Error>> {
