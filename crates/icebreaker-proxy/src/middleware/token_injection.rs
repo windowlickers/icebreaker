@@ -174,13 +174,39 @@ where
                 return Err(e);
             }
 
-            // Validate the target host
-            if let Some(host) = request.uri().host() {
-                if let Err(e) = payload.validate_host(host) {
-                    record_token_validation(TokenValidationResult::Success);
-                    record_host_rejection(host);
-                    return Err(e);
+            // Extract the target host from URI or Host header.
+            // This prevents bypass when requests use relative URIs (e.g., GET /path HTTP/1.1)
+            // which would otherwise skip host validation entirely.
+            let host = request
+                .uri()
+                .host()
+                .map(str::to_string)
+                .or_else(|| {
+                    request
+                        .headers()
+                        .get(http::header::HOST)
+                        .and_then(|h| h.to_str().ok())
+                        // Host header may include port (e.g., "example.com:8080"), extract just the host
+                        .map(|h| h.split(':').next().unwrap_or(h).to_string())
+                });
+
+            // Reject requests without a determinable host - credentials cannot be safely injected
+            // if we don't know where the request is going
+            let host = match host {
+                Some(h) => h,
+                None => {
+                    record_token_validation(TokenValidationResult::Invalid);
+                    return Err(TokenizerError::InvalidPayload(
+                        "request has no host in URI or Host header".to_string(),
+                    ));
                 }
+            };
+
+            // Validate the target host against the token's allowed hosts
+            if let Err(e) = payload.validate_host(&host) {
+                record_token_validation(TokenValidationResult::Success);
+                record_host_rejection(&host);
+                return Err(e);
             }
 
             // Token validation successful
@@ -480,5 +506,123 @@ mod tests {
 
         let result = service.oneshot(request).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_host_validation_from_host_header() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload that only allows api.example.com
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Request with path-only URI but valid Host header should succeed
+        let request = Request::builder()
+            .uri("/data")
+            .header(TOKEN_HEADER, sealed_token.to_header())
+            .header(http::header::HOST, "api.example.com")
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_host_validation_from_host_header_with_port() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload that only allows api.example.com
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Request with Host header containing port should extract hostname correctly
+        let request = Request::builder()
+            .uri("/data")
+            .header(TOKEN_HEADER, sealed_token.to_header())
+            .header(http::header::HOST, "api.example.com:8080")
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_host_validation_bypass_blocked() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload that only allows api.example.com
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Request with path-only URI and evil Host header should be blocked
+        let request = Request::builder()
+            .uri("/data")
+            .header(TOKEN_HEADER, sealed_token.to_header())
+            .header(http::header::HOST, "evil.com")
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(matches!(result, Err(TokenizerError::HostNotAllowed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_no_host_rejected() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Request with no host in URI and no Host header should be rejected
+        let request = Request::builder()
+            .uri("/data")
+            .header(TOKEN_HEADER, sealed_token.to_header())
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(matches!(result, Err(TokenizerError::InvalidPayload(_))));
+        if let Err(TokenizerError::InvalidPayload(msg)) = result {
+            assert!(msg.contains("no host"));
+        }
     }
 }

@@ -164,6 +164,15 @@ impl IpFilter {
     /// Checks if an IP address is blocked and returns the reason.
     #[must_use]
     pub fn check_ip(&self, ip: &IpAddr) -> Option<BlockReason> {
+        // Handle IPv4-mapped IPv6 addresses (::ffff:x.x.x.x) by extracting
+        // the embedded IPv4 and validating it. This prevents SSRF bypass via
+        // addresses like ::ffff:127.0.0.1 or ::ffff:10.0.0.1.
+        if let IpAddr::V6(v6) = ip {
+            if let Some(mapped_v4) = v6.to_ipv4_mapped() {
+                return self.check_ip(&IpAddr::V4(mapped_v4));
+            }
+        }
+
         // First check if explicitly allowed
         if self.is_in_allowed_cidrs(ip) {
             return None;
@@ -529,5 +538,83 @@ mod tests {
         let ip: IpAddr = "2001:db8::1".parse().expect("valid IP");
         assert!(!filter.is_allowed(&ip));
         assert_eq!(filter.check_ip(&ip), Some(BlockReason::Reserved));
+    }
+
+    // Tests for IPv4-mapped IPv6 address bypass prevention
+    #[test]
+    fn test_ipv4_mapped_loopback_blocked() {
+        let filter = default_filter();
+        // ::ffff:127.0.0.1 is an IPv4-mapped representation of localhost
+        let ip: IpAddr = "::ffff:127.0.0.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::Loopback));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_private_10_blocked() {
+        let filter = default_filter();
+        // ::ffff:10.0.0.1 is an IPv4-mapped representation of 10.0.0.1
+        let ip: IpAddr = "::ffff:10.0.0.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::PrivateNetwork));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_private_172_blocked() {
+        let filter = default_filter();
+        let ip: IpAddr = "::ffff:172.16.0.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::PrivateNetwork));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_private_192_blocked() {
+        let filter = default_filter();
+        let ip: IpAddr = "::ffff:192.168.1.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::PrivateNetwork));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_link_local_blocked() {
+        let filter = default_filter();
+        let ip: IpAddr = "::ffff:169.254.1.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::LinkLocal));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_public_allowed() {
+        let filter = default_filter();
+        // ::ffff:8.8.8.8 should still be allowed as it maps to a public IP
+        let ip: IpAddr = "::ffff:8.8.8.8".parse().expect("valid IP");
+        assert!(filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), None);
+    }
+
+    #[test]
+    fn test_ipv4_mapped_cgn_blocked() {
+        let filter = default_filter();
+        let ip: IpAddr = "::ffff:100.64.0.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::Reserved));
+    }
+
+    #[test]
+    fn test_ipv4_mapped_allowed_cidr_overrides() {
+        let config = NetworkProtectionConfig {
+            block_private: true,
+            allowed_cidrs: vec!["10.0.0.0/24".to_string()],
+            ..Default::default()
+        };
+        let filter = IpFilter::new(&config).expect("valid config");
+
+        // IPv4-mapped address for allowed CIDR should be allowed
+        let allowed: IpAddr = "::ffff:10.0.0.1".parse().expect("valid IP");
+        assert!(filter.is_allowed(&allowed));
+
+        // IPv4-mapped address outside allowed CIDR should still be blocked
+        let blocked: IpAddr = "::ffff:10.1.0.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&blocked));
     }
 }

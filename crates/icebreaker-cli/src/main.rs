@@ -20,17 +20,16 @@ use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 use tower::{Service, ServiceBuilder, ServiceExt};
-use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use icebreaker_common::{
     ClientAuthMode, HealthConfig, InjectConfig, NetworkProtectionConfig, ProcessorConfig,
-    ProxyConfig, ShutdownConfig, TlsConfig,
+    ProxyConfig, RateLimitConfig, ShutdownConfig, TlsConfig,
 };
 use icebreaker_crypto::{KeyStore, Keypair, TlsConnectionInfo, TokenCrypto, VersionedKeypair};
 use icebreaker_proxy::{
     create_tls_acceptor, extract_client_cert_info, DynamicResponseScanLayer, IpFilter,
-    MetricsLayer, TokenInjectionLayer, ValidatingConnector,
+    MetricsLayer, RateLimitLayer, TokenInjectionLayer, ValidatingConnector,
 };
 
 /// Icebreaker - A stateless tokenizer proxy
@@ -133,6 +132,18 @@ struct ServeArgs {
     /// Enable response body scanning for secret leaks
     #[arg(long, default_value = "true", env = "ICEBREAKER_RESPONSE_SCAN_ENABLED")]
     response_scan_enabled: bool,
+
+    /// Enable rate limiting
+    #[arg(long, default_value = "true", env = "ICEBREAKER_RATE_LIMIT_ENABLED")]
+    rate_limit_enabled: bool,
+
+    /// Maximum requests per second (rate limiting)
+    #[arg(long, default_value = "100", env = "ICEBREAKER_RATE_LIMIT_MAX_REQUESTS")]
+    rate_limit_max_requests: u32,
+
+    /// Burst capacity for rate limiting (allows temporary spikes)
+    #[arg(long, default_value = "20", env = "ICEBREAKER_RATE_LIMIT_BURST")]
+    rate_limit_burst: u32,
 }
 
 #[derive(Parser)]
@@ -531,6 +542,8 @@ async fn handle_connection<I>(
     tls_info: Option<TlsConnectionInfo>,
     remote_addr: SocketAddr,
     response_scan_enabled: bool,
+    request_timeout: Duration,
+    rate_limit_config: Option<RateLimitConfig>,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -538,50 +551,122 @@ async fn handle_connection<I>(
     let proxy_service = ProxyService::new(ip_filter);
 
     // Build the middleware stack
+    // Order matters:
+    // 1. RateLimitLayer - protects against brute-force attacks (when enabled)
+    // 2. MetricsLayer - record metrics
+    // 3. TokenInjectionLayer - decrypts tokens and injects secrets
+    // 4. DynamicResponseScanLayer - scans responses for leaked secrets
+    //
+    // Timeout is applied per-request in the service function below.
+    //
     // Note: DynamicResponseScanLayer must come after TokenInjectionLayer
     // so it can read the ScanPatterns stored by token injection.
-    // When response_scan_enabled is true, TokenInjectionLayer stores the secret
-    // as ScanPatterns, and DynamicResponseScanLayer wraps response bodies
-    // to detect accidental leaks of the injected secret.
-    let service = ServiceBuilder::new()
-        .layer(TraceLayer::new_for_http())
-        .layer(MetricsLayer::new())
-        .layer(TokenInjectionLayer::with_response_scan(
-            crypto,
-            response_scan_enabled,
-        ))
-        .layer(DynamicResponseScanLayer::new())
-        .service(proxy_service);
 
-    // Create a service function that handles the request and injects TLS info
-    let service_fn = hyper::service::service_fn(move |mut req: Request<Incoming>| {
-        let mut svc = service.clone();
-        let tls_info = tls_info.clone();
-        async move {
-            // Inject TLS connection info into request extensions if available
-            if let Some(info) = tls_info {
-                req.extensions_mut().insert(info);
-            }
+    // Handle the two cases (with/without rate limiting) separately to avoid
+    // complex type erasure while keeping concrete types for efficiency.
+    if let Some(rate_config) = rate_limit_config {
+        let service = ServiceBuilder::new()
+            .layer(RateLimitLayer::new(rate_config))
+            .layer(MetricsLayer::new())
+            .layer(TokenInjectionLayer::with_response_scan(
+                crypto,
+                response_scan_enabled,
+            ))
+            .layer(DynamicResponseScanLayer::new())
+            .service(proxy_service);
 
-            match svc.ready().await {
-                Ok(ready_svc) => ready_svc.call(req).await.map_err(|e| {
-                    tracing::error!(error = %e, "request failed");
-                    e
-                }),
-                Err(e) => {
-                    tracing::error!(error = %e, "service not ready");
-                    Err(e)
+        // Create a service function that handles the request and injects TLS info
+        // Request timeout is applied here using tokio::time::timeout
+        let service_fn = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+            let mut svc = service.clone();
+            let tls_info = tls_info.clone();
+            async move {
+                // Inject TLS connection info into request extensions if available
+                if let Some(info) = tls_info {
+                    req.extensions_mut().insert(info);
+                }
+
+                // Apply request timeout to prevent requests from hanging indefinitely
+                let result = tokio::time::timeout(request_timeout, async {
+                    match svc.ready().await {
+                        Ok(ready_svc) => ready_svc.call(req).await,
+                        Err(e) => Err(e),
+                    }
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(response)) => Ok(response),
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "request failed");
+                        Err(e)
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!("request timed out");
+                        Err(icebreaker_common::TokenizerError::Timeout)
+                    }
                 }
             }
-        }
-    });
+        });
 
-    if let Err(e) = http1::Builder::new().serve_connection(io, service_fn).await {
-        tracing::debug!(
-            error = %e,
-            remote_addr = %remote_addr,
-            "connection error"
-        );
+        if let Err(e) = http1::Builder::new().serve_connection(io, service_fn).await {
+            tracing::debug!(
+                error = %e,
+                remote_addr = %remote_addr,
+                "connection error"
+            );
+        }
+    } else {
+        let service = ServiceBuilder::new()
+            .layer(MetricsLayer::new())
+            .layer(TokenInjectionLayer::with_response_scan(
+                crypto,
+                response_scan_enabled,
+            ))
+            .layer(DynamicResponseScanLayer::new())
+            .service(proxy_service);
+
+        // Create a service function that handles the request and injects TLS info
+        // Request timeout is applied here using tokio::time::timeout
+        let service_fn = hyper::service::service_fn(move |mut req: Request<Incoming>| {
+            let mut svc = service.clone();
+            let tls_info = tls_info.clone();
+            async move {
+                // Inject TLS connection info into request extensions if available
+                if let Some(info) = tls_info {
+                    req.extensions_mut().insert(info);
+                }
+
+                // Apply request timeout to prevent requests from hanging indefinitely
+                let result = tokio::time::timeout(request_timeout, async {
+                    match svc.ready().await {
+                        Ok(ready_svc) => ready_svc.call(req).await,
+                        Err(e) => Err(e),
+                    }
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(response)) => Ok(response),
+                    Ok(Err(e)) => {
+                        tracing::error!(error = %e, "request failed");
+                        Err(e)
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!("request timed out");
+                        Err(icebreaker_common::TokenizerError::Timeout)
+                    }
+                }
+            }
+        });
+
+        if let Err(e) = http1::Builder::new().serve_connection(io, service_fn).await {
+            tracing::debug!(
+                error = %e,
+                remote_addr = %remote_addr,
+                "connection error"
+            );
+        }
     }
 }
 
@@ -689,6 +774,18 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let tls_enabled = tls_acceptor.is_some();
         let response_scan_enabled = args.response_scan_enabled;
+        let request_timeout = Duration::from_secs(args.timeout);
+
+        // Build rate limit config if enabled
+        let rate_limit_config = if args.rate_limit_enabled {
+            Some(RateLimitConfig {
+                max_requests: args.rate_limit_max_requests,
+                period: Duration::from_secs(1),
+                burst: args.rate_limit_burst,
+            })
+        } else {
+            None
+        };
 
         tracing::info!(
             bind = %config.bind_addr(),
@@ -698,6 +795,8 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             shutdown_timeout = ?shutdown_config.timeout,
             tls_enabled = %tls_enabled,
             response_scan_enabled = %response_scan_enabled,
+            rate_limit_enabled = %args.rate_limit_enabled,
+            request_timeout = ?request_timeout,
             "starting icebreaker proxy"
         );
 
@@ -764,6 +863,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let ip_filter = ip_filter.clone();
                 let conn_state = accept_state.clone();
                 let tls_acceptor = tls_acceptor.clone();
+                let rate_limit_config = rate_limit_config.clone();
 
                 // Track connection
                 conn_state.connection_started();
@@ -783,6 +883,8 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     tls_info,
                                     remote_addr,
                                     response_scan_enabled,
+                                    request_timeout,
+                                    rate_limit_config,
                                 )
                                 .await;
                             }
@@ -804,6 +906,8 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                             None,
                             remote_addr,
                             response_scan_enabled,
+                            request_timeout,
+                            rate_limit_config,
                         )
                         .await;
                     }
