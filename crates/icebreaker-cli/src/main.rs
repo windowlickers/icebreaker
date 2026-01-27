@@ -138,7 +138,11 @@ struct ServeArgs {
     rate_limit_enabled: bool,
 
     /// Maximum requests per second (rate limiting)
-    #[arg(long, default_value = "100", env = "ICEBREAKER_RATE_LIMIT_MAX_REQUESTS")]
+    #[arg(
+        long,
+        default_value = "100",
+        env = "ICEBREAKER_RATE_LIMIT_MAX_REQUESTS"
+    )]
     rate_limit_max_requests: u32,
 
     /// Burst capacity for rate limiting (allows temporary spikes)

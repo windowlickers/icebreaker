@@ -1513,10 +1513,12 @@ dependencies = [
 name = "icebreaker-proxy"
 version = "0.1.0"
 dependencies = [
+ "async-compression",
  "aws-credential-types",
  "aws-sigv4",
  "base64",
  "bytes",
+ "flate2",
  "futures",
  "futures-util",
  "hex",
@@ -1541,6 +1543,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tower",
  "tower-http",
  "tower-service",

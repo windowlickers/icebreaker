@@ -44,6 +44,10 @@ metrics = { workspace = true }
 # Date/time
 time = { workspace = true }
 
+# Compression
+async-compression = { workspace = true }
+tokio-util = { workspace = true }
+
 # Utilities
 bytes = { workspace = true }
 futures = { workspace = true }
@@ -70,3 +74,4 @@ hex = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = { workspace = true }
+flate2 = "1.0"

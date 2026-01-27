@@ -27,10 +27,10 @@ use tower::{Layer, Service};
 use icebreaker_common::{SealedToken, TokenizerError};
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 
-use crate::middleware::response_scan::ScanPatterns;
 use crate::metrics::{
     record_host_rejection, record_processor_used, record_token_validation, TokenValidationResult,
 };
+use crate::middleware::response_scan::ScanPatterns;
 use crate::processor::create_processor;
 
 /// The header name for the sealed token.
@@ -177,18 +177,14 @@ where
             // Extract the target host from URI or Host header.
             // This prevents bypass when requests use relative URIs (e.g., GET /path HTTP/1.1)
             // which would otherwise skip host validation entirely.
-            let host = request
-                .uri()
-                .host()
-                .map(str::to_string)
-                .or_else(|| {
-                    request
-                        .headers()
-                        .get(http::header::HOST)
-                        .and_then(|h| h.to_str().ok())
-                        // Host header may include port (e.g., "example.com:8080"), extract just the host
-                        .map(|h| h.split(':').next().unwrap_or(h).to_string())
-                });
+            let host = request.uri().host().map(str::to_string).or_else(|| {
+                request
+                    .headers()
+                    .get(http::header::HOST)
+                    .and_then(|h| h.to_str().ok())
+                    // Host header may include port (e.g., "example.com:8080"), extract just the host
+                    .map(|h| h.split(':').next().unwrap_or(h).to_string())
+            });
 
             // Reject requests without a determinable host - credentials cannot be safely injected
             // if we don't know where the request is going
