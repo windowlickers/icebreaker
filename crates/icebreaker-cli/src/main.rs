@@ -234,8 +234,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// Type alias for the HTTPS connector with SSRF protection.
 type HttpsConnector = hyper_rustls::HttpsConnector<ValidatingConnector>;
 
+/// Body error type for proxied requests/responses.
+/// Using hyper::Error since that's what Incoming bodies produce.
+type BodyError = hyper::Error;
+
 /// Type alias for the HTTP client with TLS support and SSRF protection.
-type HttpClient = Client<HttpsConnector, BoxBody<Bytes, std::convert::Infallible>>;
+type HttpClient = Client<HttpsConnector, BoxBody<Bytes, BodyError>>;
 
 /// Shared state for graceful shutdown coordination.
 #[derive(Debug)]
@@ -452,7 +456,7 @@ impl ProxyService {
 }
 
 impl Service<Request<Incoming>> for ProxyService {
-    type Response = Response<BoxBody<Bytes, std::convert::Infallible>>;
+    type Response = Response<BoxBody<Bytes, BodyError>>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
     type Future = std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
@@ -513,9 +517,7 @@ impl Service<Request<Incoming>> for ProxyService {
 
             // Build the outgoing request
             let (parts, body) = req.into_parts();
-            let boxed_body: BoxBody<Bytes, std::convert::Infallible> = body
-                .map_err(|_| -> std::convert::Infallible { unreachable!() })
-                .boxed();
+            let boxed_body: BoxBody<Bytes, BodyError> = body.boxed();
 
             let mut outgoing = Request::from_parts(parts, boxed_body);
             *outgoing.uri_mut() = target_uri;
@@ -529,9 +531,7 @@ impl Service<Request<Incoming>> for ProxyService {
 
             // Convert the response body
             let (parts, body) = response.into_parts();
-            let boxed_body: BoxBody<Bytes, std::convert::Infallible> = body
-                .map_err(|_| -> std::convert::Infallible { unreachable!() })
-                .boxed();
+            let boxed_body: BoxBody<Bytes, BodyError> = body.boxed();
 
             Ok(Response::from_parts(parts, boxed_body))
         })
@@ -714,6 +714,11 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     runtime.block_on(async move {
+        // Validate secret key is not empty
+        if args.secret_key.trim().is_empty() {
+            return Err("ICEBREAKER_SECRET_KEY cannot be empty".into());
+        }
+
         // Load keypair
         let keypair = Keypair::from_base64(&args.secret_key)
             .map_err(|e| format!("failed to load secret key: {e}"))?;
@@ -755,9 +760,17 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let tls_acceptor = match (&args.tls_cert, &args.tls_key) {
             (Some(cert), Some(key)) => {
                 let client_auth = match args.tls_client_auth.as_str() {
+                    "none" => ClientAuthMode::None,
                     "optional" => ClientAuthMode::Optional,
                     "required" => ClientAuthMode::Required,
-                    _ => ClientAuthMode::None,
+                    other => {
+                        tracing::warn!(
+                            value = %other,
+                            "unrecognized --tls-client-auth value, defaulting to 'none'. \
+                             Valid values are: none, optional, required"
+                        );
+                        ClientAuthMode::None
+                    }
                 };
                 let tls_config = TlsConfig::new(cert, key).with_client_auth(client_auth);
                 let tls_config = if let Some(ca_path) = &args.tls_client_ca {
@@ -1355,7 +1368,7 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("Sealed token:");
     println!();
-    println!("{}", sealed_token.to_header());
+    println!("{}", sealed_token.to_header()?);
     println!();
     println!("Use this in the X-Tokenizer-Token header.");
 

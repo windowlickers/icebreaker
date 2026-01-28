@@ -40,7 +40,7 @@
 //! let sealed_token = crypto.seal(&payload).expect("seal should succeed");
 //!
 //! // The sealed token can be given to clients
-//! println!("Token: {}", sealed_token.to_header());
+//! println!("Token: {}", sealed_token.to_header().expect("serialization"));
 //! ```
 //!
 //! ## Feature Flags
@@ -124,7 +124,10 @@ mod tests {
         let sealed = crypto.seal(&payload).expect("seal should work");
 
         // Verify header format
-        assert!(sealed.to_header().starts_with("Tokenizer "));
+        assert!(sealed
+            .to_header()
+            .expect("serialization")
+            .starts_with("Tokenizer "));
 
         // Unseal
         let unsealed = crypto.unseal(&sealed).expect("unseal should work");

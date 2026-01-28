@@ -147,7 +147,7 @@ impl RequestProcessor for Sigv4Processor {
             .map(String::from);
 
         tracing::debug!(
-            access_key = %self.config.access_key,
+            access_key = "[REDACTED]",
             region = %scope.region,
             service = %scope.service,
             date = %scope.date,

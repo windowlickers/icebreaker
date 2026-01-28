@@ -171,6 +171,13 @@ impl IpFilter {
             if let Some(mapped_v4) = v6.to_ipv4_mapped() {
                 return self.check_ip(&IpAddr::V4(mapped_v4));
             }
+
+            // Handle NAT64 well-known prefix (64:ff9b::/96) - RFC 6052
+            // Attackers can reach private IPv4 via addresses like 64:ff9b::192.168.1.1
+            // Extract the embedded IPv4 from the last 32 bits and validate it.
+            if let Some(embedded_v4) = Self::extract_nat64_ipv4(v6) {
+                return self.check_ip(&IpAddr::V4(embedded_v4));
+            }
         }
 
         // First check if explicitly allowed
@@ -231,6 +238,27 @@ impl IpFilter {
             });
         }
         Ok(())
+    }
+
+    /// Extracts the embedded IPv4 address from a NAT64 well-known prefix (64:ff9b::/96).
+    /// Returns None if the address is not in the NAT64 prefix range.
+    fn extract_nat64_ipv4(ip: &Ipv6Addr) -> Option<Ipv4Addr> {
+        let octets = ip.octets();
+        // Check for 64:ff9b:: prefix (first 12 bytes)
+        // 64:ff9b::/96 means: 0064:ff9b:0000:0000:0000:0000:xxxx:xxxx
+        if octets[0] == 0x00
+            && octets[1] == 0x64
+            && octets[2] == 0xff
+            && octets[3] == 0x9b
+            && octets[4..12].iter().all(|&b| b == 0)
+        {
+            // Extract the last 32 bits as IPv4
+            Some(Ipv4Addr::new(
+                octets[12], octets[13], octets[14], octets[15],
+            ))
+        } else {
+            None
+        }
     }
 
     fn is_loopback(&self, ip: &IpAddr) -> bool {
@@ -615,6 +643,70 @@ mod tests {
 
         // IPv4-mapped address outside allowed CIDR should still be blocked
         let blocked: IpAddr = "::ffff:10.1.0.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&blocked));
+    }
+
+    // Tests for NAT64 well-known prefix (64:ff9b::/96) bypass prevention
+    #[test]
+    fn test_nat64_loopback_blocked() {
+        let filter = default_filter();
+        // 64:ff9b::127.0.0.1 embeds 127.0.0.1 via NAT64 prefix
+        let ip: IpAddr = "64:ff9b::127.0.0.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::Loopback));
+    }
+
+    #[test]
+    fn test_nat64_private_10_blocked() {
+        let filter = default_filter();
+        // 64:ff9b::10.0.0.1 embeds 10.0.0.1 via NAT64 prefix
+        let ip: IpAddr = "64:ff9b::10.0.0.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::PrivateNetwork));
+    }
+
+    #[test]
+    fn test_nat64_private_192_blocked() {
+        let filter = default_filter();
+        // 64:ff9b::192.168.1.1 embeds 192.168.1.1 via NAT64 prefix
+        let ip: IpAddr = "64:ff9b::192.168.1.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::PrivateNetwork));
+    }
+
+    #[test]
+    fn test_nat64_public_allowed() {
+        let filter = default_filter();
+        // 64:ff9b::8.8.8.8 embeds a public IP, should be allowed
+        let ip: IpAddr = "64:ff9b::8.8.8.8".parse().expect("valid IP");
+        assert!(filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), None);
+    }
+
+    #[test]
+    fn test_nat64_link_local_blocked() {
+        let filter = default_filter();
+        // 64:ff9b::169.254.1.1 embeds link-local address
+        let ip: IpAddr = "64:ff9b::169.254.1.1".parse().expect("valid IP");
+        assert!(!filter.is_allowed(&ip));
+        assert_eq!(filter.check_ip(&ip), Some(BlockReason::LinkLocal));
+    }
+
+    #[test]
+    fn test_nat64_allowed_cidr_overrides() {
+        let config = NetworkProtectionConfig {
+            block_private: true,
+            allowed_cidrs: vec!["10.0.0.0/24".to_string()],
+            ..Default::default()
+        };
+        let filter = IpFilter::new(&config).expect("valid config");
+
+        // NAT64 address for allowed CIDR should be allowed
+        let allowed: IpAddr = "64:ff9b::10.0.0.1".parse().expect("valid IP");
+        assert!(filter.is_allowed(&allowed));
+
+        // NAT64 address outside allowed CIDR should still be blocked
+        let blocked: IpAddr = "64:ff9b::10.1.0.1".parse().expect("valid IP");
         assert!(!filter.is_allowed(&blocked));
     }
 }

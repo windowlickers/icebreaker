@@ -106,12 +106,20 @@ impl SealedToken {
     }
 
     /// Serializes the token to a header value.
-    #[must_use]
-    pub fn to_header(&self) -> String {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the token cannot be serialized to JSON.
+    /// This should never happen for a valid `SealedToken`.
+    pub fn to_header(&self) -> Result<String> {
         use base64::Engine;
-        let json = serde_json::to_vec(self).unwrap_or_default();
+        let json = serde_json::to_vec(self).map_err(|e| {
+            crate::error::TokenizerError::InternalError(format!(
+                "failed to serialize sealed token: {e}"
+            ))
+        })?;
         let encoded = base64::engine::general_purpose::STANDARD.encode(&json);
-        format!("Tokenizer {encoded}")
+        Ok(format!("Tokenizer {encoded}"))
     }
 }
 
@@ -460,7 +468,7 @@ mod tests {
     #[test]
     fn test_sealed_token_header_roundtrip() {
         let token = SealedToken::new("key-001", "encrypted-data");
-        let header = token.to_header();
+        let header = token.to_header().expect("serialization should succeed");
 
         assert!(header.starts_with("Tokenizer "));
 

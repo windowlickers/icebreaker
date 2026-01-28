@@ -72,6 +72,8 @@ pub enum TokenValidationResult {
     DecryptionFailed,
     /// Token header was missing.
     Missing,
+    /// Host validation failed (token used for unauthorized host).
+    HostValidationFailed,
 }
 
 impl TokenValidationResult {
@@ -84,6 +86,7 @@ impl TokenValidationResult {
             Self::Invalid => "invalid",
             Self::DecryptionFailed => "decryption_failed",
             Self::Missing => "missing",
+            Self::HostValidationFailed => "host_validation_failed",
         }
     }
 }
@@ -204,6 +207,10 @@ mod tests {
             "decryption_failed"
         );
         assert_eq!(TokenValidationResult::Missing.as_str(), "missing");
+        assert_eq!(
+            TokenValidationResult::HostValidationFailed.as_str(),
+            "host_validation_failed"
+        );
     }
 
     #[test]

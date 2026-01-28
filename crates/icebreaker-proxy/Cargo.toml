@@ -55,6 +55,7 @@ futures-util = { workspace = true }
 pin-project-lite = { workspace = true }
 regex = { workspace = true }
 ipnet = { workspace = true }
+urlencoding = { workspace = true }
 
 # AWS signing
 aws-sigv4 = { workspace = true }

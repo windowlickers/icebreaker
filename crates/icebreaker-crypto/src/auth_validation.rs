@@ -297,7 +297,7 @@ fn validate_mtls(
         });
     }
 
-    // Check subject pattern if configured
+    // Check subject pattern if configured (uses regex for precise matching)
     if let Some(ref pattern) = config.subject_pattern {
         let subject_dn =
             tls.subject_dn
@@ -306,8 +306,13 @@ fn validate_mtls(
                     reason: "client certificate subject DN not available".into(),
                 })?;
 
-        // Simple substring match for now - could use regex for more complex patterns
-        if !subject_dn.contains(pattern) {
+        // Use regex for precise DN matching to prevent overly broad patterns
+        // like "CN=" from matching any DN containing that substring
+        let re = regex::Regex::new(pattern).map_err(|e| {
+            TokenizerError::ConfigError(format!("invalid subject pattern regex: {e}"))
+        })?;
+
+        if !re.is_match(subject_dn) {
             debug!(
                 subject = %subject_dn,
                 pattern = %pattern,
@@ -460,7 +465,8 @@ mod tests {
 
     #[test]
     fn test_validate_mtls_subject_pattern() {
-        let config = MutualTlsConfig::new("sha256:abc123").with_subject_pattern("CN=client");
+        // Use anchored regex pattern for precise matching
+        let config = MutualTlsConfig::new("sha256:abc123").with_subject_pattern("^CN=client,");
         let tls_info =
             TlsConnectionInfo::with_fingerprint("sha256:abc123").with_subject_dn("CN=client,O=Org");
 
@@ -470,12 +476,36 @@ mod tests {
 
     #[test]
     fn test_validate_mtls_subject_pattern_mismatch() {
-        let config = MutualTlsConfig::new("sha256:abc123").with_subject_pattern("CN=admin");
+        let config = MutualTlsConfig::new("sha256:abc123").with_subject_pattern("^CN=admin,");
         let tls_info =
             TlsConnectionInfo::with_fingerprint("sha256:abc123").with_subject_dn("CN=client,O=Org");
 
         let result = validate_mtls(&config, Some(&tls_info));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_mtls_subject_pattern_anchored_prevents_partial_match() {
+        // Anchored pattern should NOT match a client cert where the CN appears elsewhere
+        let config = MutualTlsConfig::new("sha256:abc123").with_subject_pattern("^CN=admin$");
+        let tls_info = TlsConnectionInfo::with_fingerprint("sha256:abc123")
+            .with_subject_dn("CN=admin-user,O=Org");
+
+        let result = validate_mtls(&config, Some(&tls_info));
+        // Should fail because "admin" != "admin-user"
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_validate_mtls_subject_pattern_regex_features() {
+        // Test that regex features work (e.g., alternation)
+        let config =
+            MutualTlsConfig::new("sha256:abc123").with_subject_pattern("^CN=(admin|service),");
+        let tls_info = TlsConnectionInfo::with_fingerprint("sha256:abc123")
+            .with_subject_dn("CN=service,O=Org");
+
+        let result = validate_mtls(&config, Some(&tls_info));
+        assert!(result.is_ok());
     }
 
     #[test]

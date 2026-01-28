@@ -266,7 +266,9 @@ fn seal_oauth_token(
         .seal(&payload)
         .map_err(|e| SsoError::SealingError(e.to_string()))?;
 
-    Ok(sealed.to_header())
+    sealed
+        .to_header()
+        .map_err(|e| SsoError::SealingError(e.to_string()))
 }
 
 /// Builds the redirect URL for the client.

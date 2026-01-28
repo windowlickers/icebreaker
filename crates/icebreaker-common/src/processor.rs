@@ -258,7 +258,7 @@ impl Sigv4Config {
 impl std::fmt::Debug for Sigv4Config {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Sigv4Config")
-            .field("access_key", &self.access_key)
+            .field("access_key", &"[REDACTED]")
             .finish()
     }
 }
