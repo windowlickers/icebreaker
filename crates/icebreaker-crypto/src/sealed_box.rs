@@ -174,6 +174,23 @@ impl TokenCrypto {
     pub fn key_store_mut(&mut self) -> &mut KeyStore {
         &mut self.key_store
     }
+
+    /// Returns the HMAC key for API key authentication for the given key ID.
+    ///
+    /// This key is derived from the public key of the keypair associated with
+    /// the given key ID. It is used to hash API keys when validating client
+    /// authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the key ID is not found or HMAC key derivation fails.
+    pub fn api_key_hmac_key(&self, key_id: &str) -> Result<[u8; 32]> {
+        let versioned = self.key_store.find_by_id(key_id).ok_or_else(|| {
+            TokenizerError::DecryptionError(format!("unknown key ID: {key_id}"))
+        })?;
+
+        crate::auth_validation::derive_api_key_hmac_key(&versioned.keypair.public_key_bytes())
+    }
 }
 
 #[cfg(test)]

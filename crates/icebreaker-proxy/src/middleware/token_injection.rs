@@ -209,7 +209,17 @@ where
 
             // Validate client authentication
             let tls_info = request.extensions().get::<TlsConnectionInfo>();
-            if let Err(e) = validate_auth(&payload.auth, &request, tls_info) {
+            // Get the HMAC key for API key validation (derived from the keypair's public key)
+            let api_key_hmac_key = crypto
+                .api_key_hmac_key(&sealed_token.key_id)
+                .ok()
+                .map(|k| k.to_vec());
+            if let Err(e) = validate_auth(
+                &payload.auth,
+                &request,
+                tls_info,
+                api_key_hmac_key.as_deref(),
+            ) {
                 record_token_validation(TokenValidationResult::Invalid);
                 return Err(e);
             }
@@ -295,7 +305,9 @@ mod tests {
     use super::*;
     use icebreaker_common::auth::AuthConfig;
     use icebreaker_common::{InjectConfig, ProcessorConfig};
-    use icebreaker_crypto::{create_api_key_config, Keypair, PROXY_AUTHORIZATION_HEADER};
+    use icebreaker_crypto::{
+        create_api_key_config, derive_api_key_hmac_key, Keypair, PROXY_AUTHORIZATION_HEADER,
+    };
     use secrecy::SecretString;
     use std::convert::Infallible;
     use tower::ServiceExt;
@@ -419,7 +431,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_validation_success() {
-        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let keypair = Keypair::generate();
+        let hmac_key =
+            derive_api_key_hmac_key(&keypair.public_key_bytes()).expect("should derive hmac key");
+        let crypto = Arc::new(TokenCrypto::with_keypair(keypair, "test-key"));
 
         // Create a payload with API key auth
         let api_key = "my-proxy-key";
@@ -428,10 +443,10 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("api.example.com")
-        .auth(AuthConfig::ApiKey(create_api_key_config(
-            PROXY_AUTHORIZATION_HEADER,
-            api_key,
-        )))
+        .auth(AuthConfig::ApiKey(
+            create_api_key_config(PROXY_AUTHORIZATION_HEADER, api_key, &hmac_key)
+                .expect("should create config"),
+        ))
         .build();
 
         let sealed_token = crypto.seal(&payload).expect("should seal");
@@ -456,7 +471,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_validation_failure() {
-        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let keypair = Keypair::generate();
+        let hmac_key =
+            derive_api_key_hmac_key(&keypair.public_key_bytes()).expect("should derive hmac key");
+        let crypto = Arc::new(TokenCrypto::with_keypair(keypair, "test-key"));
 
         // Create a payload with API key auth
         let payload = icebreaker_common::TokenPayload::builder(
@@ -464,10 +482,10 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("api.example.com")
-        .auth(AuthConfig::ApiKey(create_api_key_config(
-            PROXY_AUTHORIZATION_HEADER,
-            "correct-key",
-        )))
+        .auth(AuthConfig::ApiKey(
+            create_api_key_config(PROXY_AUTHORIZATION_HEADER, "correct-key", &hmac_key)
+                .expect("should create config"),
+        ))
         .build();
 
         let sealed_token = crypto.seal(&payload).expect("should seal");
@@ -495,7 +513,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_auth_validation_missing_header() {
-        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let keypair = Keypair::generate();
+        let hmac_key =
+            derive_api_key_hmac_key(&keypair.public_key_bytes()).expect("should derive hmac key");
+        let crypto = Arc::new(TokenCrypto::with_keypair(keypair, "test-key"));
 
         // Create a payload with API key auth
         let payload = icebreaker_common::TokenPayload::builder(
@@ -503,10 +524,10 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("api.example.com")
-        .auth(AuthConfig::ApiKey(create_api_key_config(
-            PROXY_AUTHORIZATION_HEADER,
-            "my-key",
-        )))
+        .auth(AuthConfig::ApiKey(
+            create_api_key_config(PROXY_AUTHORIZATION_HEADER, "my-key", &hmac_key)
+                .expect("should create config"),
+        ))
         .build();
 
         let sealed_token = crypto.seal(&payload).expect("should seal");

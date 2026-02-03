@@ -45,7 +45,7 @@ pub struct ApiKeyConfig {
     pub prefix: Option<String>,
 
     /// Hash of the expected API key (for validation without storing plaintext).
-    /// Uses SHA-256 hash.
+    /// Uses HMAC-SHA256 with a key derived from the server's public key.
     pub key_hash: String,
 }
 

@@ -18,8 +18,9 @@ pub mod keypair;
 pub mod sealed_box;
 
 pub use auth_validation::{
-    create_api_key_config, create_bearer_api_key_config, hash_api_key, parse_proxy_authorization,
-    validate_auth, ProxyCredential, TlsConnectionInfo, PROXY_AUTHORIZATION_HEADER,
+    create_api_key_config, create_bearer_api_key_config, derive_api_key_hmac_key, hash_api_key,
+    parse_proxy_authorization, validate_auth, ProxyCredential, TlsConnectionInfo,
+    PROXY_AUTHORIZATION_HEADER,
 };
 pub use hkdf::{derive_hmac_key, derive_keypair, derive_keypairs, MasterKeyManager};
 pub use hmac::{

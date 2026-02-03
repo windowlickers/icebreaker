@@ -5,12 +5,17 @@
 //! the `Proxy-Authorization` header or mTLS connection info.
 
 use base64::Engine;
-use sha2::{Digest, Sha256};
+use hkdf::Hkdf;
+use sha2::Sha256;
 use subtle::ConstantTimeEq;
 use tracing::debug;
 
+// Use the HMAC computation from our hmac module to avoid import conflicts
+use crate::hmac::compute_signature;
+use icebreaker_common::HmacAlgorithm;
+
 use icebreaker_common::auth::{ApiKeyConfig, AuthConfig, MutualTlsConfig};
-use icebreaker_common::TokenizerError;
+use icebreaker_common::{Result, TokenizerError};
 
 /// The standard header for proxy authentication.
 pub const PROXY_AUTHORIZATION_HEADER: &str = "Proxy-Authorization";
@@ -67,61 +72,112 @@ impl TlsConnectionInfo {
     }
 }
 
-/// Computes the SHA-256 hash of an API key for storage.
+/// Derives the HMAC key used for API key hashing from a public key.
+///
+/// This uses HKDF to derive a 32-byte key from the public key bytes.
+/// Using the public key ensures the same HMAC key is available at both
+/// token creation time (client has public key) and validation time
+/// (server derives public key from secret key).
+///
+/// # Errors
+///
+/// Returns an error if HKDF expansion fails (should not happen for valid inputs).
+pub fn derive_api_key_hmac_key(public_key_bytes: &[u8]) -> Result<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(None, public_key_bytes);
+    let info = b"icebreaker-v1-api-key-auth";
+    let mut okm = [0u8; 32];
+    hk.expand(info, &mut okm)
+        .map_err(|_| TokenizerError::CryptoError("HKDF expansion failed".to_string()))?;
+    Ok(okm)
+}
+
+/// Computes the HMAC-SHA256 hash of an API key for storage.
 ///
 /// This is used when creating tokens to store the key hash rather than
-/// the plaintext key.
+/// the plaintext key. The HMAC key should be derived using
+/// [`derive_api_key_hmac_key`] from the recipient's public key.
+///
+/// Using HMAC-SHA256 instead of plain SHA-256 provides protection against
+/// rainbow table attacks, as the hash is bound to the specific server's
+/// public key.
 ///
 /// # Example
 ///
 /// ```
-/// use icebreaker_crypto::hash_api_key;
+/// use icebreaker_crypto::{hash_api_key, derive_api_key_hmac_key};
 ///
-/// let hash = hash_api_key("my-secret-key");
-/// assert_eq!(hash.len(), 64); // SHA-256 produces 64 hex chars
+/// let public_key_bytes = [0u8; 32]; // Example public key
+/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes).unwrap();
+/// let hash = hash_api_key("my-secret-key", &hmac_key).unwrap();
+/// assert_eq!(hash.len(), 64); // HMAC-SHA256 produces 64 hex chars
 /// ```
-#[must_use]
-pub fn hash_api_key(key: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(key.as_bytes());
-    hex::encode(hasher.finalize())
+///
+/// # Errors
+///
+/// Returns an error if HMAC computation fails (should not happen for valid keys).
+pub fn hash_api_key(key: &str, hmac_key: &[u8]) -> Result<String> {
+    let signature = compute_signature(hmac_key, key.as_bytes(), HmacAlgorithm::Sha256)?;
+    Ok(hex::encode(signature))
 }
 
 /// Creates an [`ApiKeyConfig`] from a header name and plaintext key.
 ///
-/// The key is hashed using SHA-256 before storage. Use this helper when
+/// The key is hashed using HMAC-SHA256 before storage. Use this helper when
 /// creating tokens with API key authentication.
+///
+/// The `hmac_key` should be derived from the recipient's public key using
+/// [`derive_api_key_hmac_key`].
 ///
 /// # Example
 ///
 /// ```
-/// use icebreaker_crypto::create_api_key_config;
+/// use icebreaker_crypto::{create_api_key_config, derive_api_key_hmac_key};
 /// use icebreaker_common::auth::AuthConfig;
 ///
-/// let config = create_api_key_config("Proxy-Authorization", "my-secret-key");
+/// let public_key_bytes = [0u8; 32]; // Example public key
+/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes).unwrap();
+/// let config = create_api_key_config("Proxy-Authorization", "my-secret-key", &hmac_key).unwrap();
 /// let auth = AuthConfig::ApiKey(config);
 /// ```
-#[must_use]
-pub fn create_api_key_config(header_name: impl Into<String>, key: &str) -> ApiKeyConfig {
-    ApiKeyConfig::new(header_name, hash_api_key(key))
+///
+/// # Errors
+///
+/// Returns an error if HMAC computation fails.
+pub fn create_api_key_config(
+    header_name: impl Into<String>,
+    key: &str,
+    hmac_key: &[u8],
+) -> Result<ApiKeyConfig> {
+    Ok(ApiKeyConfig::new(header_name, hash_api_key(key, hmac_key)?))
 }
 
 /// Creates an [`ApiKeyConfig`] with a Bearer prefix.
 ///
 /// This is the most common configuration for API key authentication.
 ///
+/// The `hmac_key` should be derived from the recipient's public key using
+/// [`derive_api_key_hmac_key`].
+///
 /// # Example
 ///
 /// ```
-/// use icebreaker_crypto::create_bearer_api_key_config;
+/// use icebreaker_crypto::{create_bearer_api_key_config, derive_api_key_hmac_key};
 /// use icebreaker_common::auth::AuthConfig;
 ///
-/// let config = create_bearer_api_key_config("my-secret-key");
+/// let public_key_bytes = [0u8; 32]; // Example public key
+/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes).unwrap();
+/// let config = create_bearer_api_key_config("my-secret-key", &hmac_key).unwrap();
 /// let auth = AuthConfig::ApiKey(config);
 /// ```
-#[must_use]
-pub fn create_bearer_api_key_config(key: &str) -> ApiKeyConfig {
-    ApiKeyConfig::new(PROXY_AUTHORIZATION_HEADER, hash_api_key(key)).with_prefix("Bearer ")
+///
+/// # Errors
+///
+/// Returns an error if HMAC computation fails.
+pub fn create_bearer_api_key_config(key: &str, hmac_key: &[u8]) -> Result<ApiKeyConfig> {
+    Ok(
+        ApiKeyConfig::new(PROXY_AUTHORIZATION_HEADER, hash_api_key(key, hmac_key)?)
+            .with_prefix("Bearer "),
+    )
 }
 
 /// Parses credentials from an HTTP request's Proxy-Authorization header.
@@ -197,6 +253,10 @@ fn parse_auth_header(value: &str) -> Option<ProxyCredential> {
 /// This function checks that the request has valid credentials matching
 /// the token's authentication configuration.
 ///
+/// The `api_key_hmac_key` parameter is required for API key authentication
+/// and should be derived from the server's public key using
+/// [`derive_api_key_hmac_key`].
+///
 /// # Errors
 ///
 /// Returns [`TokenizerError::ProxyAuthRequired`] if:
@@ -207,13 +267,21 @@ pub fn validate_auth<B>(
     config: &AuthConfig,
     request: &http::Request<B>,
     tls_info: Option<&TlsConnectionInfo>,
+    api_key_hmac_key: Option<&[u8]>,
 ) -> icebreaker_common::Result<()> {
     match config {
         AuthConfig::None => {
             debug!("no authentication required");
             Ok(())
         }
-        AuthConfig::ApiKey(api_key_config) => validate_api_key(api_key_config, request),
+        AuthConfig::ApiKey(api_key_config) => {
+            let hmac_key = api_key_hmac_key.ok_or_else(|| {
+                TokenizerError::ConfigError(
+                    "API key HMAC key required for API key authentication".to_string(),
+                )
+            })?;
+            validate_api_key(api_key_config, request, hmac_key)
+        }
         AuthConfig::MutualTls(mtls_config) => validate_mtls(mtls_config, tls_info),
     }
 }
@@ -222,6 +290,7 @@ pub fn validate_auth<B>(
 fn validate_api_key<B>(
     config: &ApiKeyConfig,
     request: &http::Request<B>,
+    hmac_key: &[u8],
 ) -> icebreaker_common::Result<()> {
     let credentials = parse_custom_auth_header(request, &config.header_name);
 
@@ -255,7 +324,10 @@ fn validate_api_key<B>(
         };
 
         // Hash the provided key and compare in constant time
-        let provided_hash = hash_api_key(&key_to_hash);
+        let provided_hash = match hash_api_key(&key_to_hash, hmac_key) {
+            Ok(h) => h,
+            Err(_) => continue, // Skip if hashing fails
+        };
         let expected_hash = &config.key_hash;
 
         if constant_time_eq(provided_hash.as_bytes(), expected_hash.as_bytes()) {
@@ -339,16 +411,48 @@ mod tests {
     use super::*;
     use http::Request;
 
+    // Test HMAC key derived from a fixed public key
+    fn test_hmac_key() -> [u8; 32] {
+        derive_api_key_hmac_key(&[0u8; 32]).expect("should derive HMAC key")
+    }
+
+    #[test]
+    fn test_derive_api_key_hmac_key() {
+        let hmac_key1 = derive_api_key_hmac_key(&[0u8; 32]).expect("should derive");
+        let hmac_key2 = derive_api_key_hmac_key(&[0u8; 32]).expect("should derive");
+
+        // Same input produces same key
+        assert_eq!(hmac_key1, hmac_key2);
+
+        // Different input produces different key
+        let hmac_key3 = derive_api_key_hmac_key(&[1u8; 32]).expect("should derive");
+        assert_ne!(hmac_key1, hmac_key3);
+    }
+
     #[test]
     fn test_hash_api_key() {
-        let hash = hash_api_key("my-secret-key");
-        assert_eq!(hash.len(), 64); // SHA-256 produces 64 hex chars
+        let hmac_key = test_hmac_key();
+        let hash = hash_api_key("my-secret-key", &hmac_key).expect("should hash");
+        assert_eq!(hash.len(), 64); // HMAC-SHA256 produces 64 hex chars
 
         // Verify deterministic
-        assert_eq!(hash, hash_api_key("my-secret-key"));
+        assert_eq!(
+            hash,
+            hash_api_key("my-secret-key", &hmac_key).expect("should hash")
+        );
 
         // Different keys produce different hashes
-        assert_ne!(hash, hash_api_key("other-key"));
+        assert_ne!(
+            hash,
+            hash_api_key("other-key", &hmac_key).expect("should hash")
+        );
+
+        // Different HMAC keys produce different hashes for same API key
+        let other_hmac_key = derive_api_key_hmac_key(&[1u8; 32]).expect("should derive");
+        assert_ne!(
+            hash,
+            hash_api_key("my-secret-key", &other_hmac_key).expect("should hash")
+        );
     }
 
     #[test]
@@ -389,28 +493,32 @@ mod tests {
 
     #[test]
     fn test_validate_api_key_success() {
+        let hmac_key = test_hmac_key();
         let key = "my-secret-key";
-        let config = create_api_key_config(PROXY_AUTHORIZATION_HEADER, key);
+        let config =
+            create_api_key_config(PROXY_AUTHORIZATION_HEADER, key, &hmac_key).expect("should create");
 
         let request = Request::builder()
             .header(PROXY_AUTHORIZATION_HEADER, format!("Bearer {}", key))
             .body(())
             .unwrap();
 
-        let result = validate_api_key(&config, &request);
+        let result = validate_api_key(&config, &request, &hmac_key);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_api_key_failure() {
-        let config = create_api_key_config(PROXY_AUTHORIZATION_HEADER, "correct-key");
+        let hmac_key = test_hmac_key();
+        let config = create_api_key_config(PROXY_AUTHORIZATION_HEADER, "correct-key", &hmac_key)
+            .expect("should create");
 
         let request = Request::builder()
             .header(PROXY_AUTHORIZATION_HEADER, "Bearer wrong-key")
             .body(())
             .unwrap();
 
-        let result = validate_api_key(&config, &request);
+        let result = validate_api_key(&config, &request, &hmac_key);
         assert!(result.is_err());
         assert!(matches!(
             result,
@@ -424,18 +532,21 @@ mod tests {
 
         let request = Request::builder().body(()).unwrap();
 
-        let result = validate_auth(&config, &request, None);
+        let result = validate_auth(&config, &request, None, None);
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_validate_missing_header() {
-        let config =
-            AuthConfig::ApiKey(create_api_key_config(PROXY_AUTHORIZATION_HEADER, "my-key"));
+        let hmac_key = test_hmac_key();
+        let config = AuthConfig::ApiKey(
+            create_api_key_config(PROXY_AUTHORIZATION_HEADER, "my-key", &hmac_key)
+                .expect("should create"),
+        );
 
         let request = Request::builder().body(()).unwrap();
 
-        let result = validate_auth(&config, &request, None);
+        let result = validate_auth(&config, &request, None, Some(&hmac_key));
         assert!(result.is_err());
 
         if let Err(TokenizerError::ProxyAuthRequired { reason }) = result {
@@ -510,23 +621,28 @@ mod tests {
 
     #[test]
     fn test_create_bearer_api_key_config() {
-        let config = create_bearer_api_key_config("my-key");
+        let hmac_key = test_hmac_key();
+        let config = create_bearer_api_key_config("my-key", &hmac_key).expect("should create");
         assert_eq!(config.header_name, PROXY_AUTHORIZATION_HEADER);
         assert_eq!(config.prefix, Some("Bearer ".to_string()));
-        assert_eq!(config.key_hash, hash_api_key("my-key"));
+        assert_eq!(
+            config.key_hash,
+            hash_api_key("my-key", &hmac_key).expect("should hash")
+        );
     }
 
     #[test]
     fn test_custom_header_name() {
+        let hmac_key = test_hmac_key();
         let key = "my-secret-key";
-        let config = create_api_key_config("X-Custom-Auth", key);
+        let config = create_api_key_config("X-Custom-Auth", key, &hmac_key).expect("should create");
 
         let request = Request::builder()
             .header("X-Custom-Auth", format!("Bearer {}", key))
             .body(())
             .unwrap();
 
-        let result = validate_api_key(&config, &request);
+        let result = validate_api_key(&config, &request, &hmac_key);
         assert!(result.is_ok());
     }
 }
