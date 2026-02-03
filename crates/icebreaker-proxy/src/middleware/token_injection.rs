@@ -20,6 +20,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Duration;
 
 use base64::Engine;
 use http::Request;
@@ -27,9 +28,11 @@ use tower::{Layer, Service};
 
 use icebreaker_common::{SealedToken, TokenizerError};
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
+use icebreaker_nonce::{CheckResult, NonceStore};
 
 use crate::metrics::{
-    record_host_rejection, record_processor_used, record_token_validation, TokenValidationResult,
+    record_host_rejection, record_processor_used, record_replay_attempt, record_token_validation,
+    TokenValidationResult,
 };
 use crate::middleware::response_scan::ScanPatterns;
 use crate::processor::create_processor;
@@ -81,6 +84,7 @@ fn generate_scan_patterns(secret: &str) -> Vec<Vec<u8>> {
 pub struct TokenInjectionLayer {
     crypto: Arc<TokenCrypto>,
     response_scan_enabled: bool,
+    nonce_store: Option<Arc<dyn NonceStore>>,
 }
 
 impl TokenInjectionLayer {
@@ -89,6 +93,7 @@ impl TokenInjectionLayer {
         Self {
             crypto,
             response_scan_enabled: true,
+            nonce_store: None,
         }
     }
 
@@ -97,6 +102,29 @@ impl TokenInjectionLayer {
         Self {
             crypto,
             response_scan_enabled: enabled,
+            nonce_store: None,
+        }
+    }
+
+    /// Creates a new token injection layer with nonce store for replay protection.
+    pub fn with_nonce_store(crypto: Arc<TokenCrypto>, nonce_store: Arc<dyn NonceStore>) -> Self {
+        Self {
+            crypto,
+            response_scan_enabled: true,
+            nonce_store: Some(nonce_store),
+        }
+    }
+
+    /// Creates a new token injection layer with all options.
+    pub fn with_options(
+        crypto: Arc<TokenCrypto>,
+        response_scan_enabled: bool,
+        nonce_store: Option<Arc<dyn NonceStore>>,
+    ) -> Self {
+        Self {
+            crypto,
+            response_scan_enabled,
+            nonce_store,
         }
     }
 }
@@ -109,6 +137,7 @@ impl<S> Layer<S> for TokenInjectionLayer {
             inner,
             crypto: self.crypto.clone(),
             response_scan_enabled: self.response_scan_enabled,
+            nonce_store: self.nonce_store.clone(),
         }
     }
 }
@@ -119,6 +148,7 @@ pub struct TokenInjectionService<S> {
     inner: S,
     crypto: Arc<TokenCrypto>,
     response_scan_enabled: bool,
+    nonce_store: Option<Arc<dyn NonceStore>>,
 }
 
 impl<S> TokenInjectionService<S> {
@@ -128,6 +158,7 @@ impl<S> TokenInjectionService<S> {
             inner,
             crypto,
             response_scan_enabled: true,
+            nonce_store: None,
         }
     }
 
@@ -137,6 +168,22 @@ impl<S> TokenInjectionService<S> {
             inner,
             crypto,
             response_scan_enabled: enabled,
+            nonce_store: None,
+        }
+    }
+
+    /// Creates a new token injection service with all options.
+    pub fn with_options(
+        inner: S,
+        crypto: Arc<TokenCrypto>,
+        response_scan_enabled: bool,
+        nonce_store: Option<Arc<dyn NonceStore>>,
+    ) -> Self {
+        Self {
+            inner,
+            crypto,
+            response_scan_enabled,
+            nonce_store,
         }
     }
 }
@@ -162,6 +209,7 @@ where
         let crypto = self.crypto.clone();
         let mut inner = self.inner.clone();
         let response_scan_enabled = self.response_scan_enabled;
+        let nonce_store = self.nonce_store.clone();
 
         Box::pin(async move {
             // Extract the token header
@@ -253,6 +301,74 @@ where
                 record_token_validation(TokenValidationResult::HostValidationFailed);
                 record_host_rejection(&host);
                 return Err(e);
+            }
+
+            // Check replay protection if configured
+            if let Some(ref replay) = payload.replay_protection {
+                if let Some(ref store) = nonce_store {
+                    // Calculate TTL: use explicit nonce_ttl_seconds, or calculate from
+                    // token expiration, or default to 24 hours
+                    let ttl = replay
+                        .nonce_ttl_seconds
+                        .map(Duration::from_secs)
+                        .or_else(|| {
+                            payload.expires_at.and_then(|expires_at| {
+                                let now = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .map(|d| d.as_secs())
+                                    .unwrap_or(0);
+                                if expires_at > now {
+                                    Some(Duration::from_secs(expires_at - now))
+                                } else {
+                                    None
+                                }
+                            })
+                        })
+                        .unwrap_or(Duration::from_secs(86400)); // 24 hours default
+
+                    match store
+                        .check_and_record(&replay.nonce, replay.max_uses, ttl)
+                        .await
+                    {
+                        Ok(CheckResult::Denied {
+                            current_uses,
+                            max_uses,
+                        }) => {
+                            record_replay_attempt();
+                            tracing::warn!(
+                                nonce = %replay.nonce,
+                                current_uses = current_uses,
+                                max_uses = max_uses,
+                                "token replay detected"
+                            );
+                            return Err(TokenizerError::TokenReplayDetected {
+                                uses_count: current_uses,
+                                max_uses,
+                            });
+                        }
+                        Ok(CheckResult::Allowed { current_uses, .. }) => {
+                            tracing::debug!(
+                                nonce = %replay.nonce,
+                                current_uses = current_uses,
+                                max_uses = ?replay.max_uses,
+                                "nonce check passed"
+                            );
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                nonce = %replay.nonce,
+                                error = %e,
+                                "nonce store error"
+                            );
+                            return Err(TokenizerError::NonceStoreError(e.to_string()));
+                        }
+                    }
+                } else {
+                    tracing::debug!(
+                        nonce = %replay.nonce,
+                        "replay protection configured but no nonce store available"
+                    );
+                }
             }
 
             // Token validation successful
@@ -803,6 +919,221 @@ mod tests {
             // Verify base64 encoding is present
             let b64 = base64::engine::general_purpose::STANDARD.encode(secret);
             assert!(patterns.contains(&b64.into_bytes()));
+        }
+    }
+
+    mod replay_protection {
+        use super::*;
+        use icebreaker_common::ReplayProtection;
+        use icebreaker_nonce::InMemoryNonceStore;
+
+        #[tokio::test]
+        async fn test_single_use_token_works_once() {
+            let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+            let nonce_store: Arc<dyn NonceStore> = Arc::new(
+                InMemoryNonceStore::with_cleanup_interval(Duration::from_secs(3600)),
+            );
+
+            // Create a single-use token
+            let payload = icebreaker_common::TokenPayload::builder(
+                SecretString::from("my-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .allowed_host("api.example.com")
+            .replay_protection(ReplayProtection::single_use("unique-nonce-123"))
+            .build();
+
+            let sealed_token = crypto.seal(&payload).expect("should seal");
+            let token_header = sealed_token.to_header().expect("token serialization");
+
+            let layer = TokenInjectionLayer::with_nonce_store(crypto.clone(), nonce_store.clone());
+
+            // First request should succeed
+            {
+                let service = layer.clone().layer(MockService);
+                let request = Request::builder()
+                    .uri("https://api.example.com/data")
+                    .header(TOKEN_HEADER, &token_header)
+                    .body(())
+                    .expect("request should build");
+
+                let result = service.oneshot(request).await;
+                assert!(result.is_ok(), "First use should succeed");
+            }
+
+            // Second request should fail with replay error
+            {
+                let service = layer.layer(MockService);
+                let request = Request::builder()
+                    .uri("https://api.example.com/data")
+                    .header(TOKEN_HEADER, &token_header)
+                    .body(())
+                    .expect("request should build");
+
+                let result = service.oneshot(request).await;
+                assert!(
+                    matches!(result, Err(TokenizerError::TokenReplayDetected { .. })),
+                    "Second use should be rejected as replay"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_multi_use_token_works_n_times() {
+            let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+            let nonce_store: Arc<dyn NonceStore> = Arc::new(
+                InMemoryNonceStore::with_cleanup_interval(Duration::from_secs(3600)),
+            );
+
+            // Create a 3-use token
+            let payload = icebreaker_common::TokenPayload::builder(
+                SecretString::from("my-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .allowed_host("api.example.com")
+            .replay_protection(ReplayProtection::with_max_uses("multi-use-nonce", 3))
+            .build();
+
+            let sealed_token = crypto.seal(&payload).expect("should seal");
+            let token_header = sealed_token.to_header().expect("token serialization");
+
+            let layer = TokenInjectionLayer::with_nonce_store(crypto.clone(), nonce_store.clone());
+
+            // First 3 requests should succeed
+            for i in 1..=3 {
+                let service = layer.clone().layer(MockService);
+                let request = Request::builder()
+                    .uri("https://api.example.com/data")
+                    .header(TOKEN_HEADER, &token_header)
+                    .body(())
+                    .expect("request should build");
+
+                let result = service.oneshot(request).await;
+                assert!(result.is_ok(), "Use {i} should succeed");
+            }
+
+            // Fourth request should fail
+            {
+                let service = layer.layer(MockService);
+                let request = Request::builder()
+                    .uri("https://api.example.com/data")
+                    .header(TOKEN_HEADER, &token_header)
+                    .body(())
+                    .expect("request should build");
+
+                let result = service.oneshot(request).await;
+                assert!(
+                    matches!(result, Err(TokenizerError::TokenReplayDetected { .. })),
+                    "Fourth use should be rejected"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_token_without_replay_protection_works_unlimited() {
+            let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+            let nonce_store: Arc<dyn NonceStore> = Arc::new(
+                InMemoryNonceStore::with_cleanup_interval(Duration::from_secs(3600)),
+            );
+
+            // Create a token WITHOUT replay protection
+            let payload = icebreaker_common::TokenPayload::builder(
+                SecretString::from("my-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .allowed_host("api.example.com")
+            .build(); // No replay_protection
+
+            let sealed_token = crypto.seal(&payload).expect("should seal");
+            let token_header = sealed_token.to_header().expect("token serialization");
+
+            let layer = TokenInjectionLayer::with_nonce_store(crypto.clone(), nonce_store.clone());
+
+            // Should work multiple times
+            for i in 1..=10 {
+                let service = layer.clone().layer(MockService);
+                let request = Request::builder()
+                    .uri("https://api.example.com/data")
+                    .header(TOKEN_HEADER, &token_header)
+                    .body(())
+                    .expect("request should build");
+
+                let result = service.oneshot(request).await;
+                assert!(
+                    result.is_ok(),
+                    "Request {i} should succeed (no replay protection)"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_replay_protection_without_nonce_store() {
+            let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+            // Create a single-use token
+            let payload = icebreaker_common::TokenPayload::builder(
+                SecretString::from("my-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .allowed_host("api.example.com")
+            .replay_protection(ReplayProtection::single_use("nonce"))
+            .build();
+
+            let sealed_token = crypto.seal(&payload).expect("should seal");
+            let token_header = sealed_token.to_header().expect("token serialization");
+
+            // Use layer WITHOUT nonce store
+            let layer = TokenInjectionLayer::new(crypto.clone());
+
+            // Should work unlimited times (nonce store not configured)
+            for i in 1..=5 {
+                let service = layer.clone().layer(MockService);
+                let request = Request::builder()
+                    .uri("https://api.example.com/data")
+                    .header(TOKEN_HEADER, &token_header)
+                    .body(())
+                    .expect("request should build");
+
+                let result = service.oneshot(request).await;
+                assert!(
+                    result.is_ok(),
+                    "Request {i} should succeed (no nonce store)"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn test_different_nonces_are_independent() {
+            let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+            let nonce_store: Arc<dyn NonceStore> = Arc::new(
+                InMemoryNonceStore::with_cleanup_interval(Duration::from_secs(3600)),
+            );
+
+            let layer = TokenInjectionLayer::with_nonce_store(crypto.clone(), nonce_store.clone());
+
+            // Create two single-use tokens with different nonces
+            for nonce in ["nonce-a", "nonce-b"] {
+                let payload = icebreaker_common::TokenPayload::builder(
+                    SecretString::from("my-secret"),
+                    ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+                )
+                .allowed_host("api.example.com")
+                .replay_protection(ReplayProtection::single_use(nonce))
+                .build();
+
+                let sealed_token = crypto.seal(&payload).expect("should seal");
+                let token_header = sealed_token.to_header().expect("token serialization");
+
+                let service = layer.clone().layer(MockService);
+                let request = Request::builder()
+                    .uri("https://api.example.com/data")
+                    .header(TOKEN_HEADER, &token_header)
+                    .body(())
+                    .expect("request should build");
+
+                let result = service.oneshot(request).await;
+                assert!(result.is_ok(), "Token with nonce {nonce} should work");
+            }
         }
     }
 }

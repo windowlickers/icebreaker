@@ -6,6 +6,7 @@ members = [
     "crates/icebreaker-crypto",
     "crates/icebreaker-proxy",
     "crates/icebreaker-audit",
+    "crates/icebreaker-nonce",
     "crates/icebreaker-sso",
     "crates/icebreaker-cli",
     "crates/icebreaker-bench",

@@ -86,6 +86,23 @@ pub enum TokenizerError {
     #[error("audit error: {0}")]
     AuditError(String),
 
+    /// Token replay detected.
+    ///
+    /// The token has been used more times than allowed by its replay protection.
+    #[error("token replay detected: used {uses_count}/{max_uses} times")]
+    TokenReplayDetected {
+        /// How many times the token has been used.
+        uses_count: u32,
+        /// Maximum allowed uses.
+        max_uses: u32,
+    },
+
+    /// Nonce store error.
+    ///
+    /// An error occurred while interacting with the nonce store.
+    #[error("nonce store error: {0}")]
+    NonceStoreError(String),
+
     /// Internal error.
     #[error("internal error: {0}")]
     InternalError(String),
@@ -118,6 +135,7 @@ impl TokenizerError {
                 | Self::TokenExpired
                 | Self::DecryptionError(_)
                 | Self::ProxyAuthRequired { .. }
+                | Self::TokenReplayDetected { .. }
         )
     }
 
@@ -131,6 +149,7 @@ impl TokenizerError {
                 | Self::HostNotAllowed { .. }
                 | Self::BlockedAddress { .. }
                 | Self::ProxyAuthRequired { .. }
+                | Self::TokenReplayDetected { .. }
         )
     }
 }

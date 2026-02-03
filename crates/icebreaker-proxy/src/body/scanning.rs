@@ -56,6 +56,29 @@ impl<B> ScanningBody<B> {
     }
 }
 
+/// Result type for body frame polling.
+type FramePollResult = Poll<Option<Result<Frame<Bytes>, Box<dyn std::error::Error + Send + Sync>>>>;
+
+/// Records a secret leak and returns the appropriate error.
+fn secret_leak_error(location: &str) -> FramePollResult {
+    record_secret_leak_detected();
+    tracing::warn!("secret leak detected in {location}");
+    Poll::Ready(Some(Err(Box::new(TokenizerError::SecretLeakDetected))))
+}
+
+/// Scans HTTP trailers for secrets.
+fn scan_trailers(trailers: &http::HeaderMap, scanner: &mut StreamScanner) -> bool {
+    for (_, value) in trailers.iter() {
+        if let Ok(value_str) = value.to_str() {
+            let value_bytes = Bytes::copy_from_slice(value_str.as_bytes());
+            if scanner.scan_chunk(&value_bytes, false) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 impl<B> Body for ScanningBody<B>
 where
     B: Body<Data = Bytes>,
@@ -83,34 +106,19 @@ where
         // Poll the inner body
         match ready!(this.inner.poll_frame(cx)) {
             Some(Ok(frame)) => {
+                // Scan body data
                 if let Some(data) = frame.data_ref() {
-                    // Scan the data chunk
-                    let is_last = false; // We don't know if it's the last until we get None
-                    if this.scanner.scan_chunk(data, is_last) {
+                    if this.scanner.scan_chunk(data, false) {
                         *this.detected = true;
-                        record_secret_leak_detected();
-                        tracing::warn!("secret leak detected in response body");
-                        return Poll::Ready(Some(Err(Box::new(
-                            TokenizerError::SecretLeakDetected,
-                        ))));
+                        return secret_leak_error("response body");
                     }
                 }
 
-                // Also scan HTTP/2 trailers for secrets
-                // Secrets can be leaked in trailer header values
+                // Scan HTTP/2 trailers for secrets
                 if let Some(trailers) = frame.trailers_ref() {
-                    for (_, value) in trailers.iter() {
-                        if let Ok(value_str) = value.to_str() {
-                            let value_bytes = Bytes::copy_from_slice(value_str.as_bytes());
-                            if this.scanner.scan_chunk(&value_bytes, false) {
-                                *this.detected = true;
-                                record_secret_leak_detected();
-                                tracing::warn!("secret leak detected in response trailers");
-                                return Poll::Ready(Some(Err(Box::new(
-                                    TokenizerError::SecretLeakDetected,
-                                ))));
-                            }
-                        }
+                    if scan_trailers(trailers, this.scanner) {
+                        *this.detected = true;
+                        return secret_leak_error("response trailers");
                     }
                 }
 
@@ -122,9 +130,7 @@ where
                 // Final scan with empty chunk to flush any remaining overlap
                 if this.scanner.scan_chunk(&Bytes::new(), true) {
                     *this.detected = true;
-                    record_secret_leak_detected();
-                    tracing::warn!("secret leak detected in final response scan");
-                    return Poll::Ready(Some(Err(Box::new(TokenizerError::SecretLeakDetected))));
+                    return secret_leak_error("final response scan");
                 }
                 Poll::Ready(None)
             }

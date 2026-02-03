@@ -67,5 +67,8 @@ metrics-exporter-prometheus = { workspace = true }
 # Secret management
 secrecy = { workspace = true }
 
+# Utilities
+rand = { workspace = true }
+
 [dev-dependencies]
 wiremock = { workspace = true }

@@ -286,6 +286,39 @@ pub fn validate_auth<B>(
     }
 }
 
+/// Extracts the raw key from a credential, stripping any configured prefix.
+///
+/// Returns `None` if a prefix is configured but not present in the key.
+fn extract_key_from_credential(cred: &ProxyCredential, prefix: Option<&str>) -> Option<String> {
+    let provided_key = match cred {
+        ProxyCredential::Bearer(token) => token,
+        ProxyCredential::Basic { password, .. } => password,
+    };
+
+    match prefix {
+        Some(p) => provided_key.strip_prefix(p).map(|s| s.to_string()),
+        None => Some(provided_key.clone()),
+    }
+}
+
+/// Checks if a single credential matches the expected key hash.
+fn check_credential(
+    cred: &ProxyCredential,
+    prefix: Option<&str>,
+    expected_hash: &str,
+    hmac_key: &[u8],
+) -> bool {
+    let Some(key_to_hash) = extract_key_from_credential(cred, prefix) else {
+        return false;
+    };
+
+    let Ok(provided_hash) = hash_api_key(&key_to_hash, hmac_key) else {
+        return false;
+    };
+
+    constant_time_eq(provided_hash.as_bytes(), expected_hash.as_bytes())
+}
+
 /// Validates API key authentication.
 fn validate_api_key<B>(
     config: &ApiKeyConfig,
@@ -295,51 +328,26 @@ fn validate_api_key<B>(
     let credentials = parse_custom_auth_header(request, &config.header_name);
 
     if credentials.is_empty() {
-        debug!(
-            header = %config.header_name,
-            "missing authentication header"
-        );
+        debug!(header = %config.header_name, "missing authentication header");
         return Err(TokenizerError::ProxyAuthRequired {
             reason: format!("missing {} header", config.header_name),
         });
     }
 
-    // Extract the key from credentials
-    for cred in credentials {
-        let provided_key = match &cred {
-            ProxyCredential::Bearer(token) => token.clone(),
-            ProxyCredential::Basic { password, .. } => password.clone(),
-        };
+    let prefix = config.prefix.as_deref();
+    let is_valid = credentials
+        .iter()
+        .any(|cred| check_credential(cred, prefix, &config.key_hash, hmac_key));
 
-        // Handle optional prefix
-        let key_to_hash = if let Some(ref prefix) = config.prefix {
-            // If the token has a prefix configured, the credential should already
-            // have the prefix stripped by the parse function, but we handle both cases
-            provided_key
-                .strip_prefix(prefix)
-                .unwrap_or(&provided_key)
-                .to_string()
-        } else {
-            provided_key
-        };
-
-        // Hash the provided key and compare in constant time
-        let provided_hash = match hash_api_key(&key_to_hash, hmac_key) {
-            Ok(h) => h,
-            Err(_) => continue, // Skip if hashing fails
-        };
-        let expected_hash = &config.key_hash;
-
-        if constant_time_eq(provided_hash.as_bytes(), expected_hash.as_bytes()) {
-            debug!("API key authentication successful");
-            return Ok(());
-        }
+    if is_valid {
+        debug!("API key authentication successful");
+        Ok(())
+    } else {
+        debug!("API key authentication failed - invalid key");
+        Err(TokenizerError::ProxyAuthRequired {
+            reason: "invalid API key".into(),
+        })
     }
-
-    debug!("API key authentication failed - invalid key");
-    Err(TokenizerError::ProxyAuthRequired {
-        reason: "invalid API key".into(),
-    })
 }
 
 /// Validates mutual TLS authentication.
@@ -495,8 +503,8 @@ mod tests {
     fn test_validate_api_key_success() {
         let hmac_key = test_hmac_key();
         let key = "my-secret-key";
-        let config =
-            create_api_key_config(PROXY_AUTHORIZATION_HEADER, key, &hmac_key).expect("should create");
+        let config = create_api_key_config(PROXY_AUTHORIZATION_HEADER, key, &hmac_key)
+            .expect("should create");
 
         let request = Request::builder()
             .header(PROXY_AUTHORIZATION_HEADER, format!("Bearer {}", key))
@@ -644,5 +652,46 @@ mod tests {
 
         let result = validate_api_key(&config, &request, &hmac_key);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_api_key_prefix_bypass_rejected() {
+        // Security test: when a key prefix is configured, keys without the prefix must be rejected
+        // Note: prefix here is a key-specific prefix (like "sk_live_"), not an auth scheme
+        let hmac_key = test_hmac_key();
+        let raw_key = "abc123";
+        let prefix = "sk_live_";
+        let full_key = format!("{}{}", prefix, raw_key);
+
+        // Create config that expects keys with "sk_live_" prefix
+        // The hash is computed from the raw key (without prefix)
+        let config =
+            ApiKeyConfig::new("X-Api-Key", hash_api_key(raw_key, &hmac_key).expect("hash"))
+                .with_prefix(prefix);
+
+        // Attempt to authenticate with raw key (no prefix)
+        // This was previously a vulnerability - the code would silently accept the key
+        let request_no_prefix = Request::builder()
+            .header("X-Api-Key", raw_key)
+            .body(())
+            .unwrap();
+
+        let result = validate_api_key(&config, &request_no_prefix, &hmac_key);
+        assert!(
+            result.is_err(),
+            "raw key without required prefix should be rejected"
+        );
+
+        // Verify the correct format (with prefix) still works
+        let request_with_prefix = Request::builder()
+            .header("X-Api-Key", &full_key)
+            .body(())
+            .unwrap();
+
+        let result_with_prefix = validate_api_key(&config, &request_with_prefix, &hmac_key);
+        assert!(
+            result_with_prefix.is_ok(),
+            "key with correct prefix should succeed"
+        );
     }
 }

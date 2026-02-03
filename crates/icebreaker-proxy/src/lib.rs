@@ -38,7 +38,10 @@ pub use tunnel::{is_connect_request, ConnectHandler, TunnelConfig};
 // Metrics re-exports
 pub use metrics::{
     record_blocked_address, record_connect_tunnel, record_host_rejection, record_processor_used,
-    record_request, record_request_bytes, record_request_duration, record_response_bytes,
-    record_secret_leak_detected, record_token_validation, set_active_connections,
-    BlockReason as MetricsBlockReason, TokenValidationResult,
+    record_replay_attempt, record_request, record_request_bytes, record_request_duration,
+    record_response_bytes, record_secret_leak_detected, record_token_validation,
+    set_active_connections, BlockReason as MetricsBlockReason, TokenValidationResult,
 };
+
+// Re-export nonce store types for convenience
+pub use icebreaker_nonce::{CheckResult, InMemoryNonceStore, NoOpNonceStore, NonceStore};

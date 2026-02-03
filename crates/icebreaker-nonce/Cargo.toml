@@ -1,0 +1,33 @@
+[package]
+name = "icebreaker-nonce"
+description = "Nonce tracking for replay protection in the Icebreaker tokenizer proxy"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+default = []
+redis = ["dep:redis"]
+
+[dependencies]
+icebreaker-common = { path = "../icebreaker-common" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Observability
+tracing = { workspace = true }
+
+# Error handling
+thiserror = { workspace = true }
+
+# Redis (optional)
+redis = { version = "0.27", features = ["tokio-comp", "connection-manager"], optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

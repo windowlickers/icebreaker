@@ -24,12 +24,12 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use icebreaker_common::{
     ClientAuthMode, HealthConfig, InjectConfig, NetworkProtectionConfig, ProcessorConfig,
-    ProxyConfig, RateLimitConfig, ShutdownConfig, TlsConfig,
+    ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, TlsConfig,
 };
 use icebreaker_crypto::{KeyStore, Keypair, TlsConnectionInfo, TokenCrypto, VersionedKeypair};
 use icebreaker_proxy::{
-    create_tls_acceptor, extract_client_cert_info, DynamicResponseScanLayer, IpFilter,
-    MetricsLayer, RateLimitLayer, TokenInjectionLayer, ValidatingConnector,
+    create_tls_acceptor, extract_client_cert_info, DynamicResponseScanLayer, InMemoryNonceStore,
+    IpFilter, MetricsLayer, NonceStore, RateLimitLayer, TokenInjectionLayer, ValidatingConnector,
 };
 
 /// Icebreaker - A stateless tokenizer proxy
@@ -148,6 +148,22 @@ struct ServeArgs {
     /// Burst capacity for rate limiting (allows temporary spikes)
     #[arg(long, default_value = "20", env = "ICEBREAKER_RATE_LIMIT_BURST")]
     rate_limit_burst: u32,
+
+    /// Enable replay detection (nonce tracking)
+    #[arg(long, env = "ICEBREAKER_REPLAY_DETECTION")]
+    replay_detection: bool,
+
+    /// Replay detection backend: memory or redis
+    #[arg(long, default_value = "memory", env = "ICEBREAKER_REPLAY_BACKEND")]
+    replay_backend: String,
+
+    /// Redis URL for replay detection (when backend=redis)
+    #[arg(long, env = "ICEBREAKER_REPLAY_REDIS_URL")]
+    replay_redis_url: Option<String>,
+
+    /// Default nonce TTL in seconds (for nonces without explicit TTL)
+    #[arg(long, default_value = "86400", env = "ICEBREAKER_NONCE_TTL")]
+    nonce_ttl: u64,
 }
 
 #[derive(Parser)]
@@ -190,6 +206,22 @@ struct SealArgs {
     /// Token expiration in seconds from now
     #[arg(long)]
     expires_in: Option<u64>,
+
+    /// Make this a single-use token (enables replay protection)
+    #[arg(long)]
+    single_use: bool,
+
+    /// Maximum number of times this token can be used (enables replay protection)
+    #[arg(long)]
+    max_uses: Option<u32>,
+
+    /// Custom nonce for replay protection (auto-generated if not provided)
+    #[arg(long)]
+    nonce: Option<String>,
+
+    /// Nonce TTL in seconds (defaults to token expiration or 24 hours)
+    #[arg(long)]
+    nonce_ttl: Option<u64>,
 }
 
 #[derive(Parser)]
@@ -548,6 +580,7 @@ async fn handle_connection<I>(
     response_scan_enabled: bool,
     request_timeout: Duration,
     rate_limit_config: Option<RateLimitConfig>,
+    nonce_store: Option<Arc<dyn NonceStore>>,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -572,9 +605,10 @@ async fn handle_connection<I>(
         let service = ServiceBuilder::new()
             .layer(RateLimitLayer::new(rate_config))
             .layer(MetricsLayer::new())
-            .layer(TokenInjectionLayer::with_response_scan(
+            .layer(TokenInjectionLayer::with_options(
                 crypto,
                 response_scan_enabled,
+                nonce_store,
             ))
             .layer(DynamicResponseScanLayer::new())
             .service(proxy_service);
@@ -623,9 +657,10 @@ async fn handle_connection<I>(
     } else {
         let service = ServiceBuilder::new()
             .layer(MetricsLayer::new())
-            .layer(TokenInjectionLayer::with_response_scan(
+            .layer(TokenInjectionLayer::with_options(
                 crypto,
                 response_scan_enabled,
+                nonce_store,
             ))
             .layer(DynamicResponseScanLayer::new())
             .service(proxy_service);
@@ -804,6 +839,31 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             None
         };
 
+        // Build nonce store for replay detection if enabled
+        let nonce_store: Option<Arc<dyn NonceStore>> = if args.replay_detection {
+            match args.replay_backend.as_str() {
+                "memory" => {
+                    tracing::info!("replay detection enabled with in-memory backend");
+                    Some(Arc::new(InMemoryNonceStore::new()))
+                }
+                "redis" => {
+                    return Err(
+                        "redis replay backend requires the 'redis' feature (not implemented yet)"
+                            .into(),
+                    );
+                }
+                other => {
+                    return Err(format!(
+                        "unknown replay backend: '{}'. Valid options: memory, redis",
+                        other
+                    )
+                    .into());
+                }
+            }
+        } else {
+            None
+        };
+
         tracing::info!(
             bind = %config.bind_addr(),
             key_id = %args.key_id,
@@ -813,6 +873,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             tls_enabled = %tls_enabled,
             response_scan_enabled = %response_scan_enabled,
             rate_limit_enabled = %args.rate_limit_enabled,
+            replay_detection = %args.replay_detection,
             request_timeout = ?request_timeout,
             "starting icebreaker proxy"
         );
@@ -881,6 +942,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let conn_state = accept_state.clone();
                 let tls_acceptor = tls_acceptor.clone();
                 let rate_limit_config = rate_limit_config.clone();
+                let nonce_store = nonce_store.clone();
 
                 // Track connection
                 conn_state.connection_started();
@@ -902,6 +964,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     response_scan_enabled,
                                     request_timeout,
                                     rate_limit_config,
+                                    nonce_store,
                                 )
                                 .await;
                             }
@@ -925,6 +988,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                             response_scan_enabled,
                             request_timeout,
                             rate_limit_config,
+                            nonce_store,
                         )
                         .await;
                     }
@@ -1355,6 +1419,47 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
             .map(|d| d.as_secs() + expires_in)
             .unwrap_or(0);
         builder = builder.expires_at(expires_at);
+    }
+
+    // Build replay protection if requested
+    if args.single_use || args.max_uses.is_some() {
+        // Generate nonce if not provided
+        let nonce = args.nonce.unwrap_or_else(|| {
+            use rand::Rng;
+            let mut rng = rand::thread_rng();
+            let bytes: [u8; 16] = rng.gen();
+            hex::encode(bytes)
+        });
+
+        let max_uses = if args.single_use {
+            Some(1)
+        } else {
+            args.max_uses
+        };
+
+        let mut replay = ReplayProtection {
+            nonce: nonce.clone(),
+            max_uses,
+            nonce_ttl_seconds: args.nonce_ttl,
+        };
+
+        if let Some(ttl) = args.nonce_ttl {
+            replay = replay.with_ttl(ttl);
+        }
+
+        builder = builder.replay_protection(replay);
+
+        println!("Replay protection enabled:");
+        println!("  Nonce: {}", nonce);
+        if let Some(max) = max_uses {
+            println!("  Max uses: {}", max);
+        } else {
+            println!("  Max uses: unlimited (audit only)");
+        }
+        if let Some(ttl) = args.nonce_ttl {
+            println!("  Nonce TTL: {} seconds", ttl);
+        }
+        println!();
     }
 
     let payload = builder.build();

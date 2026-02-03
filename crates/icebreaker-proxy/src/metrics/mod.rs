@@ -118,6 +118,11 @@ pub fn record_secret_leak_detected() {
     counter!("icebreaker_secret_leaks_detected_total").increment(1);
 }
 
+/// Records a token replay attempt (blocked).
+pub fn record_replay_attempt() {
+    counter!("icebreaker_replay_detections_total").increment(1);
+}
+
 /// Reason an address was blocked.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockReason {

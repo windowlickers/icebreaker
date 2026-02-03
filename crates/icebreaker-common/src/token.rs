@@ -159,6 +159,14 @@ pub struct TokenPayload {
     #[zeroize(skip)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub oauth: Option<OAuthMetadata>,
+
+    /// Optional replay protection configuration.
+    ///
+    /// When present, the proxy will track nonce usage and reject
+    /// replay attempts based on the configured limits.
+    #[zeroize(skip)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub replay_protection: Option<ReplayProtection>,
 }
 
 impl std::fmt::Debug for TokenPayload {
@@ -172,6 +180,7 @@ impl std::fmt::Debug for TokenPayload {
             .field("expires_at", &self.expires_at)
             .field("metadata", &self.metadata)
             .field("oauth", &self.oauth)
+            .field("replay_protection", &self.replay_protection)
             .finish()
     }
 }
@@ -189,6 +198,7 @@ impl TokenPayload {
             expires_at: None,
             metadata: None,
             oauth: None,
+            replay_protection: None,
         }
     }
 
@@ -247,6 +257,7 @@ pub struct TokenPayloadBuilder {
     expires_at: Option<u64>,
     metadata: Option<TokenMetadata>,
     oauth: Option<OAuthMetadata>,
+    replay_protection: Option<ReplayProtection>,
 }
 
 impl TokenPayloadBuilder {
@@ -299,6 +310,13 @@ impl TokenPayloadBuilder {
         self
     }
 
+    /// Sets replay protection configuration.
+    #[must_use]
+    pub fn replay_protection(mut self, replay_protection: ReplayProtection) -> Self {
+        self.replay_protection = Some(replay_protection);
+        self
+    }
+
     /// Builds the `TokenPayload`.
     #[must_use]
     pub fn build(self) -> TokenPayload {
@@ -311,6 +329,7 @@ impl TokenPayloadBuilder {
             expires_at: self.expires_at,
             metadata: self.metadata,
             oauth: self.oauth,
+            replay_protection: self.replay_protection,
         }
     }
 }
@@ -345,6 +364,74 @@ impl TokenMetadata {
             name: None,
             tags: Vec::new(),
         }
+    }
+}
+
+/// Replay protection configuration.
+///
+/// When present in a token payload, this enables nonce tracking to prevent
+/// replay attacks where an attacker captures a valid token+request and
+/// replays it multiple times.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplayProtection {
+    /// Unique nonce for this token use.
+    ///
+    /// This should be a cryptographically random string that uniquely
+    /// identifies this token instance. UUIDs or random hex strings work well.
+    pub nonce: String,
+
+    /// Maximum number of times this token can be used.
+    ///
+    /// - `Some(1)` = single use (default behavior)
+    /// - `Some(n)` = can be used n times
+    /// - `None` = unlimited uses (audit only mode)
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub max_uses: Option<u32>,
+
+    /// Time-to-live for the nonce in seconds.
+    ///
+    /// After this duration, the nonce is forgotten and could theoretically
+    /// be reused. Defaults to the token expiration or 24 hours if not set.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub nonce_ttl_seconds: Option<u64>,
+}
+
+impl ReplayProtection {
+    /// Creates a new single-use replay protection.
+    #[must_use]
+    pub fn single_use(nonce: impl Into<String>) -> Self {
+        Self {
+            nonce: nonce.into(),
+            max_uses: Some(1),
+            nonce_ttl_seconds: None,
+        }
+    }
+
+    /// Creates replay protection with a specific max use count.
+    #[must_use]
+    pub fn with_max_uses(nonce: impl Into<String>, max_uses: u32) -> Self {
+        Self {
+            nonce: nonce.into(),
+            max_uses: Some(max_uses),
+            nonce_ttl_seconds: None,
+        }
+    }
+
+    /// Creates audit-only replay protection (unlimited uses).
+    #[must_use]
+    pub fn audit_only(nonce: impl Into<String>) -> Self {
+        Self {
+            nonce: nonce.into(),
+            max_uses: None,
+            nonce_ttl_seconds: None,
+        }
+    }
+
+    /// Sets the nonce TTL.
+    #[must_use]
+    pub fn with_ttl(mut self, ttl_seconds: u64) -> Self {
+        self.nonce_ttl_seconds = Some(ttl_seconds);
+        self
     }
 }
 
@@ -551,5 +638,115 @@ mod tests {
         )
         .build();
         assert!(!payload.is_expired());
+    }
+
+    #[test]
+    fn test_replay_protection_single_use() {
+        let replay = super::ReplayProtection::single_use("nonce-123");
+        assert_eq!(replay.nonce, "nonce-123");
+        assert_eq!(replay.max_uses, Some(1));
+        assert_eq!(replay.nonce_ttl_seconds, None);
+    }
+
+    #[test]
+    fn test_replay_protection_with_max_uses() {
+        let replay = super::ReplayProtection::with_max_uses("nonce-456", 5);
+        assert_eq!(replay.nonce, "nonce-456");
+        assert_eq!(replay.max_uses, Some(5));
+    }
+
+    #[test]
+    fn test_replay_protection_audit_only() {
+        let replay = super::ReplayProtection::audit_only("nonce-789");
+        assert_eq!(replay.nonce, "nonce-789");
+        assert_eq!(replay.max_uses, None);
+    }
+
+    #[test]
+    fn test_replay_protection_with_ttl() {
+        let replay = super::ReplayProtection::single_use("nonce").with_ttl(3600);
+        assert_eq!(replay.nonce_ttl_seconds, Some(3600));
+    }
+
+    #[test]
+    fn test_replay_protection_serialization_roundtrip() {
+        let replay = super::ReplayProtection {
+            nonce: "test-nonce".to_string(),
+            max_uses: Some(3),
+            nonce_ttl_seconds: Some(7200),
+        };
+
+        let json = serde_json::to_string(&replay).expect("should serialize");
+        let deserialized: super::ReplayProtection =
+            serde_json::from_str(&json).expect("should deserialize");
+
+        assert_eq!(deserialized.nonce, "test-nonce");
+        assert_eq!(deserialized.max_uses, Some(3));
+        assert_eq!(deserialized.nonce_ttl_seconds, Some(7200));
+    }
+
+    #[test]
+    fn test_replay_protection_optional_fields() {
+        // Test that optional fields can be omitted in JSON
+        let json = r#"{"nonce":"minimal"}"#;
+        let replay: super::ReplayProtection =
+            serde_json::from_str(json).expect("should deserialize");
+
+        assert_eq!(replay.nonce, "minimal");
+        assert_eq!(replay.max_uses, None);
+        assert_eq!(replay.nonce_ttl_seconds, None);
+    }
+
+    #[test]
+    fn test_token_payload_with_replay_protection() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .replay_protection(super::ReplayProtection::single_use("unique-nonce"))
+        .build();
+
+        assert!(payload.replay_protection.is_some());
+        let replay = payload.replay_protection.as_ref().expect("should exist");
+        assert_eq!(replay.nonce, "unique-nonce");
+        assert_eq!(replay.max_uses, Some(1));
+    }
+
+    #[test]
+    fn test_token_payload_without_replay_protection() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+
+        assert!(payload.replay_protection.is_none());
+    }
+
+    #[test]
+    fn test_token_payload_with_replay_protection_serialization() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .replay_protection(super::ReplayProtection::with_max_uses("nonce", 5).with_ttl(3600))
+        .build();
+
+        let json = serde_json::to_string(&payload).expect("should serialize");
+        assert!(json.contains("replay_protection"));
+        assert!(json.contains("nonce"));
+
+        // Deserialize and verify
+        let deserialized: TokenPayload = serde_json::from_str(&json).expect("should deserialize");
+        let replay = deserialized
+            .replay_protection
+            .as_ref()
+            .expect("should have replay protection");
+        assert_eq!(replay.nonce, "nonce");
+        assert_eq!(replay.max_uses, Some(5));
+        assert_eq!(replay.nonce_ttl_seconds, Some(3600));
     }
 }
