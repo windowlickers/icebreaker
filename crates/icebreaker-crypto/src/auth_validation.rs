@@ -38,10 +38,11 @@ pub enum ProxyCredential {
     },
 }
 
-/// TLS connection information for mutual TLS authentication.
+/// TLS connection information extracted from client certificates during mTLS handshake.
 ///
-/// This is a placeholder for future mTLS support. The actual implementation
-/// would extract this from the TLS handshake layer.
+/// Used by [`validate_mtls()`](validate_auth) to verify client certificate fingerprint and subject DN.
+/// Certificate information is extracted via [`extract_client_cert_info`](crate::extract_client_cert_info)
+/// after TLS handshake completion.
 #[derive(Debug, Clone, Default)]
 pub struct TlsConnectionInfo {
     /// SHA-256 fingerprint of the client certificate.

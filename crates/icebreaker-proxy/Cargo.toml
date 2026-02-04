@@ -77,3 +77,4 @@ hex = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = { workspace = true }
 flate2 = "1.0"
+rcgen = "0.13"
