@@ -225,7 +225,19 @@ impl TokenPayload {
 
         // Check pattern if provided
         if let Some(ref pattern) = self.allowed_host_pattern {
-            let re = regex::Regex::new(pattern).map_err(|e| {
+            // Auto-anchor patterns to prevent partial matches (e.g., "api.example.com"
+            // matching "evil.api.example.com"). Wrap in non-capturing group to preserve
+            // any alternation in the original pattern.
+            let anchored = if pattern.starts_with('^') && pattern.ends_with('$') {
+                pattern.clone()
+            } else if pattern.starts_with('^') {
+                format!("{pattern}$")
+            } else if pattern.ends_with('$') {
+                format!("^{pattern}")
+            } else {
+                format!("^(?:{pattern})$")
+            };
+            let re = regex::Regex::new(&anchored).map_err(|e| {
                 crate::error::TokenizerError::ConfigError(format!("invalid host pattern: {e}"))
             })?;
             if re.is_match(host) {
@@ -608,6 +620,42 @@ mod tests {
 
         assert!(payload.validate_host("api.example.com").is_ok());
         assert!(payload.validate_host("test.example.com").is_ok());
+        assert!(payload.validate_host("evil.com").is_err());
+    }
+
+    #[test]
+    fn test_host_pattern_auto_anchoring_prevents_overmatch() {
+        // Pattern without anchors should NOT match hosts with prefix/suffix
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host_pattern(r"api\.example\.com")
+        .build();
+
+        // Exact match should work
+        assert!(payload.validate_host("api.example.com").is_ok());
+        // Prefix should be rejected (would match without anchoring)
+        assert!(payload.validate_host("evil.api.example.com").is_err());
+        // Suffix should be rejected (would match without anchoring)
+        assert!(payload.validate_host("api.example.com.evil.com").is_err());
+        // Completely different host should be rejected
+        assert!(payload.validate_host("evil.com").is_err());
+    }
+
+    #[test]
+    fn test_host_pattern_preserves_explicit_anchors() {
+        // Patterns with explicit anchors should work unchanged
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host_pattern(r"^.*\.example\.com$")
+        .build();
+
+        assert!(payload.validate_host("api.example.com").is_ok());
+        assert!(payload.validate_host("deep.sub.example.com").is_ok());
+        assert!(payload.validate_host("example.com").is_err()); // No subdomain
         assert!(payload.validate_host("evil.com").is_err());
     }
 
