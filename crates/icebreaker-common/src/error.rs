@@ -103,6 +103,13 @@ pub enum TokenizerError {
     #[error("nonce store error: {0}")]
     NonceStoreError(String),
 
+    /// Response uses an unsupported Content-Encoding that cannot be scanned.
+    #[error("unsupported content encoding: {encoding}")]
+    UnsupportedContentEncoding {
+        /// The encoding that was not supported.
+        encoding: String,
+    },
+
     /// Internal error.
     #[error("internal error: {0}")]
     InternalError(String),
@@ -134,6 +141,7 @@ impl TokenizerError {
             Self::AuditError(_) => "audit error",
             Self::TokenReplayDetected { .. } => "token already used",
             Self::NonceStoreError(_) => "internal error",
+            Self::UnsupportedContentEncoding { .. } => "unsupported response encoding",
             Self::InternalError(_) => "internal error",
         }
     }
@@ -179,6 +187,7 @@ impl TokenizerError {
                 | Self::BlockedAddress { .. }
                 | Self::ProxyAuthRequired { .. }
                 | Self::TokenReplayDetected { .. }
+                | Self::UnsupportedContentEncoding { .. }
         )
     }
 }
@@ -303,5 +312,28 @@ mod tests {
         let display = error.to_string();
         assert!(display.contains("192.168.1.1"));
         assert!(display.contains("private network"));
+    }
+
+    #[test]
+    fn test_unsupported_content_encoding_error() {
+        let error = TokenizerError::UnsupportedContentEncoding {
+            encoding: "compress".into(),
+        };
+
+        // Client message should not expose the encoding
+        assert_eq!(error.client_message(), "unsupported response encoding");
+
+        // Display should contain the encoding for logging
+        let display = error.to_string();
+        assert!(display.contains("compress"));
+
+        // Should be a security error
+        assert!(error.is_security_error());
+
+        // Should not be retryable
+        assert!(!error.is_retryable());
+
+        // Should not be a client error (it's a server-side decision)
+        assert!(!error.is_client_error());
     }
 }

@@ -20,7 +20,8 @@ pub mod token;
 pub use auth::{ApiKeyConfig, AuthConfig, MutualTlsConfig};
 pub use config::{
     ClientAuthMode, ClockSkewConfig, HealthConfig, LoggingConfig, NetworkProtectionConfig,
-    ProxyConfig, RateLimitConfig, ShutdownConfig, TlsConfig,
+    ProxyConfig, RateLimitConfig, ResponseScanConfig, ShutdownConfig, TlsConfig,
+    UnsupportedEncodingBehavior,
 };
 pub use error::{Result, TokenizerError};
 pub use processor::{

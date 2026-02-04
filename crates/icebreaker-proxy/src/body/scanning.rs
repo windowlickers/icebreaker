@@ -9,7 +9,7 @@ use futures_util::ready;
 use http_body::{Body, Frame};
 use pin_project_lite::pin_project;
 
-use icebreaker_common::TokenizerError;
+use icebreaker_common::{ResponseScanConfig, TokenizerError, UnsupportedEncodingBehavior};
 
 use super::StreamScanner;
 use crate::metrics::record_secret_leak_detected;
@@ -156,6 +156,9 @@ pub struct SecretScannerConfig {
 
     /// Whether scanning is enabled.
     enabled: bool,
+
+    /// Response scan configuration for encoding handling.
+    response_scan_config: Arc<ResponseScanConfig>,
 }
 
 impl Default for SecretScannerConfig {
@@ -163,6 +166,7 @@ impl Default for SecretScannerConfig {
         Self {
             patterns: Arc::new(Vec::new()),
             enabled: true,
+            response_scan_config: Arc::new(ResponseScanConfig::default()),
         }
     }
 }
@@ -203,6 +207,25 @@ impl SecretScannerConfig {
     /// Wraps a body with scanning if enabled.
     pub fn wrap_body<B>(&self, body: B) -> ScanningBody<B> {
         ScanningBody::new(body, (*self.patterns).clone())
+    }
+
+    /// Sets the response scan configuration.
+    #[must_use]
+    pub fn with_response_scan_config(mut self, config: ResponseScanConfig) -> Self {
+        self.response_scan_config = Arc::new(config);
+        self
+    }
+
+    /// Returns the behavior for unsupported encodings.
+    #[must_use]
+    pub fn unsupported_encoding_behavior(&self) -> &UnsupportedEncodingBehavior {
+        &self.response_scan_config.unsupported_encoding
+    }
+
+    /// Checks if an encoding is in the additional allowed list.
+    #[must_use]
+    pub fn is_encoding_allowed(&self, encoding: &str) -> bool {
+        self.response_scan_config.is_encoding_allowed(encoding)
     }
 }
 

@@ -467,6 +467,63 @@ impl ClockSkewConfig {
     }
 }
 
+/// Behavior when encountering unsupported Content-Encoding.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UnsupportedEncodingBehavior {
+    /// Block the response with an error (fail-safe, default).
+    #[default]
+    Block,
+    /// Pass through with a warning (allows potentially unscannable content).
+    PassthroughWithWarning,
+}
+
+/// Configuration for response scanning behavior.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ResponseScanConfig {
+    /// Behavior when encountering unsupported Content-Encoding.
+    #[serde(default)]
+    pub unsupported_encoding: UnsupportedEncodingBehavior,
+
+    /// Additional Content-Encoding values to treat as identity (passthrough).
+    #[serde(default)]
+    pub additional_allowed_encodings: Vec<String>,
+}
+
+impl ResponseScanConfig {
+    /// Creates a new response scan configuration with default settings.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the behavior for unsupported encodings.
+    #[must_use]
+    pub fn with_unsupported_encoding_behavior(
+        mut self,
+        behavior: UnsupportedEncodingBehavior,
+    ) -> Self {
+        self.unsupported_encoding = behavior;
+        self
+    }
+
+    /// Adds an additional allowed encoding.
+    #[must_use]
+    pub fn with_allowed_encoding(mut self, encoding: impl Into<String>) -> Self {
+        self.additional_allowed_encodings.push(encoding.into());
+        self
+    }
+
+    /// Checks if an encoding is in the additional allowed list (case-insensitive).
+    #[must_use]
+    pub fn is_encoding_allowed(&self, encoding: &str) -> bool {
+        let encoding_lower = encoding.to_lowercase();
+        self.additional_allowed_encodings
+            .iter()
+            .any(|e| e.to_lowercase() == encoding_lower)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -541,5 +598,33 @@ mod tests {
     fn test_clock_skew_config_disable_future_check() {
         let config = ClockSkewConfig::default().with_max_future(None);
         assert_eq!(config.max_future_seconds, None);
+    }
+
+    #[test]
+    fn test_unsupported_encoding_behavior_default() {
+        let behavior = UnsupportedEncodingBehavior::default();
+        assert_eq!(behavior, UnsupportedEncodingBehavior::Block);
+    }
+
+    #[test]
+    fn test_response_scan_config_default() {
+        let config = ResponseScanConfig::default();
+        assert_eq!(
+            config.unsupported_encoding,
+            UnsupportedEncodingBehavior::Block
+        );
+        assert!(config.additional_allowed_encodings.is_empty());
+    }
+
+    #[test]
+    fn test_response_scan_config_is_encoding_allowed() {
+        let config = ResponseScanConfig {
+            unsupported_encoding: UnsupportedEncodingBehavior::Block,
+            additional_allowed_encodings: vec!["br-slow".to_string(), "custom".to_string()],
+        };
+        assert!(config.is_encoding_allowed("br-slow"));
+        assert!(config.is_encoding_allowed("BR-SLOW")); // case insensitive
+        assert!(config.is_encoding_allowed("custom"));
+        assert!(!config.is_encoding_allowed("unknown"));
     }
 }

@@ -118,6 +118,15 @@ pub fn record_secret_leak_detected() {
     counter!("icebreaker_secret_leaks_detected_total").increment(1);
 }
 
+/// Records a blocked response due to unsupported Content-Encoding.
+pub fn record_unsupported_encoding_blocked(encoding: &str) {
+    counter!(
+        "icebreaker_unsupported_encoding_blocked_total",
+        "encoding" => encoding.to_string()
+    )
+    .increment(1);
+}
+
 /// Records a token replay attempt (blocked).
 pub fn record_replay_attempt() {
     counter!("icebreaker_replay_detections_total").increment(1);

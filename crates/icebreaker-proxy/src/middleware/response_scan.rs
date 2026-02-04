@@ -11,7 +11,10 @@ use http::{Request, Response};
 use http_body::Body;
 use tower::{Layer, Service};
 
+use icebreaker_common::{ResponseScanConfig, TokenizerError, UnsupportedEncodingBehavior};
+
 use crate::body::{DecompressingBody, ScanningBody, SecretScannerConfig};
+use crate::metrics::record_unsupported_encoding_blocked;
 
 /// Layer that scans responses for secret leaks.
 #[derive(Clone)]
@@ -83,7 +86,7 @@ where
 
         Box::pin(async move {
             // Call inner service
-            let response = inner.call(request).await.map_err(Into::into)?;
+            let response: Response<ResBody> = inner.call(request).await.map_err(Into::into)?;
 
             // Decompress and wrap the response body with scanning
             let (mut parts, body) = response.into_parts();
@@ -117,18 +120,39 @@ where
                     DecompressingBody::zstd(body)
                 }
                 Some(unknown) => {
-                    tracing::warn!(
-                        encoding = %unknown,
-                        "unsupported Content-Encoding, scanning compressed data"
-                    );
-                    DecompressingBody::identity(body)
+                    if config.is_encoding_allowed(unknown) {
+                        tracing::debug!(encoding = %unknown, "using allowed additional encoding as identity");
+                        DecompressingBody::identity(body)
+                    } else {
+                        match config.unsupported_encoding_behavior() {
+                            UnsupportedEncodingBehavior::Block => {
+                                tracing::warn!(encoding = %unknown, "blocking response with unsupported Content-Encoding");
+                                record_unsupported_encoding_blocked(unknown);
+                                let err: Box<dyn std::error::Error + Send + Sync> =
+                                    Box::new(TokenizerError::UnsupportedContentEncoding {
+                                        encoding: unknown.to_string(),
+                                    });
+                                return Err(err);
+                            }
+                            UnsupportedEncodingBehavior::PassthroughWithWarning => {
+                                tracing::warn!(
+                                    encoding = %unknown,
+                                    "unsupported Content-Encoding, scanning compressed data (may miss secrets)"
+                                );
+                                DecompressingBody::identity(body)
+                            }
+                        }
+                    }
                 }
                 None => DecompressingBody::identity(body),
             };
 
             let scanning_body = config.wrap_body(decompressing);
 
-            Ok(Response::from_parts(parts, scanning_body))
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::from_parts(
+                parts,
+                scanning_body,
+            ))
         })
     }
 }
@@ -137,14 +161,32 @@ where
 ///
 /// This can be used in conjunction with token injection to scan for
 /// the specific secret that was injected.
-#[derive(Clone, Default)]
-pub struct DynamicResponseScanLayer;
+#[derive(Clone)]
+pub struct DynamicResponseScanLayer {
+    response_scan_config: Arc<ResponseScanConfig>,
+}
+
+impl Default for DynamicResponseScanLayer {
+    fn default() -> Self {
+        Self {
+            response_scan_config: Arc::new(ResponseScanConfig::default()),
+        }
+    }
+}
 
 impl DynamicResponseScanLayer {
     /// Creates a new dynamic response scan layer.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Creates a new dynamic response scan layer with the given response scan config.
+    #[must_use]
+    pub fn with_response_scan_config(config: ResponseScanConfig) -> Self {
+        Self {
+            response_scan_config: Arc::new(config),
+        }
     }
 }
 
@@ -152,7 +194,10 @@ impl<S> Layer<S> for DynamicResponseScanLayer {
     type Service = DynamicResponseScanService<S>;
 
     fn layer(&self, inner: S) -> Self::Service {
-        DynamicResponseScanService { inner }
+        DynamicResponseScanService {
+            inner,
+            response_scan_config: self.response_scan_config.clone(),
+        }
     }
 }
 
@@ -160,6 +205,7 @@ impl<S> Layer<S> for DynamicResponseScanLayer {
 #[derive(Clone)]
 pub struct DynamicResponseScanService<S> {
     inner: S,
+    response_scan_config: Arc<ResponseScanConfig>,
 }
 
 /// Extension type for storing patterns to scan for.
@@ -193,9 +239,10 @@ where
 
         let inner = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, inner);
+        let response_scan_config = self.response_scan_config.clone();
 
         Box::pin(async move {
-            let response = inner.call(request).await.map_err(Into::into)?;
+            let response: Response<ResBody> = inner.call(request).await.map_err(Into::into)?;
 
             let (mut parts, body) = response.into_parts();
 
@@ -228,18 +275,39 @@ where
                     DecompressingBody::zstd(body)
                 }
                 Some(unknown) => {
-                    tracing::warn!(
-                        encoding = %unknown,
-                        "unsupported Content-Encoding, scanning compressed data"
-                    );
-                    DecompressingBody::identity(body)
+                    if response_scan_config.is_encoding_allowed(unknown) {
+                        tracing::debug!(encoding = %unknown, "using allowed additional encoding as identity");
+                        DecompressingBody::identity(body)
+                    } else {
+                        match &response_scan_config.unsupported_encoding {
+                            UnsupportedEncodingBehavior::Block => {
+                                tracing::warn!(encoding = %unknown, "blocking response with unsupported Content-Encoding");
+                                record_unsupported_encoding_blocked(unknown);
+                                let err: Box<dyn std::error::Error + Send + Sync> =
+                                    Box::new(TokenizerError::UnsupportedContentEncoding {
+                                        encoding: unknown.to_string(),
+                                    });
+                                return Err(err);
+                            }
+                            UnsupportedEncodingBehavior::PassthroughWithWarning => {
+                                tracing::warn!(
+                                    encoding = %unknown,
+                                    "unsupported Content-Encoding, scanning compressed data (may miss secrets)"
+                                );
+                                DecompressingBody::identity(body)
+                            }
+                        }
+                    }
                 }
                 None => DecompressingBody::identity(body),
             };
 
             let scanning_body = ScanningBody::new(decompressing, patterns);
 
-            Ok(Response::from_parts(parts, scanning_body))
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::from_parts(
+                parts,
+                scanning_body,
+            ))
         })
     }
 }
@@ -469,5 +537,227 @@ mod tests {
         // Trying to read the body should error - secret detected in decompressed content
         let result = response.into_body().collect().await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_encoding_blocked_by_default() {
+        // By default, unsupported encodings should be blocked
+        let mock = MockService::new(b"some compressed data".to_vec()).with_encoding("compress");
+
+        let config = SecretScannerConfig::new().with_pattern(b"secret");
+
+        let layer = ResponseScanLayer::new(config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // The request should fail with an error about unsupported encoding
+        let result = service.oneshot(request).await;
+        match result {
+            Ok(_) => panic!("expected error for unsupported encoding"),
+            Err(err) => assert!(
+                err.to_string().contains("unsupported content encoding"),
+                "expected unsupported content encoding error, got: {}",
+                err
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_unsupported_encoding_passthrough_when_configured() {
+        use icebreaker_common::{ResponseScanConfig, UnsupportedEncodingBehavior};
+
+        let mock =
+            MockService::new(b"some data without secrets".to_vec()).with_encoding("compress");
+
+        let response_scan_config = ResponseScanConfig::new().with_unsupported_encoding_behavior(
+            UnsupportedEncodingBehavior::PassthroughWithWarning,
+        );
+
+        let config = SecretScannerConfig::new()
+            .with_pattern(b"secret-pattern")
+            .with_response_scan_config(response_scan_config);
+
+        let layer = ResponseScanLayer::new(config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // With passthrough mode, the request should succeed
+        let response = service
+            .oneshot(request)
+            .await
+            .expect("should succeed in passthrough mode");
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect body");
+        assert_eq!(body.to_bytes().as_ref(), b"some data without secrets");
+    }
+
+    #[tokio::test]
+    async fn test_additional_allowed_encoding_treated_as_identity() {
+        use icebreaker_common::ResponseScanConfig;
+
+        let mock = MockService::new(b"uncompressed data actually".to_vec())
+            .with_encoding("custom-encoding");
+
+        let response_scan_config =
+            ResponseScanConfig::new().with_allowed_encoding("custom-encoding");
+
+        let config = SecretScannerConfig::new()
+            .with_pattern(b"secret-pattern")
+            .with_response_scan_config(response_scan_config);
+
+        let layer = ResponseScanLayer::new(config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // Allowed encodings should pass through without blocking
+        let response = service
+            .oneshot(request)
+            .await
+            .expect("should succeed with allowed encoding");
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect body");
+        assert_eq!(body.to_bytes().as_ref(), b"uncompressed data actually");
+    }
+
+    #[tokio::test]
+    async fn test_allowed_encoding_case_insensitive() {
+        use icebreaker_common::ResponseScanConfig;
+
+        // Server returns "Custom-Encoding" but we allow "custom-encoding" (different case)
+        let mock =
+            MockService::new(b"case insensitive test".to_vec()).with_encoding("Custom-Encoding");
+
+        let response_scan_config =
+            ResponseScanConfig::new().with_allowed_encoding("custom-encoding"); // lowercase
+
+        let config = SecretScannerConfig::new()
+            .with_pattern(b"secret")
+            .with_response_scan_config(response_scan_config);
+
+        let layer = ResponseScanLayer::new(config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // Should pass through because matching is case-insensitive
+        let response = service
+            .oneshot(request)
+            .await
+            .expect("should succeed with case-insensitive match");
+
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect body");
+        assert_eq!(body.to_bytes().as_ref(), b"case insensitive test");
+    }
+
+    #[tokio::test]
+    async fn test_secret_detected_in_passthrough_mode() {
+        use icebreaker_common::{ResponseScanConfig, UnsupportedEncodingBehavior};
+
+        // Even in passthrough mode, we still scan for secrets in the raw data
+        let mock = MockService::new(b"here is the secret-key-xyz in the data".to_vec())
+            .with_encoding("compress");
+
+        let response_scan_config = ResponseScanConfig::new().with_unsupported_encoding_behavior(
+            UnsupportedEncodingBehavior::PassthroughWithWarning,
+        );
+
+        let config = SecretScannerConfig::new()
+            .with_pattern(b"secret-key-xyz")
+            .with_response_scan_config(response_scan_config);
+
+        let layer = ResponseScanLayer::new(config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // Should get a response...
+        let response = service.oneshot(request).await.expect("should get response");
+
+        // ...but reading the body should fail due to secret detection
+        let result = response.into_body().collect().await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_layer_unsupported_encoding_blocked_by_default() {
+        // Test that DynamicResponseScanLayer also blocks by default
+        let mock = MockService::new(b"some compressed data".to_vec()).with_encoding("br-slow");
+
+        let layer = DynamicResponseScanLayer::new();
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // Should fail with unsupported encoding error
+        let result = service.oneshot(request).await;
+        match result {
+            Ok(_) => panic!("expected error for unsupported encoding"),
+            Err(err) => assert!(
+                err.to_string().contains("unsupported content encoding"),
+                "expected unsupported content encoding error, got: {}",
+                err
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_layer_with_passthrough_config() {
+        use icebreaker_common::{ResponseScanConfig, UnsupportedEncodingBehavior};
+
+        let mock = MockService::new(b"data with unknown encoding".to_vec()).with_encoding("lz4");
+
+        let response_scan_config = ResponseScanConfig::new().with_unsupported_encoding_behavior(
+            UnsupportedEncodingBehavior::PassthroughWithWarning,
+        );
+
+        let layer = DynamicResponseScanLayer::with_response_scan_config(response_scan_config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // Should succeed in passthrough mode
+        let response = service.oneshot(request).await.expect("should succeed");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect");
+        assert_eq!(body.to_bytes().as_ref(), b"data with unknown encoding");
     }
 }
