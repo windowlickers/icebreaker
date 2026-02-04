@@ -109,6 +109,35 @@ pub enum TokenizerError {
 }
 
 impl TokenizerError {
+    /// Returns a client-safe error message that does not expose internal details.
+    ///
+    /// Use this for error responses returned to clients. The detailed error
+    /// information is preserved in the `Display` implementation for internal logging.
+    #[must_use]
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            Self::CryptoError(_) => "cryptographic operation failed",
+            Self::DecryptionError(_) => "token decryption failed",
+            Self::TokenExpired => "token expired",
+            Self::InvalidPayload(_) => "invalid token",
+            Self::HostNotAllowed { .. } => "destination not allowed",
+            Self::BlockedAddress { .. } => "destination not allowed",
+            Self::ProxyAuthRequired { .. } => "proxy authentication required",
+            Self::SecretLeakDetected => "request blocked",
+            Self::HttpError(_) => "request failed",
+            Self::UpstreamError { .. } => "upstream error",
+            Self::RateLimitExceeded => "rate limit exceeded",
+            Self::Timeout => "request timeout",
+            Self::OAuthRefreshError(_) => "authentication failed",
+            Self::SigningError(_) => "request signing failed",
+            Self::ConfigError(_) => "configuration error",
+            Self::AuditError(_) => "audit error",
+            Self::TokenReplayDetected { .. } => "token already used",
+            Self::NonceStoreError(_) => "internal error",
+            Self::InternalError(_) => "internal error",
+        }
+    }
+
     /// Returns `true` if this error is retryable.
     ///
     /// Retryable errors are transient failures that may succeed on retry,
@@ -212,5 +241,67 @@ mod tests {
 
         assert!(!TokenizerError::Timeout.is_security_error());
         assert!(!TokenizerError::ConfigError("missing key".into()).is_security_error());
+    }
+
+    #[test]
+    fn test_client_message_does_not_expose_hosts() {
+        let error = TokenizerError::HostNotAllowed {
+            host: "evil.com".into(),
+        };
+        let msg = error.client_message();
+
+        // Client message should not contain the actual host
+        assert!(!msg.contains("evil.com"));
+        assert_eq!(msg, "destination not allowed");
+    }
+
+    #[test]
+    fn test_client_message_does_not_expose_ip_addresses() {
+        let error = TokenizerError::BlockedAddress {
+            ip: "127.0.0.1".into(),
+            reason: "loopback".into(),
+        };
+        let msg = error.client_message();
+
+        // Client message should not contain IP or reason
+        assert!(!msg.contains("127.0.0.1"));
+        assert!(!msg.contains("loopback"));
+        assert_eq!(msg, "destination not allowed");
+    }
+
+    #[test]
+    fn test_client_message_does_not_expose_internal_details() {
+        // ProxyAuthRequired should not expose the reason
+        let error = TokenizerError::ProxyAuthRequired {
+            reason: "HMAC validation failed for key abc123".into(),
+        };
+        assert!(!error.client_message().contains("HMAC"));
+        assert!(!error.client_message().contains("abc123"));
+
+        // TokenReplayDetected should not expose usage counts
+        let error = TokenizerError::TokenReplayDetected {
+            uses_count: 5,
+            max_uses: 3,
+        };
+        assert!(!error.client_message().contains("5"));
+        assert!(!error.client_message().contains("3"));
+    }
+
+    #[test]
+    fn test_detailed_display_preserved_for_logging() {
+        // Ensure Display still contains details for internal logging
+        let error = TokenizerError::HostNotAllowed {
+            host: "evil.com".into(),
+        };
+        let display = error.to_string();
+        assert!(display.contains("evil.com"));
+
+        let error = TokenizerError::BlockedAddress {
+            ip: "192.168.1.1".into(),
+            reason: "private network".into(),
+        };
+        let display = error.to_string();
+        assert!(display.contains("192.168.1.1"));
+        assert!(display.contains("private network"));
     }
 }

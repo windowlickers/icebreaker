@@ -212,6 +212,9 @@ impl ConnectHandler {
     }
 
     /// Creates an error response for a CONNECT request.
+    ///
+    /// Returns a generic error message to the client to avoid leaking
+    /// internal details. Detailed error information should be logged separately.
     #[must_use]
     pub fn error_response(error: &TokenizerError) -> Response<String> {
         let status = match error {
@@ -223,10 +226,12 @@ impl ConnectHandler {
             _ => StatusCode::BAD_GATEWAY,
         };
 
+        // Use client_message() to avoid exposing internal details
+        let message = error.client_message().to_string();
         Response::builder()
             .status(status)
-            .body(error.to_string())
-            .unwrap_or_else(|_| Response::new(error.to_string()))
+            .body(message.clone())
+            .unwrap_or_else(|_| Response::new(message))
     }
 }
 
@@ -302,6 +307,34 @@ mod tests {
         let error = TokenizerError::Timeout;
         let response = ConnectHandler::error_response(&error);
         assert_eq!(response.status(), StatusCode::GATEWAY_TIMEOUT);
+    }
+
+    #[test]
+    fn test_error_response_does_not_leak_host() {
+        let error = TokenizerError::HostNotAllowed {
+            host: "sensitive-internal.corp".to_string(),
+        };
+        let response = ConnectHandler::error_response(&error);
+        let body = response.into_body();
+
+        // Body should not contain the actual host
+        assert!(!body.contains("sensitive-internal.corp"));
+        assert_eq!(body, "destination not allowed");
+    }
+
+    #[test]
+    fn test_error_response_does_not_leak_ip() {
+        let error = TokenizerError::BlockedAddress {
+            ip: "10.0.0.1".to_string(),
+            reason: "private network".to_string(),
+        };
+        let response = ConnectHandler::error_response(&error);
+        let body = response.into_body();
+
+        // Body should not contain IP address or reason
+        assert!(!body.contains("10.0.0.1"));
+        assert!(!body.contains("private"));
+        assert_eq!(body, "destination not allowed");
     }
 
     #[test]
