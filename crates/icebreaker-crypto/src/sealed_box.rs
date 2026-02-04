@@ -6,9 +6,26 @@ use crypto_box::{
 };
 use rand::rngs::OsRng;
 
-use icebreaker_common::{Result, SealedToken, TokenPayload, TokenizerError};
+use icebreaker_common::{
+    ClockSkewConfig, ExpirationStatus, Result, SealedToken, TokenPayload, TokenizerError,
+};
 
 use crate::keypair::{KeyStore, Keypair, VersionedKeypair};
+
+/// Configuration for token decryption.
+#[derive(Debug, Clone, Default)]
+pub struct DecryptConfig {
+    /// Clock skew tolerance configuration.
+    pub clock_skew: ClockSkewConfig,
+}
+
+impl DecryptConfig {
+    /// Creates a new decrypt configuration with the given clock skew settings.
+    #[must_use]
+    pub fn with_clock_skew(clock_skew: ClockSkewConfig) -> Self {
+        Self { clock_skew }
+    }
+}
 
 /// Seals a token payload using NaCl sealed box encryption.
 ///
@@ -95,8 +112,23 @@ pub fn create_sealed_token(
     Ok(SealedToken::new(&versioned_keypair.key_id, ciphertext))
 }
 
-/// Decrypts a sealed token using the key store.
+/// Decrypts a sealed token using the key store with default configuration.
+///
+/// This function uses default clock skew tolerance settings. For custom
+/// tolerance, use [`decrypt_sealed_token_with_config`].
 pub fn decrypt_sealed_token(token: &SealedToken, key_store: &KeyStore) -> Result<TokenPayload> {
+    decrypt_sealed_token_with_config(token, key_store, &DecryptConfig::default())
+}
+
+/// Decrypts a sealed token using the key store with custom configuration.
+///
+/// This function allows configuring clock skew tolerance for token expiration
+/// validation. See [`ClockSkewConfig`] for details on tolerance settings.
+pub fn decrypt_sealed_token_with_config(
+    token: &SealedToken,
+    key_store: &KeyStore,
+    config: &DecryptConfig,
+) -> Result<TokenPayload> {
     use base64::Engine;
 
     // Find the keypair
@@ -112,25 +144,43 @@ pub fn decrypt_sealed_token(token: &SealedToken, key_store: &KeyStore) -> Result
     // Decrypt
     let payload = unseal(&sealed_bytes, &versioned_keypair.keypair)?;
 
-    // Check expiration
-    if payload.is_expired() {
-        return Err(TokenizerError::TokenExpired);
+    // Check expiration with clock skew tolerance
+    match payload.check_expiration(&config.clock_skew) {
+        ExpirationStatus::Valid | ExpirationStatus::NoExpiration => Ok(payload),
+        ExpirationStatus::Expired => Err(TokenizerError::TokenExpired),
+        ExpirationStatus::FutureDated { seconds_ahead } => {
+            Err(TokenizerError::InvalidPayload(format!(
+                "token expiration is {} seconds too far in the future",
+                seconds_ahead
+            )))
+        }
     }
-
-    Ok(payload)
 }
 
 /// A token sealer/unsealer service.
 #[derive(Debug)]
 pub struct TokenCrypto {
     key_store: KeyStore,
+    decrypt_config: DecryptConfig,
 }
 
 impl TokenCrypto {
     /// Creates a new `TokenCrypto` with the given key store.
     #[must_use]
     pub fn new(key_store: KeyStore) -> Self {
-        Self { key_store }
+        Self {
+            key_store,
+            decrypt_config: DecryptConfig::default(),
+        }
+    }
+
+    /// Creates a new `TokenCrypto` with the given key store and decrypt configuration.
+    #[must_use]
+    pub fn with_config(key_store: KeyStore, decrypt_config: DecryptConfig) -> Self {
+        Self {
+            key_store,
+            decrypt_config,
+        }
     }
 
     /// Creates a new `TokenCrypto` with a single keypair.
@@ -138,7 +188,10 @@ impl TokenCrypto {
     pub fn with_keypair(keypair: Keypair, key_id: impl Into<String>) -> Self {
         let versioned = VersionedKeypair::new(key_id, keypair, 1);
         let key_store = KeyStore::with_primary(versioned);
-        Self { key_store }
+        Self {
+            key_store,
+            decrypt_config: DecryptConfig::default(),
+        }
     }
 
     /// Generates a new `TokenCrypto` with a random keypair.
@@ -147,6 +200,12 @@ impl TokenCrypto {
     #[must_use]
     pub fn generate() -> Self {
         Self::with_keypair(Keypair::generate(), "generated")
+    }
+
+    /// Returns the current clock skew configuration.
+    #[must_use]
+    pub fn clock_skew_config(&self) -> &ClockSkewConfig {
+        &self.decrypt_config.clock_skew
     }
 
     /// Seals a token payload.
@@ -159,9 +218,18 @@ impl TokenCrypto {
         create_sealed_token(payload, primary)
     }
 
-    /// Unseals a token.
+    /// Unseals a token using the configured clock skew tolerance.
     pub fn unseal(&self, token: &SealedToken) -> Result<TokenPayload> {
-        decrypt_sealed_token(token, &self.key_store)
+        decrypt_sealed_token_with_config(token, &self.key_store, &self.decrypt_config)
+    }
+
+    /// Unseals a token with a custom configuration.
+    pub fn unseal_with_config(
+        &self,
+        token: &SealedToken,
+        config: &DecryptConfig,
+    ) -> Result<TokenPayload> {
+        decrypt_sealed_token_with_config(token, &self.key_store, config)
     }
 
     /// Returns a reference to the key store.
@@ -305,5 +373,130 @@ mod tests {
 
         let result = decrypt_sealed_token(&token, &key_store);
         assert!(result.is_err());
+    }
+
+    mod clock_skew {
+        use super::*;
+
+        fn now_secs() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+
+        #[test]
+        fn test_expired_token_valid_within_tolerance() {
+            let keypair = Keypair::generate();
+            let now = now_secs();
+
+            // Token expired 10 seconds ago
+            let payload = TokenPayload::builder(
+                SecretString::from("test-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now - 10)
+            .build();
+
+            let versioned = VersionedKeypair::new("test-key", keypair, 1);
+            let key_store = KeyStore::with_primary(versioned);
+
+            let primary = key_store.primary().expect("should have primary");
+            let sealed_token = create_sealed_token(&payload, primary).expect("seal should succeed");
+
+            // With default config (30s tolerance), should succeed
+            let config = DecryptConfig::default();
+            let result = decrypt_sealed_token_with_config(&sealed_token, &key_store, &config);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_expired_token_fails_beyond_tolerance() {
+            let keypair = Keypair::generate();
+            let now = now_secs();
+
+            // Token expired 60 seconds ago
+            let payload = TokenPayload::builder(
+                SecretString::from("test-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now - 60)
+            .build();
+
+            let versioned = VersionedKeypair::new("test-key", keypair, 1);
+            let key_store = KeyStore::with_primary(versioned);
+
+            let primary = key_store.primary().expect("should have primary");
+            let sealed_token = create_sealed_token(&payload, primary).expect("seal should succeed");
+
+            // With default config (30s tolerance), should fail
+            let config = DecryptConfig::default();
+            let result = decrypt_sealed_token_with_config(&sealed_token, &key_store, &config);
+            assert!(matches!(result, Err(TokenizerError::TokenExpired)));
+        }
+
+        #[test]
+        fn test_future_dated_token_rejected() {
+            let keypair = Keypair::generate();
+            let now = now_secs();
+
+            // Token expires 1 hour in the future
+            let payload = TokenPayload::builder(
+                SecretString::from("test-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now + 3600)
+            .build();
+
+            let versioned = VersionedKeypair::new("test-key", keypair, 1);
+            let key_store = KeyStore::with_primary(versioned);
+
+            let primary = key_store.primary().expect("should have primary");
+            let sealed_token = create_sealed_token(&payload, primary).expect("seal should succeed");
+
+            // With default config (300s max future), should fail
+            let config = DecryptConfig::default();
+            let result = decrypt_sealed_token_with_config(&sealed_token, &key_store, &config);
+            assert!(matches!(result, Err(TokenizerError::InvalidPayload(_))));
+        }
+
+        #[test]
+        fn test_token_crypto_with_custom_config() {
+            let keypair = Keypair::generate();
+            let versioned = VersionedKeypair::new("test-key", keypair, 1);
+            let key_store = KeyStore::with_primary(versioned);
+
+            // Create crypto with strict config (0 tolerance)
+            let config = DecryptConfig::with_clock_skew(ClockSkewConfig::strict());
+            let crypto = TokenCrypto::with_config(key_store, config);
+
+            // Verify the config is stored
+            assert_eq!(crypto.clock_skew_config().tolerance_seconds, 0);
+        }
+
+        #[test]
+        fn test_permissive_config_allows_larger_skew() {
+            let keypair = Keypair::generate();
+            let now = now_secs();
+
+            // Token expired 200 seconds ago
+            let payload = TokenPayload::builder(
+                SecretString::from("test-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now - 200)
+            .build();
+
+            let versioned = VersionedKeypair::new("test-key", keypair, 1);
+            let key_store = KeyStore::with_primary(versioned);
+
+            let primary = key_store.primary().expect("should have primary");
+            let sealed_token = create_sealed_token(&payload, primary).expect("seal should succeed");
+
+            // With permissive config (300s tolerance), should succeed
+            let config = DecryptConfig::with_clock_skew(ClockSkewConfig::permissive());
+            let result = decrypt_sealed_token_with_config(&sealed_token, &key_store, &config);
+            assert!(result.is_ok());
+        }
     }
 }

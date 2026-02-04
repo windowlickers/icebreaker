@@ -28,4 +28,7 @@ pub use hmac::{
     signature_to_hex, verify_signature, CanonicalRequestBuilder, RequestSigner,
 };
 pub use keypair::{KeyStore, Keypair, VersionedKeypair};
-pub use sealed_box::{create_sealed_token, decrypt_sealed_token, seal, unseal, TokenCrypto};
+pub use sealed_box::{
+    create_sealed_token, decrypt_sealed_token, decrypt_sealed_token_with_config, seal, unseal,
+    DecryptConfig, TokenCrypto,
+};

@@ -8,7 +8,7 @@ use http::{Request, Response, StatusCode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
-use icebreaker_common::{Result, TokenPayload, TokenizerError};
+use icebreaker_common::{ClockSkewConfig, ExpirationStatus, Result, TokenPayload, TokenizerError};
 use icebreaker_crypto::TokenCrypto;
 
 use crate::middleware::TOKEN_HEADER;
@@ -43,6 +43,7 @@ pub struct ConnectHandler {
     crypto: Arc<TokenCrypto>,
     ip_filter: Arc<IpFilter>,
     config: TunnelConfig,
+    clock_skew: ClockSkewConfig,
 }
 
 impl ConnectHandler {
@@ -52,6 +53,7 @@ impl ConnectHandler {
             crypto,
             ip_filter,
             config: TunnelConfig::default(),
+            clock_skew: ClockSkewConfig::default(),
         }
     }
 
@@ -65,6 +67,22 @@ impl ConnectHandler {
             crypto,
             ip_filter,
             config,
+            clock_skew: ClockSkewConfig::default(),
+        }
+    }
+
+    /// Creates a new CONNECT handler with all options including clock skew configuration.
+    pub fn with_all_options(
+        crypto: Arc<TokenCrypto>,
+        ip_filter: Arc<IpFilter>,
+        config: TunnelConfig,
+        clock_skew: ClockSkewConfig,
+    ) -> Self {
+        Self {
+            crypto,
+            ip_filter,
+            config,
+            clock_skew,
         }
     }
 
@@ -73,7 +91,7 @@ impl ConnectHandler {
     /// This performs:
     /// - Token extraction and decryption
     /// - Host validation against token's allowed hosts
-    /// - Token expiration check
+    /// - Token expiration check (with clock skew tolerance)
     pub fn validate_connect<B>(&self, request: &Request<B>) -> Result<(TokenPayload, String, u16)> {
         // Extract the token
         let token_header = request
@@ -89,9 +107,20 @@ impl ConnectHandler {
         let sealed_token = icebreaker_common::SealedToken::from_header(token_header)?;
         let payload = self.crypto.unseal(&sealed_token)?;
 
-        // Check expiration
-        if payload.is_expired() {
-            return Err(TokenizerError::TokenExpired);
+        // Check expiration with clock skew tolerance
+        match payload.check_expiration(&self.clock_skew) {
+            ExpirationStatus::Valid | ExpirationStatus::NoExpiration => {
+                // Token is valid, continue
+            }
+            ExpirationStatus::Expired => {
+                return Err(TokenizerError::TokenExpired);
+            }
+            ExpirationStatus::FutureDated { seconds_ahead } => {
+                return Err(TokenizerError::InvalidPayload(format!(
+                    "token expiration is {} seconds too far in the future",
+                    seconds_ahead
+                )));
+            }
         }
 
         // Extract target host and port from the CONNECT URI

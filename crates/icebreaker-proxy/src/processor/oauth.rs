@@ -10,7 +10,9 @@
 
 use http::{header::HeaderName, HeaderValue, Request};
 
-use icebreaker_common::{OAuthConfig, Result, TokenPayload, TokenizerError};
+use icebreaker_common::{
+    ClockSkewConfig, ExpirationStatus, OAuthConfig, Result, TokenPayload, TokenizerError,
+};
 
 use super::RequestProcessor;
 
@@ -23,29 +25,55 @@ use super::RequestProcessor;
 #[derive(Debug, Clone)]
 pub struct OAuthProcessor {
     config: OAuthConfig,
+    clock_skew: ClockSkewConfig,
 }
 
 impl OAuthProcessor {
-    /// Creates a new OAuth processor.
+    /// Creates a new OAuth processor with default clock skew configuration.
     #[must_use]
     pub fn new(config: OAuthConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            clock_skew: ClockSkewConfig::default(),
+        }
+    }
+
+    /// Creates a new OAuth processor with custom clock skew configuration.
+    #[must_use]
+    pub fn with_clock_skew(config: OAuthConfig, clock_skew: ClockSkewConfig) -> Self {
+        Self { config, clock_skew }
     }
 }
 
 impl RequestProcessor for OAuthProcessor {
     fn process<B>(&self, mut request: Request<B>, payload: &TokenPayload) -> Result<Request<B>> {
-        // Check if the OAuth access token has expired
+        // Check if the OAuth access token has expired (with clock skew tolerance)
         // This happens when the sealed token contains OAuthMetadata with expiration info
         if let Some(ref oauth) = payload.oauth {
-            if oauth.is_access_token_expired() {
-                tracing::warn!(
-                    provider_id = %oauth.provider_id,
-                    "OAuth access token has expired, client should refresh via SSO service"
-                );
-                return Err(TokenizerError::OAuthRefreshError(
-                    "access token expired, refresh required".to_string(),
-                ));
+            match oauth.check_access_token_expiration(&self.clock_skew) {
+                ExpirationStatus::Expired => {
+                    tracing::warn!(
+                        provider_id = %oauth.provider_id,
+                        "OAuth access token has expired, client should refresh via SSO service"
+                    );
+                    return Err(TokenizerError::OAuthRefreshError(
+                        "access token expired, refresh required".to_string(),
+                    ));
+                }
+                ExpirationStatus::FutureDated { seconds_ahead } => {
+                    tracing::warn!(
+                        provider_id = %oauth.provider_id,
+                        seconds_ahead = seconds_ahead,
+                        "OAuth access token expiration is too far in the future"
+                    );
+                    return Err(TokenizerError::InvalidPayload(format!(
+                        "access token expiration is {} seconds too far in the future",
+                        seconds_ahead
+                    )));
+                }
+                ExpirationStatus::Valid | ExpirationStatus::NoExpiration => {
+                    // Token is valid, continue processing
+                }
             }
         }
 
@@ -152,13 +180,20 @@ mod tests {
         assert_eq!(header, "Bearer my-token");
     }
 
+    fn now_secs() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
     #[test]
     fn test_oauth_with_valid_metadata() {
         let config = create_default_config();
         let processor = OAuthProcessor::new(config);
 
-        // Token with OAuth metadata, not expired (far future)
-        let oauth_metadata = OAuthMetadata::new("google").with_expires_at(u64::MAX);
+        // Token with OAuth metadata, expires in 60 seconds (within acceptable range)
+        let oauth_metadata = OAuthMetadata::new("google").with_expires_at(now_secs() + 60);
 
         let payload = TokenPayload::builder(
             SecretString::from("valid-access-token"),
@@ -234,5 +269,86 @@ mod tests {
             .expect("should have auth header");
 
         assert_eq!(auth_header, "Bearer simple-token");
+    }
+
+    #[test]
+    fn test_oauth_expired_within_tolerance_succeeds() {
+        let config = create_default_config();
+        let processor = OAuthProcessor::new(config); // Default 30s tolerance
+
+        // Token expired 10 seconds ago - should be valid with tolerance
+        let oauth_metadata = OAuthMetadata::new("google").with_expires_at(now_secs() - 10);
+
+        let payload = TokenPayload::builder(
+            SecretString::from("recently-expired-token"),
+            ProcessorConfig::OAuth(OAuthConfig::default()),
+        )
+        .oauth(oauth_metadata)
+        .build();
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // Should succeed because we're within tolerance
+        let result = processor.process(request, &payload);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_oauth_strict_mode_rejects_recently_expired() {
+        let config = create_default_config();
+        let processor = OAuthProcessor::with_clock_skew(config, ClockSkewConfig::strict());
+
+        // Token expired 5 seconds ago - should fail with strict mode (0 tolerance)
+        let oauth_metadata = OAuthMetadata::new("google").with_expires_at(now_secs() - 5);
+
+        let payload = TokenPayload::builder(
+            SecretString::from("recently-expired-token"),
+            ProcessorConfig::OAuth(OAuthConfig::default()),
+        )
+        .oauth(oauth_metadata)
+        .build();
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        let result = processor.process(request, &payload);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TokenizerError::OAuthRefreshError(_)
+        ));
+    }
+
+    #[test]
+    fn test_oauth_future_dated_rejected() {
+        let config = create_default_config();
+        let processor = OAuthProcessor::new(config); // Default 300s max future
+
+        // Token expires 1 hour in the future - should be rejected
+        let oauth_metadata = OAuthMetadata::new("google").with_expires_at(now_secs() + 3600);
+
+        let payload = TokenPayload::builder(
+            SecretString::from("future-dated-token"),
+            ProcessorConfig::OAuth(OAuthConfig::default()),
+        )
+        .oauth(oauth_metadata)
+        .build();
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        let result = processor.process(request, &payload);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            TokenizerError::InvalidPayload(_)
+        ));
     }
 }

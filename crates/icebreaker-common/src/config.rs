@@ -394,6 +394,79 @@ impl NetworkProtectionConfig {
     }
 }
 
+/// Configuration for clock skew tolerance in token expiration validation.
+///
+/// This configuration protects against clock drift between systems while also
+/// preventing future-dated tokens that could remain valid indefinitely.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClockSkewConfig {
+    /// Tolerance in seconds for token expiration (default: 30).
+    ///
+    /// A token that expired up to `tolerance_seconds` ago will still be
+    /// considered valid. This allows for minor clock drift between the
+    /// token issuer and the proxy.
+    pub tolerance_seconds: u64,
+
+    /// Maximum seconds a token can expire in the future (default: Some(300)).
+    ///
+    /// If a token's expiration is more than this many seconds in the future,
+    /// it will be rejected as `FutureDated`. This prevents attackers from
+    /// creating tokens with extremely long lifetimes.
+    ///
+    /// Set to `None` to disable future-dating checks (not recommended).
+    pub max_future_seconds: Option<u64>,
+}
+
+impl Default for ClockSkewConfig {
+    fn default() -> Self {
+        Self {
+            tolerance_seconds: 30,
+            max_future_seconds: Some(300), // 5 minutes
+        }
+    }
+}
+
+impl ClockSkewConfig {
+    /// Creates a strict configuration with no tolerance.
+    ///
+    /// This is useful when clock synchronization is guaranteed and strict
+    /// validation is required.
+    #[must_use]
+    pub fn strict() -> Self {
+        Self {
+            tolerance_seconds: 0,
+            max_future_seconds: Some(60), // 1 minute
+        }
+    }
+
+    /// Creates a permissive configuration with higher tolerance.
+    ///
+    /// This is useful in environments with poor clock synchronization.
+    #[must_use]
+    pub fn permissive() -> Self {
+        Self {
+            tolerance_seconds: 300,         // 5 minutes
+            max_future_seconds: Some(3600), // 1 hour
+        }
+    }
+
+    /// Creates a new configuration with the specified tolerance.
+    #[must_use]
+    pub fn with_tolerance(tolerance_seconds: u64) -> Self {
+        Self {
+            tolerance_seconds,
+            ..Default::default()
+        }
+    }
+
+    /// Sets the maximum future seconds.
+    #[must_use]
+    pub fn with_max_future(mut self, max_future_seconds: Option<u64>) -> Self {
+        self.max_future_seconds = max_future_seconds;
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +500,46 @@ mod tests {
             .build();
 
         assert_eq!(config.bind_addr(), "192.168.1.1:9000");
+    }
+
+    #[test]
+    fn test_clock_skew_config_default() {
+        let config = ClockSkewConfig::default();
+        assert_eq!(config.tolerance_seconds, 30);
+        assert_eq!(config.max_future_seconds, Some(300));
+    }
+
+    #[test]
+    fn test_clock_skew_config_strict() {
+        let config = ClockSkewConfig::strict();
+        assert_eq!(config.tolerance_seconds, 0);
+        assert_eq!(config.max_future_seconds, Some(60));
+    }
+
+    #[test]
+    fn test_clock_skew_config_permissive() {
+        let config = ClockSkewConfig::permissive();
+        assert_eq!(config.tolerance_seconds, 300);
+        assert_eq!(config.max_future_seconds, Some(3600));
+    }
+
+    #[test]
+    fn test_clock_skew_config_with_tolerance() {
+        let config = ClockSkewConfig::with_tolerance(60);
+        assert_eq!(config.tolerance_seconds, 60);
+        assert_eq!(config.max_future_seconds, Some(300)); // Default
+    }
+
+    #[test]
+    fn test_clock_skew_config_with_max_future() {
+        let config = ClockSkewConfig::default().with_max_future(Some(600));
+        assert_eq!(config.tolerance_seconds, 30); // Default
+        assert_eq!(config.max_future_seconds, Some(600));
+    }
+
+    #[test]
+    fn test_clock_skew_config_disable_future_check() {
+        let config = ClockSkewConfig::default().with_max_future(None);
+        assert_eq!(config.max_future_seconds, None);
     }
 }

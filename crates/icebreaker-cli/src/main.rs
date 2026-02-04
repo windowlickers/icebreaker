@@ -23,8 +23,8 @@ use tower::{Service, ServiceBuilder, ServiceExt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use icebreaker_common::{
-    ClientAuthMode, HealthConfig, InjectConfig, NetworkProtectionConfig, ProcessorConfig,
-    ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, TlsConfig,
+    ClientAuthMode, ClockSkewConfig, HealthConfig, InjectConfig, NetworkProtectionConfig,
+    ProcessorConfig, ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, TlsConfig,
 };
 use icebreaker_crypto::{KeyStore, Keypair, TlsConnectionInfo, TokenCrypto, VersionedKeypair};
 use icebreaker_proxy::{
@@ -164,6 +164,16 @@ struct ServeArgs {
     /// Default nonce TTL in seconds (for nonces without explicit TTL)
     #[arg(long, default_value = "86400", env = "ICEBREAKER_NONCE_TTL")]
     nonce_ttl: u64,
+
+    /// Clock skew tolerance in seconds for token expiration validation.
+    /// Tokens that expired within this window are still considered valid.
+    #[arg(long, default_value = "30", env = "ICEBREAKER_CLOCK_SKEW_TOLERANCE")]
+    clock_skew_tolerance: u64,
+
+    /// Maximum seconds a token's expiration can be in the future.
+    /// Set to 0 to disable future-dating check (not recommended).
+    #[arg(long, default_value = "300", env = "ICEBREAKER_MAX_FUTURE_TOKEN")]
+    max_future_token: u64,
 }
 
 #[derive(Parser)]
@@ -581,6 +591,7 @@ async fn handle_connection<I>(
     request_timeout: Duration,
     rate_limit_config: Option<RateLimitConfig>,
     nonce_store: Option<Arc<dyn NonceStore>>,
+    clock_skew: ClockSkewConfig,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
@@ -605,10 +616,11 @@ async fn handle_connection<I>(
         let service = ServiceBuilder::new()
             .layer(RateLimitLayer::new(rate_config))
             .layer(MetricsLayer::new())
-            .layer(TokenInjectionLayer::with_options(
+            .layer(TokenInjectionLayer::with_all_options(
                 crypto,
                 response_scan_enabled,
                 nonce_store,
+                clock_skew,
             ))
             .layer(DynamicResponseScanLayer::new())
             .service(proxy_service);
@@ -657,10 +669,11 @@ async fn handle_connection<I>(
     } else {
         let service = ServiceBuilder::new()
             .layer(MetricsLayer::new())
-            .layer(TokenInjectionLayer::with_options(
+            .layer(TokenInjectionLayer::with_all_options(
                 crypto,
                 response_scan_enabled,
                 nonce_store,
+                clock_skew,
             ))
             .layer(DynamicResponseScanLayer::new())
             .service(proxy_service);
@@ -864,6 +877,16 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             None
         };
 
+        // Build clock skew configuration
+        let clock_skew = ClockSkewConfig {
+            tolerance_seconds: args.clock_skew_tolerance,
+            max_future_seconds: if args.max_future_token == 0 {
+                None
+            } else {
+                Some(args.max_future_token)
+            },
+        };
+
         tracing::info!(
             bind = %config.bind_addr(),
             key_id = %args.key_id,
@@ -875,6 +898,8 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             rate_limit_enabled = %args.rate_limit_enabled,
             replay_detection = %args.replay_detection,
             request_timeout = ?request_timeout,
+            clock_skew_tolerance = ?clock_skew.tolerance_seconds,
+            max_future_token = ?clock_skew.max_future_seconds,
             "starting icebreaker proxy"
         );
 
@@ -943,6 +968,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 let tls_acceptor = tls_acceptor.clone();
                 let rate_limit_config = rate_limit_config.clone();
                 let nonce_store = nonce_store.clone();
+                let clock_skew = clock_skew.clone();
 
                 // Track connection
                 conn_state.connection_started();
@@ -965,6 +991,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                                     request_timeout,
                                     rate_limit_config,
                                     nonce_store,
+                                    clock_skew.clone(),
                                 )
                                 .await;
                             }
@@ -989,6 +1016,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                             request_timeout,
                             rate_limit_config,
                             nonce_store,
+                            clock_skew,
                         )
                         .await;
                     }

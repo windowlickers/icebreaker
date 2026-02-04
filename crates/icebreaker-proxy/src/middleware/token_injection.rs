@@ -26,7 +26,7 @@ use base64::Engine;
 use http::Request;
 use tower::{Layer, Service};
 
-use icebreaker_common::{SealedToken, TokenizerError};
+use icebreaker_common::{ClockSkewConfig, SealedToken, TokenizerError};
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 use icebreaker_nonce::{CheckResult, NonceStore};
 
@@ -118,6 +118,7 @@ pub struct TokenInjectionLayer {
     crypto: Arc<TokenCrypto>,
     response_scan_enabled: bool,
     nonce_store: Option<Arc<dyn NonceStore>>,
+    clock_skew: ClockSkewConfig,
 }
 
 impl TokenInjectionLayer {
@@ -127,6 +128,7 @@ impl TokenInjectionLayer {
             crypto,
             response_scan_enabled: true,
             nonce_store: None,
+            clock_skew: ClockSkewConfig::default(),
         }
     }
 
@@ -136,6 +138,7 @@ impl TokenInjectionLayer {
             crypto,
             response_scan_enabled: enabled,
             nonce_store: None,
+            clock_skew: ClockSkewConfig::default(),
         }
     }
 
@@ -145,6 +148,7 @@ impl TokenInjectionLayer {
             crypto,
             response_scan_enabled: true,
             nonce_store: Some(nonce_store),
+            clock_skew: ClockSkewConfig::default(),
         }
     }
 
@@ -158,6 +162,22 @@ impl TokenInjectionLayer {
             crypto,
             response_scan_enabled,
             nonce_store,
+            clock_skew: ClockSkewConfig::default(),
+        }
+    }
+
+    /// Creates a new token injection layer with all options including clock skew configuration.
+    pub fn with_all_options(
+        crypto: Arc<TokenCrypto>,
+        response_scan_enabled: bool,
+        nonce_store: Option<Arc<dyn NonceStore>>,
+        clock_skew: ClockSkewConfig,
+    ) -> Self {
+        Self {
+            crypto,
+            response_scan_enabled,
+            nonce_store,
+            clock_skew,
         }
     }
 }
@@ -171,6 +191,7 @@ impl<S> Layer<S> for TokenInjectionLayer {
             crypto: self.crypto.clone(),
             response_scan_enabled: self.response_scan_enabled,
             nonce_store: self.nonce_store.clone(),
+            clock_skew: self.clock_skew.clone(),
         }
     }
 }
@@ -182,6 +203,7 @@ pub struct TokenInjectionService<S> {
     crypto: Arc<TokenCrypto>,
     response_scan_enabled: bool,
     nonce_store: Option<Arc<dyn NonceStore>>,
+    clock_skew: ClockSkewConfig,
 }
 
 impl<S> TokenInjectionService<S> {
@@ -192,6 +214,7 @@ impl<S> TokenInjectionService<S> {
             crypto,
             response_scan_enabled: true,
             nonce_store: None,
+            clock_skew: ClockSkewConfig::default(),
         }
     }
 
@@ -202,6 +225,7 @@ impl<S> TokenInjectionService<S> {
             crypto,
             response_scan_enabled: enabled,
             nonce_store: None,
+            clock_skew: ClockSkewConfig::default(),
         }
     }
 
@@ -217,6 +241,24 @@ impl<S> TokenInjectionService<S> {
             crypto,
             response_scan_enabled,
             nonce_store,
+            clock_skew: ClockSkewConfig::default(),
+        }
+    }
+
+    /// Creates a new token injection service with all options including clock skew.
+    pub fn with_all_options(
+        inner: S,
+        crypto: Arc<TokenCrypto>,
+        response_scan_enabled: bool,
+        nonce_store: Option<Arc<dyn NonceStore>>,
+        clock_skew: ClockSkewConfig,
+    ) -> Self {
+        Self {
+            inner,
+            crypto,
+            response_scan_enabled,
+            nonce_store,
+            clock_skew,
         }
     }
 }
@@ -243,6 +285,7 @@ where
         let mut inner = self.inner.clone();
         let response_scan_enabled = self.response_scan_enabled;
         let nonce_store = self.nonce_store.clone();
+        let clock_skew = self.clock_skew.clone();
 
         Box::pin(async move {
             // Extract the token header
@@ -340,7 +383,9 @@ where
             if let Some(ref replay) = payload.replay_protection {
                 if let Some(ref store) = nonce_store {
                     // Calculate TTL: use explicit nonce_ttl_seconds, or calculate from
-                    // token expiration, or default to 24 hours
+                    // token expiration (plus tolerance buffer), or default to 24 hours.
+                    // The tolerance buffer ensures the nonce isn't purged before the token
+                    // becomes truly expired (accounting for clock skew).
                     let ttl = replay
                         .nonce_ttl_seconds
                         .map(Duration::from_secs)
@@ -350,8 +395,11 @@ where
                                     .duration_since(std::time::UNIX_EPOCH)
                                     .map(|d| d.as_secs())
                                     .unwrap_or(0);
-                                if expires_at > now {
-                                    Some(Duration::from_secs(expires_at - now))
+                                // Add clock skew tolerance to ensure nonce lives as long as
+                                // the token could potentially be valid
+                                let effective_expiry = expires_at + clock_skew.tolerance_seconds;
+                                if effective_expiry > now {
+                                    Some(Duration::from_secs(effective_expiry - now))
                                 } else {
                                     None
                                 }

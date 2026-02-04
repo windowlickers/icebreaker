@@ -2,12 +2,50 @@
 
 use secrecy::{ExposeSecret, SecretString};
 
+use crate::config::ClockSkewConfig;
+
 /// Maximum compiled size for host pattern regex (10KB).
 const HOST_PATTERN_REGEX_SIZE_LIMIT: usize = 10 * 1024;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::ZeroizeOnDrop;
 
 use crate::{auth::AuthConfig, error::Result, processor::ProcessorConfig};
+
+/// Result of checking token expiration with clock skew tolerance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExpirationStatus {
+    /// Token is valid (not expired or within tolerance).
+    Valid,
+    /// Token has expired beyond the tolerance window.
+    Expired,
+    /// Token has no expiration set.
+    NoExpiration,
+    /// Token expiration is too far in the future.
+    FutureDated {
+        /// How many seconds ahead of the max_future limit the token is.
+        seconds_ahead: u64,
+    },
+}
+
+impl ExpirationStatus {
+    /// Returns `true` if the status represents a valid (usable) token.
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        matches!(self, Self::Valid | Self::NoExpiration)
+    }
+
+    /// Returns `true` if the token has expired.
+    #[must_use]
+    pub fn is_expired(&self) -> bool {
+        matches!(self, Self::Expired)
+    }
+
+    /// Returns `true` if the token is future-dated beyond allowed limits.
+    #[must_use]
+    pub fn is_future_dated(&self) -> bool {
+        matches!(self, Self::FutureDated { .. })
+    }
+}
 
 /// Custom serialization module for SecretString.
 mod secret_string_serde {
@@ -206,7 +244,14 @@ impl TokenPayload {
     }
 
     /// Returns `true` if the token has expired.
+    ///
+    /// This method does not account for clock skew. For production use,
+    /// prefer [`check_expiration`] which accepts a [`ClockSkewConfig`].
     #[must_use]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use check_expiration() with ClockSkewConfig for proper clock skew handling"
+    )]
     pub fn is_expired(&self) -> bool {
         if let Some(expires_at) = self.expires_at {
             let now = std::time::SystemTime::now()
@@ -217,6 +262,45 @@ impl TokenPayload {
         } else {
             false
         }
+    }
+
+    /// Checks token expiration with clock skew tolerance.
+    ///
+    /// This method accounts for clock drift between systems and prevents
+    /// future-dated tokens that could remain valid indefinitely.
+    ///
+    /// # Returns
+    ///
+    /// - [`ExpirationStatus::Valid`] if the token is not expired (or within tolerance)
+    /// - [`ExpirationStatus::Expired`] if the token has expired beyond tolerance
+    /// - [`ExpirationStatus::NoExpiration`] if no expiration is set
+    /// - [`ExpirationStatus::FutureDated`] if expiration is too far in the future
+    #[must_use]
+    pub fn check_expiration(&self, clock_skew: &ClockSkewConfig) -> ExpirationStatus {
+        let Some(expires_at) = self.expires_at else {
+            return ExpirationStatus::NoExpiration;
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Check if token is too far in the future
+        if let Some(max_future) = clock_skew.max_future_seconds {
+            if expires_at > now + max_future {
+                return ExpirationStatus::FutureDated {
+                    seconds_ahead: expires_at - now - max_future,
+                };
+            }
+        }
+
+        // Check if token is expired (with tolerance)
+        if now > expires_at + clock_skew.tolerance_seconds {
+            return ExpirationStatus::Expired;
+        }
+
+        ExpirationStatus::Valid
     }
 
     /// Validates that the given host is allowed.
@@ -546,7 +630,14 @@ impl OAuthMetadata {
     }
 
     /// Returns `true` if the access token has expired.
+    ///
+    /// This method does not account for clock skew. For production use,
+    /// prefer [`check_access_token_expiration`] which accepts a [`ClockSkewConfig`].
     #[must_use]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use check_access_token_expiration() with ClockSkewConfig for proper clock skew handling"
+    )]
     pub fn is_access_token_expired(&self) -> bool {
         if let Some(expires_at) = self.access_token_expires_at {
             let now = std::time::SystemTime::now()
@@ -557,6 +648,45 @@ impl OAuthMetadata {
         } else {
             false
         }
+    }
+
+    /// Checks access token expiration with clock skew tolerance.
+    ///
+    /// This method accounts for clock drift between systems and prevents
+    /// future-dated tokens that could remain valid indefinitely.
+    ///
+    /// # Returns
+    ///
+    /// - [`ExpirationStatus::Valid`] if the token is not expired (or within tolerance)
+    /// - [`ExpirationStatus::Expired`] if the token has expired beyond tolerance
+    /// - [`ExpirationStatus::NoExpiration`] if no expiration is set
+    /// - [`ExpirationStatus::FutureDated`] if expiration is too far in the future
+    #[must_use]
+    pub fn check_access_token_expiration(&self, clock_skew: &ClockSkewConfig) -> ExpirationStatus {
+        let Some(expires_at) = self.access_token_expires_at else {
+            return ExpirationStatus::NoExpiration;
+        };
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Check if token is too far in the future
+        if let Some(max_future) = clock_skew.max_future_seconds {
+            if expires_at > now + max_future {
+                return ExpirationStatus::FutureDated {
+                    seconds_ahead: expires_at - now - max_future,
+                };
+            }
+        }
+
+        // Check if token is expired (with tolerance)
+        if now > expires_at + clock_skew.tolerance_seconds {
+            return ExpirationStatus::Expired;
+        }
+
+        ExpirationStatus::Valid
     }
 
     /// Returns `true` if a refresh token is available.
@@ -668,14 +798,20 @@ mod tests {
 
     #[test]
     fn test_token_expiration() {
-        // Not expired (far future)
+        let clock_skew = ClockSkewConfig::default();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+
+        // Not expired (60 seconds in the future, within max_future_seconds)
         let payload = TokenPayload::builder(
             SecretString::from("secret"),
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
-        .expires_at(u64::MAX)
+        .expires_at(now + 60)
         .build();
-        assert!(!payload.is_expired());
+        assert!(payload.check_expiration(&clock_skew).is_valid());
 
         // Expired (past)
         let payload = TokenPayload::builder(
@@ -684,7 +820,7 @@ mod tests {
         )
         .expires_at(0)
         .build();
-        assert!(payload.is_expired());
+        assert!(payload.check_expiration(&clock_skew).is_expired());
 
         // No expiration
         let payload = TokenPayload::builder(
@@ -692,7 +828,17 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .build();
-        assert!(!payload.is_expired());
+        let status = payload.check_expiration(&clock_skew);
+        assert!(matches!(status, ExpirationStatus::NoExpiration));
+
+        // Future-dated token (too far in the future)
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .expires_at(now + 3600) // 1 hour, beyond default 300s max_future
+        .build();
+        assert!(payload.check_expiration(&clock_skew).is_future_dated());
     }
 
     #[test]
@@ -824,5 +970,198 @@ mod tests {
             result,
             Err(crate::error::TokenizerError::ConfigError(_))
         ));
+    }
+
+    // Clock skew tolerance tests
+    mod clock_skew {
+        use super::*;
+        use crate::config::ClockSkewConfig;
+
+        fn now_secs() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        }
+
+        #[test]
+        fn test_token_valid_within_tolerance() {
+            let config = ClockSkewConfig::default(); // 30 seconds tolerance
+            let now = now_secs();
+
+            // Token expired 10 seconds ago should be valid with 30s tolerance
+            let payload = TokenPayload::builder(
+                SecretString::from("secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now - 10)
+            .build();
+
+            let status = payload.check_expiration(&config);
+            assert_eq!(status, ExpirationStatus::Valid);
+            assert!(status.is_valid());
+        }
+
+        #[test]
+        fn test_token_expired_beyond_tolerance() {
+            let config = ClockSkewConfig::default(); // 30 seconds tolerance
+            let now = now_secs();
+
+            // Token expired 60 seconds ago should be expired
+            let payload = TokenPayload::builder(
+                SecretString::from("secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now - 60)
+            .build();
+
+            let status = payload.check_expiration(&config);
+            assert_eq!(status, ExpirationStatus::Expired);
+            assert!(status.is_expired());
+            assert!(!status.is_valid());
+        }
+
+        #[test]
+        fn test_future_dated_token_rejected() {
+            let config = ClockSkewConfig::default(); // 300 seconds max future
+            let now = now_secs();
+
+            // Token expires 1 hour in the future should be rejected
+            let payload = TokenPayload::builder(
+                SecretString::from("secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now + 3600)
+            .build();
+
+            let status = payload.check_expiration(&config);
+            assert!(status.is_future_dated());
+            assert!(!status.is_valid());
+            if let ExpirationStatus::FutureDated { seconds_ahead } = status {
+                // Should be about 3300 seconds ahead (3600 - 300)
+                assert!(seconds_ahead > 3000);
+            }
+        }
+
+        #[test]
+        fn test_no_expiration_returns_no_expiration() {
+            let config = ClockSkewConfig::default();
+
+            let payload = TokenPayload::builder(
+                SecretString::from("secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .build();
+
+            let status = payload.check_expiration(&config);
+            assert_eq!(status, ExpirationStatus::NoExpiration);
+            assert!(status.is_valid()); // NoExpiration is considered valid
+        }
+
+        #[test]
+        fn test_strict_mode_no_tolerance() {
+            let config = ClockSkewConfig::strict(); // 0 seconds tolerance
+            let now = now_secs();
+
+            // Token expired just 1 second ago should be expired with strict mode
+            let payload = TokenPayload::builder(
+                SecretString::from("secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now - 1)
+            .build();
+
+            let status = payload.check_expiration(&config);
+            assert_eq!(status, ExpirationStatus::Expired);
+        }
+
+        #[test]
+        fn test_permissive_mode_high_tolerance() {
+            let config = ClockSkewConfig::permissive(); // 300 seconds tolerance
+            let now = now_secs();
+
+            // Token expired 200 seconds ago should be valid with permissive mode
+            let payload = TokenPayload::builder(
+                SecretString::from("secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now - 200)
+            .build();
+
+            let status = payload.check_expiration(&config);
+            assert_eq!(status, ExpirationStatus::Valid);
+        }
+
+        #[test]
+        fn test_future_check_disabled() {
+            let config = ClockSkewConfig::default().with_max_future(None);
+            let now = now_secs();
+
+            // Token expires very far in the future should be valid when check disabled
+            let payload = TokenPayload::builder(
+                SecretString::from("secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .expires_at(now + 86400 * 365) // 1 year
+            .build();
+
+            let status = payload.check_expiration(&config);
+            assert_eq!(status, ExpirationStatus::Valid);
+        }
+
+        #[test]
+        fn test_oauth_access_token_with_tolerance() {
+            let config = ClockSkewConfig::default();
+            let now = now_secs();
+
+            // OAuth token expired 10 seconds ago should be valid
+            let oauth = OAuthMetadata::new("google").with_expires_at(now - 10);
+
+            let status = oauth.check_access_token_expiration(&config);
+            assert_eq!(status, ExpirationStatus::Valid);
+        }
+
+        #[test]
+        fn test_oauth_access_token_expired() {
+            let config = ClockSkewConfig::default();
+            let now = now_secs();
+
+            // OAuth token expired 60 seconds ago should be expired
+            let oauth = OAuthMetadata::new("google").with_expires_at(now - 60);
+
+            let status = oauth.check_access_token_expiration(&config);
+            assert_eq!(status, ExpirationStatus::Expired);
+        }
+
+        #[test]
+        fn test_oauth_access_token_no_expiration() {
+            let config = ClockSkewConfig::default();
+
+            let oauth = OAuthMetadata::new("google");
+
+            let status = oauth.check_access_token_expiration(&config);
+            assert_eq!(status, ExpirationStatus::NoExpiration);
+        }
+
+        #[test]
+        fn test_expiration_status_helpers() {
+            // Test is_valid
+            assert!(ExpirationStatus::Valid.is_valid());
+            assert!(ExpirationStatus::NoExpiration.is_valid());
+            assert!(!ExpirationStatus::Expired.is_valid());
+            assert!(!ExpirationStatus::FutureDated { seconds_ahead: 100 }.is_valid());
+
+            // Test is_expired
+            assert!(ExpirationStatus::Expired.is_expired());
+            assert!(!ExpirationStatus::Valid.is_expired());
+            assert!(!ExpirationStatus::NoExpiration.is_expired());
+            assert!(!ExpirationStatus::FutureDated { seconds_ahead: 100 }.is_expired());
+
+            // Test is_future_dated
+            assert!(ExpirationStatus::FutureDated { seconds_ahead: 100 }.is_future_dated());
+            assert!(!ExpirationStatus::Valid.is_future_dated());
+            assert!(!ExpirationStatus::NoExpiration.is_future_dated());
+            assert!(!ExpirationStatus::Expired.is_future_dated());
+        }
     }
 }

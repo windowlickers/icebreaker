@@ -19,12 +19,14 @@ pub mod token;
 
 pub use auth::{ApiKeyConfig, AuthConfig, MutualTlsConfig};
 pub use config::{
-    ClientAuthMode, HealthConfig, LoggingConfig, NetworkProtectionConfig, ProxyConfig,
-    RateLimitConfig, ShutdownConfig, TlsConfig,
+    ClientAuthMode, ClockSkewConfig, HealthConfig, LoggingConfig, NetworkProtectionConfig,
+    ProxyConfig, RateLimitConfig, ShutdownConfig, TlsConfig,
 };
 pub use error::{Result, TokenizerError};
 pub use processor::{
     CachedOAuthToken, HmacAlgorithm, HmacConfig, InjectBodyConfig, InjectConfig, OAuthConfig,
     OAuthGrantType, ProcessorConfig, Sigv4Config,
 };
-pub use token::{OAuthMetadata, ReplayProtection, SealedToken, TokenMetadata, TokenPayload};
+pub use token::{
+    ExpirationStatus, OAuthMetadata, ReplayProtection, SealedToken, TokenMetadata, TokenPayload,
+};
