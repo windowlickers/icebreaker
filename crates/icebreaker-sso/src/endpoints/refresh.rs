@@ -60,10 +60,8 @@ pub async fn handle_refresh(
     let sealed_token = SealedToken::from_header(auth_header)
         .map_err(|e| SsoError::UnsealingError(format!("invalid token format: {e}")))?;
 
-    // Unseal to get the refresh token
-    // Note: Standard OAuth tokens don't store refresh tokens
-    // This would need a custom token format or separate refresh token storage
-    let _payload = service
+    // Unseal the token to access OAuth metadata containing the refresh token
+    let payload = service
         .crypto()
         .unseal(&sealed_token)
         .map_err(|e| SsoError::UnsealingError(e.to_string()))?;
@@ -85,15 +83,8 @@ pub async fn handle_refresh(
             SsoError::ConfigError(format!("unknown profile: {}", provider_config.profile))
         })?;
 
-    // For now, we'll return an error since the standard token format
-    // doesn't include refresh tokens. In a real implementation, you'd
-    // need to either:
-    // 1. Store refresh tokens separately (e.g., in a database)
-    // 2. Include refresh tokens in the sealed token payload
-    // 3. Use a different token format that supports refresh
-
-    // This is a placeholder that shows the structure:
-    let refresh_token = extract_refresh_token(&_payload)?;
+    // Extract refresh token from OAuth metadata stored in sealed token
+    let refresh_token = extract_refresh_token(&payload)?;
 
     // Build refresh parameters
     let token_url = profile.token_url(provider_config)?;
@@ -345,5 +336,367 @@ mod tests {
 
         assert_eq!(http_response.status(), StatusCode::OK);
         assert!(http_response.body().contains("Tokenizer"));
+    }
+
+    #[test]
+    fn test_extract_refresh_token_success() {
+        let payload = TokenPayload::builder(
+            SecretString::from("access_token"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .oauth(
+            OAuthMetadata::new("test-provider")
+                .with_refresh_token(SecretString::from("my-refresh-token")),
+        )
+        .build();
+
+        let result = extract_refresh_token(&payload);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), "my-refresh-token");
+    }
+
+    #[test]
+    fn test_extract_refresh_token_missing_oauth_metadata() {
+        let payload = TokenPayload::builder(
+            SecretString::from("access_token"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .build();
+
+        let result = extract_refresh_token(&payload);
+        assert!(matches!(result, Err(SsoError::TokenRefreshFailed { .. })));
+    }
+
+    #[test]
+    fn test_extract_refresh_token_missing_refresh_token() {
+        let payload = TokenPayload::builder(
+            SecretString::from("access_token"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .oauth(OAuthMetadata::new("test-provider"))
+        .build();
+
+        let result = extract_refresh_token(&payload);
+        assert!(matches!(result, Err(SsoError::TokenRefreshFailed { .. })));
+    }
+}
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use crate::config::{CookieConfig, CryptoConfig, ProviderConfig, SsoConfig};
+    use crate::SsoService;
+    use std::collections::HashMap;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Creates a test SsoConfig with the given token URL for the provider.
+    fn test_config(token_url: &str) -> SsoConfig {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "test-provider".to_string(),
+            ProviderConfig {
+                profile: "generic".to_string(),
+                client_id: "test-client-id".to_string(),
+                client_secret: SecretString::from("test-client-secret"),
+                callback_url: None,
+                scopes: vec![],
+                auth_url: Some("https://auth.example.com/authorize".to_string()),
+                token_url: Some(token_url.to_string()),
+                pkce: false,
+                allowed_hosts: vec!["api.example.com".to_string()],
+                allowed_host_pattern: None,
+                forwarded_params: vec![],
+                token_expires_in: None, // Don't set sealed token expiration to avoid clock skew validation
+            },
+        );
+
+        SsoConfig {
+            bind_address: "127.0.0.1".to_string(),
+            port: 8081,
+            base_url: "https://sso.example.com".to_string(),
+            cookie: CookieConfig {
+                name: "test_sso".to_string(),
+                secret_key: SecretString::from("test-cookie-secret-key-32bytes!!"),
+                domain: None,
+                path: "/".to_string(),
+                secure: false,
+                same_site: crate::config::SameSitePolicy::Lax,
+                ttl_seconds: 3600,
+            },
+            crypto: CryptoConfig {
+                // Valid 32-byte key encoded as base64
+                secret_key: SecretString::from("MDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTIzNDU2Nzg5MDE="),
+                key_id: "test-key".to_string(),
+            },
+            providers,
+        }
+    }
+
+    /// Creates a sealed token with OAuth metadata containing a refresh token.
+    fn create_sealed_token_with_refresh(service: &SsoService, refresh_token: &str) -> String {
+        let payload = TokenPayload::builder(
+            SecretString::from("old-access-token"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_hosts(vec!["api.example.com".to_string()])
+        .oauth(
+            OAuthMetadata::new("test-provider")
+                .with_refresh_token(SecretString::from(refresh_token.to_string()))
+                .with_token_type("Bearer".to_string()),
+        )
+        .build();
+
+        let sealed = service.crypto().seal(&payload).expect("sealing should work");
+        sealed.to_header().expect("to_header should work")
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_success() {
+        // Start mock OAuth server
+        let mock_server = MockServer::start().await;
+
+        // Mock the token refresh endpoint
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("grant_type=refresh_token"))
+            .and(body_string_contains("refresh_token=original-refresh-token"))
+            .and(body_string_contains("client_id=test-client-id"))
+            .and(body_string_contains("client_secret=test-client-secret"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "new-refresh-token",
+                "scope": "read write"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = test_config(&format!("{}/token", mock_server.uri()));
+        let service = SsoService::new(config).expect("service creation should work");
+
+        // Create a sealed token with the original refresh token
+        let auth_header = create_sealed_token_with_refresh(&service, "original-refresh-token");
+
+        // Call the refresh endpoint
+        let response = handle_refresh(&service, "test-provider", Some(&auth_header))
+            .await
+            .expect("refresh should succeed");
+
+        // Verify the response
+        assert_eq!(response.status, StatusCode::OK);
+        assert!(response.token.is_some());
+        assert!(response.error.is_none());
+        assert!(response.cache_control.contains("max-age="));
+
+        // Verify the new token contains the refreshed access token
+        let new_token_header = response.token.unwrap();
+        let new_sealed =
+            SealedToken::from_header(&new_token_header).expect("should parse new token");
+        let new_payload = service
+            .crypto()
+            .unseal(&new_sealed)
+            .expect("should unseal new token");
+
+        assert_eq!(new_payload.secret.expose_secret(), "new-access-token");
+
+        // Verify OAuth metadata is preserved with new refresh token
+        let oauth = new_payload.oauth.clone().expect("should have oauth metadata");
+        assert_eq!(oauth.provider_id, "test-provider");
+        assert_eq!(oauth.token_type, "Bearer");
+        assert!(oauth.refresh_token.is_some());
+        assert_eq!(
+            oauth.refresh_token.unwrap().expose_secret(),
+            "new-refresh-token"
+        );
+        assert_eq!(oauth.scopes, vec!["read", "write"]);
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_missing_authorization() {
+        let mock_server = MockServer::start().await;
+        let config = test_config(&format!("{}/token", mock_server.uri()));
+        let service = SsoService::new(config).expect("service creation should work");
+
+        let result = handle_refresh(&service, "test-provider", None).await;
+
+        assert!(matches!(
+            result,
+            Err(SsoError::MissingParameter { name }) if name == "Proxy-Authorization"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_invalid_token() {
+        let mock_server = MockServer::start().await;
+        let config = test_config(&format!("{}/token", mock_server.uri()));
+        let service = SsoService::new(config).expect("service creation should work");
+
+        let result = handle_refresh(&service, "test-provider", Some("invalid-token")).await;
+
+        assert!(matches!(result, Err(SsoError::UnsealingError(_))));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_provider_not_found() {
+        let mock_server = MockServer::start().await;
+        let config = test_config(&format!("{}/token", mock_server.uri()));
+        let service = SsoService::new(config).expect("service creation should work");
+
+        let auth_header = create_sealed_token_with_refresh(&service, "refresh-token");
+
+        let result = handle_refresh(&service, "nonexistent-provider", Some(&auth_header)).await;
+
+        assert!(matches!(
+            result,
+            Err(SsoError::ProviderNotFound { provider_id }) if provider_id == "nonexistent-provider"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_token_without_refresh_token() {
+        let mock_server = MockServer::start().await;
+        let config = test_config(&format!("{}/token", mock_server.uri()));
+        let service = SsoService::new(config).expect("service creation should work");
+
+        // Create a token without a refresh token
+        let payload = TokenPayload::builder(
+            SecretString::from("access-token"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .oauth(OAuthMetadata::new("test-provider"))
+        .build();
+
+        let sealed = service.crypto().seal(&payload).expect("sealing should work");
+        let auth_header = sealed.to_header().expect("to_header should work");
+
+        let result = handle_refresh(&service, "test-provider", Some(&auth_header)).await;
+
+        assert!(matches!(result, Err(SsoError::TokenRefreshFailed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_oauth_provider_error() {
+        let mock_server = MockServer::start().await;
+
+        // Mock the token endpoint to return an OAuth error
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_grant",
+                "error_description": "The refresh token has expired"
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = test_config(&format!("{}/token", mock_server.uri()));
+        let service = SsoService::new(config).expect("service creation should work");
+        let auth_header = create_sealed_token_with_refresh(&service, "expired-refresh-token");
+
+        let result = handle_refresh(&service, "test-provider", Some(&auth_header)).await;
+
+        assert!(matches!(
+            result,
+            Err(SsoError::OAuthProviderError { error, .. }) if error == "invalid_grant"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_no_new_refresh_token() {
+        // Some providers don't return a new refresh token on every refresh
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+                // No refresh_token in response
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = test_config(&format!("{}/token", mock_server.uri()));
+        let service = SsoService::new(config).expect("service creation should work");
+        let auth_header = create_sealed_token_with_refresh(&service, "original-refresh-token");
+
+        let response = handle_refresh(&service, "test-provider", Some(&auth_header))
+            .await
+            .expect("refresh should succeed");
+
+        assert_eq!(response.status, StatusCode::OK);
+
+        // Verify the new token has no refresh token
+        let new_token_header = response.token.unwrap();
+        let new_sealed =
+            SealedToken::from_header(&new_token_header).expect("should parse new token");
+        let new_payload = service
+            .crypto()
+            .unseal(&new_sealed)
+            .expect("should unseal new token");
+
+        let oauth = new_payload.oauth.clone().expect("should have oauth metadata");
+        assert!(
+            oauth.refresh_token.is_none(),
+            "should not have refresh token when provider doesn't return one"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_cache_control_header() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access-token",
+                "token_type": "Bearer",
+                "expires_in": 7200  // 2 hours
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = test_config(&format!("{}/token", mock_server.uri()));
+        let service = SsoService::new(config).expect("service creation should work");
+        let auth_header = create_sealed_token_with_refresh(&service, "refresh-token");
+
+        let response = handle_refresh(&service, "test-provider", Some(&auth_header))
+            .await
+            .expect("refresh should succeed");
+
+        // Cache-Control should be expires_in - 60 seconds
+        assert_eq!(response.cache_control, "private, max-age=7140");
+    }
+
+    #[tokio::test]
+    async fn test_refresh_endpoint_no_expiration_no_cache() {
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "new-access-token",
+                "token_type": "Bearer"
+                // No expires_in
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let config = test_config(&format!("{}/token", mock_server.uri()));
+        let service = SsoService::new(config).expect("service creation should work");
+        let auth_header = create_sealed_token_with_refresh(&service, "refresh-token");
+
+        let response = handle_refresh(&service, "test-provider", Some(&auth_header))
+            .await
+            .expect("refresh should succeed");
+
+        assert_eq!(response.cache_control, "no-store");
     }
 }
