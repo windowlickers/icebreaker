@@ -13,8 +13,8 @@ use tower::{Layer, Service};
 
 use icebreaker_common::{ResponseScanConfig, TokenizerError, UnsupportedEncodingBehavior};
 
-use crate::body::{DecompressingBody, ScanningBody, SecretScannerConfig};
-use crate::metrics::record_unsupported_encoding_blocked;
+use crate::body::{scan_header_values, DecompressingBody, ScanningBody, SecretScannerConfig};
+use crate::metrics::{record_secret_leak_detected, record_unsupported_encoding_blocked};
 
 /// Layer that scans responses for secret leaks.
 #[derive(Clone)]
@@ -90,6 +90,16 @@ where
 
             // Decompress and wrap the response body with scanning
             let (mut parts, body) = response.into_parts();
+
+            // Scan response headers for secrets
+            let mut scanner = config.create_scanner();
+            if scan_header_values(&parts.headers, &mut scanner) {
+                record_secret_leak_detected();
+                tracing::warn!("secret leak detected in response headers");
+                let err: Box<dyn std::error::Error + Send + Sync> =
+                    Box::new(TokenizerError::SecretLeakDetected);
+                return Err(err);
+            }
 
             // Determine encoding and create decompressing body
             let encoding = parts
@@ -246,6 +256,18 @@ where
 
             let (mut parts, body) = response.into_parts();
 
+            // Scan response headers for secrets
+            if !patterns.is_empty() {
+                let mut scanner = crate::body::StreamScanner::new(patterns.clone());
+                if scan_header_values(&parts.headers, &mut scanner) {
+                    record_secret_leak_detected();
+                    tracing::warn!("secret leak detected in response headers");
+                    let err: Box<dyn std::error::Error + Send + Sync> =
+                        Box::new(TokenizerError::SecretLeakDetected);
+                    return Err(err);
+                }
+            }
+
             // Determine encoding and create decompressing body
             let encoding = parts
                 .headers
@@ -342,6 +364,7 @@ mod tests {
     struct MockService {
         response_body: Vec<u8>,
         content_encoding: Option<&'static str>,
+        custom_headers: Vec<(&'static str, String)>,
     }
 
     impl MockService {
@@ -349,11 +372,17 @@ mod tests {
             Self {
                 response_body,
                 content_encoding: None,
+                custom_headers: Vec::new(),
             }
         }
 
         fn with_encoding(mut self, encoding: &'static str) -> Self {
             self.content_encoding = Some(encoding);
+            self
+        }
+
+        fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+            self.custom_headers.push((name, value.into()));
             self
         }
     }
@@ -370,10 +399,14 @@ mod tests {
         fn call(&mut self, _request: Request<()>) -> Self::Future {
             let body = self.response_body.clone();
             let encoding = self.content_encoding;
+            let custom_headers = self.custom_headers.clone();
             Box::pin(async move {
                 let mut builder = Response::builder().status(200);
                 if let Some(enc) = encoding {
                     builder = builder.header("content-encoding", enc);
+                }
+                for (name, value) in custom_headers {
+                    builder = builder.header(name, value);
                 }
                 Ok(builder
                     .body(Full::new(Bytes::from(body)))
@@ -759,5 +792,158 @@ mod tests {
             .await
             .expect("should collect");
         assert_eq!(body.to_bytes().as_ref(), b"data with unknown encoding");
+    }
+
+    #[tokio::test]
+    async fn test_response_header_scan_clean() {
+        let mock = MockService::new(b"hello world".to_vec())
+            .with_header("x-debug-token", "safe-value-here");
+
+        let config = SecretScannerConfig::new().with_pattern(b"secret-key-123");
+
+        let layer = ResponseScanLayer::new(config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        let response = service.oneshot(request).await.expect("should succeed");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect");
+        assert_eq!(body.to_bytes().as_ref(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_response_header_scan_detects_leak() {
+        // Secret is leaked in the X-Debug-Token response header
+        let mock = MockService::new(b"hello world".to_vec())
+            .with_header("x-debug-token", "secret-key-123");
+
+        let config = SecretScannerConfig::new().with_pattern(b"secret-key-123");
+
+        let layer = ResponseScanLayer::new(config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // The request should fail immediately because secret is in headers
+        let result = service.oneshot(request).await;
+        match result {
+            Ok(_) => panic!("expected error for secret in header"),
+            Err(err) => assert!(
+                err.to_string().contains("secret leak detected"),
+                "expected secret leak error, got: {}",
+                err
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_response_header_scan_detects_partial_match() {
+        // Secret is embedded within a larger header value
+        let mock = MockService::new(b"hello world".to_vec())
+            .with_header("x-request-id", "req-secret-key-123-suffix");
+
+        let config = SecretScannerConfig::new().with_pattern(b"secret-key-123");
+
+        let layer = ResponseScanLayer::new(config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // Should detect the secret even when embedded in a larger value
+        let result = service.oneshot(request).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_layer_header_scan_detects_leak() {
+        // Test that DynamicResponseScanLayer also scans headers
+        let mock =
+            MockService::new(b"hello world".to_vec()).with_header("x-api-key", "my-secret-token");
+
+        let layer = DynamicResponseScanLayer::new();
+        let service = layer.layer(mock);
+
+        // Create request with scan patterns in extensions
+        let mut request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+        request
+            .extensions_mut()
+            .insert(ScanPatterns(vec![b"my-secret-token".to_vec()]));
+
+        // Should fail because secret is in response header
+        let result = service.oneshot(request).await;
+        match result {
+            Ok(_) => panic!("expected error for secret in header"),
+            Err(err) => assert!(
+                err.to_string().contains("secret leak detected"),
+                "expected secret leak error, got: {}",
+                err
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_dynamic_layer_header_scan_clean() {
+        // Test that DynamicResponseScanLayer passes clean headers
+        let mock =
+            MockService::new(b"hello world".to_vec()).with_header("x-request-id", "safe-id-12345");
+
+        let layer = DynamicResponseScanLayer::new();
+        let service = layer.layer(mock);
+
+        // Create request with scan patterns in extensions
+        let mut request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+        request
+            .extensions_mut()
+            .insert(ScanPatterns(vec![b"my-secret-token".to_vec()]));
+
+        let response = service.oneshot(request).await.expect("should succeed");
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect");
+        assert_eq!(body.to_bytes().as_ref(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_header_scan_multiple_headers() {
+        // Secret is in one of many headers
+        let mock = MockService::new(b"hello world".to_vec())
+            .with_header("x-request-id", "safe-value")
+            .with_header("x-trace-id", "also-safe")
+            .with_header("x-debug-info", "contains-secret-key-123-here");
+
+        let config = SecretScannerConfig::new().with_pattern(b"secret-key-123");
+
+        let layer = ResponseScanLayer::new(config);
+        let service = layer.layer(mock);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        // Should detect the secret in the third header
+        let result = service.oneshot(request).await;
+        assert!(result.is_err());
     }
 }

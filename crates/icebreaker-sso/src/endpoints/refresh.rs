@@ -447,7 +447,10 @@ mod integration_tests {
         )
         .build();
 
-        let sealed = service.crypto().seal(&payload).expect("sealing should work");
+        let sealed = service
+            .crypto()
+            .seal(&payload)
+            .expect("sealing should work");
         sealed.to_header().expect("to_header should work")
     }
 
@@ -503,7 +506,10 @@ mod integration_tests {
         assert_eq!(new_payload.secret.expose_secret(), "new-access-token");
 
         // Verify OAuth metadata is preserved with new refresh token
-        let oauth = new_payload.oauth.clone().expect("should have oauth metadata");
+        let oauth = new_payload
+            .oauth
+            .clone()
+            .expect("should have oauth metadata");
         assert_eq!(oauth.provider_id, "test-provider");
         assert_eq!(oauth.token_type, "Bearer");
         assert!(oauth.refresh_token.is_some());
@@ -569,7 +575,10 @@ mod integration_tests {
         .oauth(OAuthMetadata::new("test-provider"))
         .build();
 
-        let sealed = service.crypto().seal(&payload).expect("sealing should work");
+        let sealed = service
+            .crypto()
+            .seal(&payload)
+            .expect("sealing should work");
         let auth_header = sealed.to_header().expect("to_header should work");
 
         let result = handle_refresh(&service, "test-provider", Some(&auth_header)).await;
@@ -640,7 +649,10 @@ mod integration_tests {
             .unseal(&new_sealed)
             .expect("should unseal new token");
 
-        let oauth = new_payload.oauth.clone().expect("should have oauth metadata");
+        let oauth = new_payload
+            .oauth
+            .clone()
+            .expect("should have oauth metadata");
         assert!(
             oauth.refresh_token.is_none(),
             "should not have refresh token when provider doesn't return one"

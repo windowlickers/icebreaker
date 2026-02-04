@@ -66,9 +66,12 @@ fn secret_leak_error(location: &str) -> FramePollResult {
     Poll::Ready(Some(Err(Box::new(TokenizerError::SecretLeakDetected))))
 }
 
-/// Scans HTTP trailers for secrets.
-fn scan_trailers(trailers: &http::HeaderMap, scanner: &mut StreamScanner) -> bool {
-    for (_, value) in trailers.iter() {
+/// Scans HTTP header values for secrets.
+///
+/// This function checks all header values in the given header map against
+/// the patterns in the scanner. Returns `true` if any pattern is found.
+pub fn scan_header_values(headers: &http::HeaderMap, scanner: &mut StreamScanner) -> bool {
+    for (_, value) in headers.iter() {
         let value_bytes = Bytes::copy_from_slice(value.as_bytes());
         if scanner.scan_chunk(&value_bytes, false) {
             return true;
@@ -114,7 +117,7 @@ where
 
                 // Scan HTTP/2 trailers for secrets
                 if let Some(trailers) = frame.trailers_ref() {
-                    if scan_trailers(trailers, this.scanner) {
+                    if scan_header_values(trailers, this.scanner) {
                         *this.detected = true;
                         return secret_leak_error("response trailers");
                     }
@@ -278,7 +281,7 @@ mod tests {
     }
 
     #[test]
-    fn test_scan_trailers_with_non_utf8_secret() {
+    fn test_scan_header_values_with_non_utf8_secret() {
         // Create a pattern with non-UTF8 bytes (e.g., binary secret)
         let binary_secret: Vec<u8> = vec![0x80, 0x81, 0x82, 0x83, 0x84];
         let mut scanner = StreamScanner::new(vec![binary_secret.clone()]);
@@ -291,12 +294,12 @@ mod tests {
         trailers.insert("x-binary-data", header_value);
 
         // The scan should detect the secret in the non-UTF8 trailer
-        let detected = scan_trailers(&trailers, &mut scanner);
+        let detected = scan_header_values(&trailers, &mut scanner);
         assert!(detected, "should detect non-UTF8 secret in trailers");
     }
 
     #[test]
-    fn test_scan_trailers_with_mixed_utf8_and_non_utf8() {
+    fn test_scan_header_values_with_mixed_utf8_and_non_utf8() {
         // Pattern that could appear in both UTF-8 and non-UTF8 contexts
         let secret = b"secret_key_123".to_vec();
         let mut scanner = StreamScanner::new(vec![secret.clone()]);
@@ -318,7 +321,7 @@ mod tests {
         trailers.insert("x-binary-trailer", header_value);
 
         // The scan should detect the secret even when embedded in non-UTF8 bytes
-        let detected = scan_trailers(&trailers, &mut scanner);
+        let detected = scan_header_values(&trailers, &mut scanner);
         assert!(
             detected,
             "should detect secret embedded in non-UTF8 trailer"
