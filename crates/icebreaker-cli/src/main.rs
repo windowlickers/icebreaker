@@ -27,7 +27,8 @@ use icebreaker_common::{
     ProcessorConfig, ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, TlsConfig,
 };
 use icebreaker_crypto::{
-    DecryptConfig, KeyStore, Keypair, TlsConnectionInfo, TokenCrypto, VersionedKeypair,
+    ConnectionInfo, DecryptConfig, KeyStore, Keypair, TlsConnectionInfo, TokenCrypto,
+    VersionedKeypair,
 };
 use icebreaker_proxy::{
     create_tls_acceptor, extract_client_cert_info, DynamicResponseScanLayer, InMemoryNonceStore,
@@ -632,13 +633,22 @@ async fn handle_connection<I>(
             .layer(DynamicResponseScanLayer::new())
             .service(proxy_service);
 
-        // Create a service function that handles the request and injects TLS info
+        // Create a service function that handles the request and injects connection info
         // Request timeout is applied here using tokio::time::timeout
         let service_fn = hyper::service::service_fn(move |mut req: Request<Incoming>| {
             let mut svc = service.clone();
             let tls_info = tls_info.clone();
             async move {
-                // Inject TLS connection info into request extensions if available
+                // Inject connection info into request extensions (unforgeable identity)
+                let conn_info = ConnectionInfo::new(remote_addr);
+                let conn_info = if let Some(info) = tls_info.clone() {
+                    conn_info.with_tls(info)
+                } else {
+                    conn_info
+                };
+                req.extensions_mut().insert(conn_info);
+
+                // Also inject TLS info separately for backwards compatibility
                 if let Some(info) = tls_info {
                     req.extensions_mut().insert(info);
                 }
@@ -685,13 +695,22 @@ async fn handle_connection<I>(
             .layer(DynamicResponseScanLayer::new())
             .service(proxy_service);
 
-        // Create a service function that handles the request and injects TLS info
+        // Create a service function that handles the request and injects connection info
         // Request timeout is applied here using tokio::time::timeout
         let service_fn = hyper::service::service_fn(move |mut req: Request<Incoming>| {
             let mut svc = service.clone();
             let tls_info = tls_info.clone();
             async move {
-                // Inject TLS connection info into request extensions if available
+                // Inject connection info into request extensions (unforgeable identity)
+                let conn_info = ConnectionInfo::new(remote_addr);
+                let conn_info = if let Some(info) = tls_info.clone() {
+                    conn_info.with_tls(info)
+                } else {
+                    conn_info
+                };
+                req.extensions_mut().insert(conn_info);
+
+                // Also inject TLS info separately for backwards compatibility
                 if let Some(info) = tls_info {
                     req.extensions_mut().insert(info);
                 }

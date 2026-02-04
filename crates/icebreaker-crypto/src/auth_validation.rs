@@ -76,6 +76,52 @@ impl TlsConnectionInfo {
     }
 }
 
+/// Connection-level information from the transport layer.
+///
+/// This struct captures unforgeable connection data from the socket layer,
+/// providing a secure source of client identity for rate limiting and audit logging.
+/// Unlike HTTP headers like `X-Forwarded-For` which can be spoofed by attackers,
+/// the socket's remote address cannot be forged.
+#[derive(Debug, Clone)]
+pub struct ConnectionInfo {
+    /// Remote address from the socket (cannot be spoofed).
+    pub remote_addr: std::net::SocketAddr,
+    /// TLS connection info if mTLS is used.
+    pub tls_info: Option<TlsConnectionInfo>,
+}
+
+impl ConnectionInfo {
+    /// Creates a new connection info with the given remote address.
+    #[must_use]
+    pub fn new(remote_addr: std::net::SocketAddr) -> Self {
+        Self {
+            remote_addr,
+            tls_info: None,
+        }
+    }
+
+    /// Adds TLS connection info from an mTLS handshake.
+    #[must_use]
+    pub fn with_tls(mut self, tls_info: TlsConnectionInfo) -> Self {
+        self.tls_info = Some(tls_info);
+        self
+    }
+
+    /// Returns a rate limit key based on the connection info.
+    ///
+    /// Prefers the mTLS certificate fingerprint if available (more specific identity),
+    /// otherwise falls back to the remote IP address.
+    #[must_use]
+    pub fn rate_limit_key(&self) -> String {
+        if let Some(ref tls) = self.tls_info {
+            if let Some(ref fp) = tls.cert_fingerprint {
+                return fp.clone();
+            }
+        }
+        self.remote_addr.ip().to_string()
+    }
+}
+
 /// Derives the HMAC key used for API key hashing from a public key.
 ///
 /// This uses HKDF to derive a 32-byte key from the public key bytes.

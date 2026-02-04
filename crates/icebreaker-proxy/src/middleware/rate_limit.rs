@@ -86,23 +86,19 @@ where
 }
 
 /// Extracts a key for rate limiting from the request.
+///
+/// Uses unforgeable connection info from the transport layer rather than
+/// spoofable HTTP headers like X-Forwarded-For or X-Real-IP.
 fn extract_rate_limit_key<B>(request: &Request<B>) -> String {
-    // Try to get client IP from X-Forwarded-For or X-Real-IP
-    if let Some(forwarded) = request.headers().get("X-Forwarded-For") {
-        if let Ok(s) = forwarded.to_str() {
-            if let Some(ip) = s.split(',').next() {
-                return ip.trim().to_string();
-            }
-        }
+    use icebreaker_crypto::ConnectionInfo;
+
+    // Use unforgeable connection info from request extensions
+    if let Some(conn_info) = request.extensions().get::<ConnectionInfo>() {
+        return conn_info.rate_limit_key();
     }
 
-    if let Some(real_ip) = request.headers().get("X-Real-IP") {
-        if let Ok(s) = real_ip.to_str() {
-            return s.to_string();
-        }
-    }
-
-    // Fall back to a default key
+    // Fallback for tests or missing connection info
+    tracing::warn!("ConnectionInfo not available, using default rate limit key");
     "default".to_string()
 }
 
@@ -272,23 +268,59 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_rate_limit_key() {
-        // Test X-Forwarded-For
-        let request = Request::builder()
-            .header("X-Forwarded-For", "192.168.1.1, 10.0.0.1")
+    fn test_extract_key_from_connection_info() {
+        use icebreaker_crypto::ConnectionInfo;
+
+        let mut request = Request::builder().body(()).expect("request");
+        let conn_info = ConnectionInfo::new("192.168.1.100:12345".parse().unwrap());
+        request.extensions_mut().insert(conn_info);
+        assert_eq!(extract_rate_limit_key(&request), "192.168.1.100");
+    }
+
+    #[test]
+    fn test_extract_key_prefers_mtls_fingerprint() {
+        use icebreaker_crypto::{ConnectionInfo, TlsConnectionInfo};
+
+        let mut request = Request::builder().body(()).expect("request");
+        let tls = TlsConnectionInfo::with_fingerprint("sha256:abc123");
+        let conn_info = ConnectionInfo::new("192.168.1.100:12345".parse().unwrap()).with_tls(tls);
+        request.extensions_mut().insert(conn_info);
+        assert_eq!(extract_rate_limit_key(&request), "sha256:abc123");
+    }
+
+    #[test]
+    fn test_spoofed_headers_ignored() {
+        use icebreaker_crypto::ConnectionInfo;
+
+        // Attacker tries to spoof X-Forwarded-For to bypass rate limiting
+        let mut request = Request::builder()
+            .header("X-Forwarded-For", "1.1.1.1") // Spoofed header
+            .header("X-Real-IP", "2.2.2.2") // Spoofed header
             .body(())
             .expect("request");
-        assert_eq!(extract_rate_limit_key(&request), "192.168.1.1");
 
-        // Test X-Real-IP
-        let request = Request::builder()
-            .header("X-Real-IP", "192.168.1.2")
-            .body(())
-            .expect("request");
-        assert_eq!(extract_rate_limit_key(&request), "192.168.1.2");
+        // But we use the actual socket address from ConnectionInfo
+        let conn_info = ConnectionInfo::new("192.168.1.100:12345".parse().unwrap());
+        request.extensions_mut().insert(conn_info);
 
-        // Test default
+        // Should use socket address, not spoofed headers
+        assert_eq!(extract_rate_limit_key(&request), "192.168.1.100");
+    }
+
+    #[test]
+    fn test_extract_key_fallback_without_connection_info() {
+        // Test fallback when ConnectionInfo is missing (e.g., in unit tests)
         let request = Request::builder().body(()).expect("request");
         assert_eq!(extract_rate_limit_key(&request), "default");
+    }
+
+    #[test]
+    fn test_extract_key_ipv6_address() {
+        use icebreaker_crypto::ConnectionInfo;
+
+        let mut request = Request::builder().body(()).expect("request");
+        let conn_info = ConnectionInfo::new("[2001:db8::1]:12345".parse().unwrap());
+        request.extensions_mut().insert(conn_info);
+        assert_eq!(extract_rate_limit_key(&request), "2001:db8::1");
     }
 }
