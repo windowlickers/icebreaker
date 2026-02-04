@@ -17,13 +17,25 @@ use crate::keypair::{KeyStore, Keypair, VersionedKeypair};
 pub struct DecryptConfig {
     /// Clock skew tolerance configuration.
     pub clock_skew: ClockSkewConfig,
+    /// Whether tokens must have an expiration time.
+    pub require_expiration: bool,
 }
 
 impl DecryptConfig {
     /// Creates a new decrypt configuration with the given clock skew settings.
     #[must_use]
     pub fn with_clock_skew(clock_skew: ClockSkewConfig) -> Self {
-        Self { clock_skew }
+        Self {
+            clock_skew,
+            ..Default::default()
+        }
+    }
+
+    /// Sets whether tokens must have an expiration time.
+    #[must_use]
+    pub fn with_require_expiration(mut self, require: bool) -> Self {
+        self.require_expiration = require;
+        self
     }
 }
 
@@ -146,7 +158,16 @@ pub fn decrypt_sealed_token_with_config(
 
     // Check expiration with clock skew tolerance
     match payload.check_expiration(&config.clock_skew) {
-        ExpirationStatus::Valid | ExpirationStatus::NoExpiration => Ok(payload),
+        ExpirationStatus::Valid => Ok(payload),
+        ExpirationStatus::NoExpiration => {
+            if config.require_expiration {
+                Err(TokenizerError::InvalidPayload(
+                    "token must have expiration".to_string(),
+                ))
+            } else {
+                Ok(payload)
+            }
+        }
         ExpirationStatus::Expired => Err(TokenizerError::TokenExpired),
         ExpirationStatus::FutureDated { seconds_ahead } => {
             Err(TokenizerError::InvalidPayload(format!(
@@ -497,6 +518,96 @@ mod tests {
             let config = DecryptConfig::with_clock_skew(ClockSkewConfig::permissive());
             let result = decrypt_sealed_token_with_config(&sealed_token, &key_store, &config);
             assert!(result.is_ok());
+        }
+    }
+
+    mod require_expiration {
+        use super::*;
+
+        #[test]
+        fn test_require_expiration_rejects_token_without_expiration() {
+            let keypair = Keypair::generate();
+            let payload = TokenPayload::builder(
+                SecretString::from("test-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .allowed_host("api.example.com")
+            // No .expires_at() call
+            .build();
+
+            let versioned = VersionedKeypair::new("test-key", keypair, 1);
+            let key_store = KeyStore::with_primary(versioned);
+            let primary = key_store.primary().expect("should have primary");
+            let sealed_token = create_sealed_token(&payload, primary).expect("seal should succeed");
+
+            let config = DecryptConfig {
+                clock_skew: ClockSkewConfig::default(),
+                require_expiration: true,
+            };
+            let result = decrypt_sealed_token_with_config(&sealed_token, &key_store, &config);
+            assert!(matches!(result, Err(TokenizerError::InvalidPayload(_))));
+            if let Err(TokenizerError::InvalidPayload(msg)) = result {
+                assert!(msg.contains("must have expiration"));
+            }
+        }
+
+        #[test]
+        fn test_no_require_expiration_allows_token_without_expiration() {
+            let keypair = Keypair::generate();
+            let payload = TokenPayload::builder(
+                SecretString::from("test-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .allowed_host("api.example.com")
+            .build();
+
+            let versioned = VersionedKeypair::new("test-key", keypair, 1);
+            let key_store = KeyStore::with_primary(versioned);
+            let primary = key_store.primary().expect("should have primary");
+            let sealed_token = create_sealed_token(&payload, primary).expect("seal should succeed");
+
+            let config = DecryptConfig::default(); // require_expiration defaults to false
+            let result = decrypt_sealed_token_with_config(&sealed_token, &key_store, &config);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_require_expiration_allows_token_with_valid_expiration() {
+            let keypair = Keypair::generate();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+
+            let payload = TokenPayload::builder(
+                SecretString::from("test-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .allowed_host("api.example.com")
+            .expires_at(now + 60) // Valid for 60 seconds
+            .build();
+
+            let versioned = VersionedKeypair::new("test-key", keypair, 1);
+            let key_store = KeyStore::with_primary(versioned);
+            let primary = key_store.primary().expect("should have primary");
+            let sealed_token = create_sealed_token(&payload, primary).expect("seal should succeed");
+
+            let config = DecryptConfig {
+                clock_skew: ClockSkewConfig::default(),
+                require_expiration: true,
+            };
+            let result = decrypt_sealed_token_with_config(&sealed_token, &key_store, &config);
+            assert!(result.is_ok());
+        }
+
+        #[test]
+        fn test_builder_method_sets_require_expiration() {
+            let config = DecryptConfig::with_clock_skew(ClockSkewConfig::default())
+                .with_require_expiration(true);
+            assert!(config.require_expiration);
+
+            let config2 = DecryptConfig::default().with_require_expiration(false);
+            assert!(!config2.require_expiration);
         }
     }
 }

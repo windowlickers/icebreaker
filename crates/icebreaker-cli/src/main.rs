@@ -26,7 +26,9 @@ use icebreaker_common::{
     ClientAuthMode, ClockSkewConfig, HealthConfig, InjectConfig, NetworkProtectionConfig,
     ProcessorConfig, ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, TlsConfig,
 };
-use icebreaker_crypto::{KeyStore, Keypair, TlsConnectionInfo, TokenCrypto, VersionedKeypair};
+use icebreaker_crypto::{
+    DecryptConfig, KeyStore, Keypair, TlsConnectionInfo, TokenCrypto, VersionedKeypair,
+};
 use icebreaker_proxy::{
     create_tls_acceptor, extract_client_cert_info, DynamicResponseScanLayer, InMemoryNonceStore,
     IpFilter, MetricsLayer, NonceStore, RateLimitLayer, TokenInjectionLayer, ValidatingConnector,
@@ -174,6 +176,11 @@ struct ServeArgs {
     /// Set to 0 to disable future-dating check (not recommended).
     #[arg(long, default_value = "300", env = "ICEBREAKER_MAX_FUTURE_TOKEN")]
     max_future_token: u64,
+
+    /// Require tokens to have an expiration time.
+    /// When enabled, tokens without expires_at are rejected.
+    #[arg(long, default_value = "false", env = "ICEBREAKER_REQUIRE_EXPIRATION")]
+    require_expiration: bool,
 }
 
 #[derive(Parser)]
@@ -773,7 +780,6 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
 
         let versioned = VersionedKeypair::new(&args.key_id, keypair, 1);
         let key_store = KeyStore::with_primary(versioned);
-        let crypto = Arc::new(TokenCrypto::new(key_store));
 
         // Create network protection filter for SSRF prevention
         let network_config = NetworkProtectionConfig::default();
@@ -887,6 +893,13 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             },
         };
 
+        // Build decrypt configuration and create TokenCrypto
+        let decrypt_config = DecryptConfig {
+            clock_skew: clock_skew.clone(),
+            require_expiration: args.require_expiration,
+        };
+        let crypto = Arc::new(TokenCrypto::with_config(key_store, decrypt_config));
+
         tracing::info!(
             bind = %config.bind_addr(),
             key_id = %args.key_id,
@@ -900,6 +913,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             request_timeout = ?request_timeout,
             clock_skew_tolerance = ?clock_skew.tolerance_seconds,
             max_future_token = ?clock_skew.max_future_seconds,
+            require_expiration = %args.require_expiration,
             "starting icebreaker proxy"
         );
 
