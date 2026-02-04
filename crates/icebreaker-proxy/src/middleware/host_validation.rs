@@ -12,6 +12,9 @@ use tower::{Layer, Service};
 
 use icebreaker_common::TokenizerError;
 
+/// Maximum compiled size for host pattern regex (10KB).
+const HOST_PATTERN_REGEX_SIZE_LIMIT: usize = 10 * 1024;
+
 /// Returns a regex that matches any string (used for allow_all).
 fn match_all_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
@@ -159,11 +162,16 @@ impl HostValidationConfig {
     /// that matches nothing.
     #[must_use]
     pub fn allow_pattern(mut self, pattern: &str) -> Self {
-        self.allowed_patterns
-            .push(Regex::new(pattern).unwrap_or_else(|e| {
-                tracing::error!(pattern, error = %e, "invalid host pattern");
-                match_none_regex().clone()
-            }));
+        self.allowed_patterns.push(
+            regex::RegexBuilder::new(pattern)
+                .size_limit(HOST_PATTERN_REGEX_SIZE_LIMIT)
+                .dfa_size_limit(HOST_PATTERN_REGEX_SIZE_LIMIT)
+                .build()
+                .unwrap_or_else(|e| {
+                    tracing::error!(pattern, error = %e, "invalid host pattern");
+                    match_none_regex().clone()
+                }),
+        );
         self
     }
 
@@ -180,11 +188,16 @@ impl HostValidationConfig {
     /// that matches nothing.
     #[must_use]
     pub fn block_pattern(mut self, pattern: &str) -> Self {
-        self.blocked_patterns
-            .push(Regex::new(pattern).unwrap_or_else(|e| {
-                tracing::error!(pattern, error = %e, "invalid host pattern");
-                match_none_regex().clone()
-            }));
+        self.blocked_patterns.push(
+            regex::RegexBuilder::new(pattern)
+                .size_limit(HOST_PATTERN_REGEX_SIZE_LIMIT)
+                .dfa_size_limit(HOST_PATTERN_REGEX_SIZE_LIMIT)
+                .build()
+                .unwrap_or_else(|e| {
+                    tracing::error!(pattern, error = %e, "invalid host pattern");
+                    match_none_regex().clone()
+                }),
+        );
         self
     }
 
@@ -287,5 +300,32 @@ mod tests {
 
         assert!(config.validate("any-host.com").is_ok());
         assert!(config.validate("another.host.org").is_ok());
+    }
+
+    #[test]
+    fn test_oversized_allow_pattern_falls_back_to_match_none() {
+        // Create a pattern that will exceed compiled regex size limits.
+        // Patterns with many optional groups create exponential NFA state growth.
+        let huge_pattern = format!("({})?", "a|b|c|d|e|f|g|h|i|j").repeat(50);
+        let config = HostValidationConfig::new().allow_pattern(&huge_pattern);
+
+        // Should fall back to match_none_regex, so nothing should match
+        assert!(config.validate("a").is_err());
+        assert!(config.validate("test.com").is_err());
+    }
+
+    #[test]
+    fn test_oversized_block_pattern_falls_back_to_match_none() {
+        // Create a pattern that will exceed compiled regex size limits.
+        // Patterns with many optional groups create exponential NFA state growth.
+        let huge_pattern = format!("({})?", "a|b|c|d|e|f|g|h|i|j").repeat(50);
+        let config = HostValidationConfig::new()
+            .allow_pattern(r".*")
+            .block_pattern(&huge_pattern);
+
+        // Should fall back to match_none_regex, so nothing gets blocked
+        // (which means the allow pattern succeeds)
+        assert!(config.validate("evil.com").is_ok());
+        assert!(config.validate("test.com").is_ok());
     }
 }

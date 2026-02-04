@@ -1,6 +1,9 @@
 //! Token types for sealed secrets.
 
 use secrecy::{ExposeSecret, SecretString};
+
+/// Maximum compiled size for host pattern regex (10KB).
+const HOST_PATTERN_REGEX_SIZE_LIMIT: usize = 10 * 1024;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::ZeroizeOnDrop;
 
@@ -237,9 +240,13 @@ impl TokenPayload {
             } else {
                 format!("^(?:{pattern})$")
             };
-            let re = regex::Regex::new(&anchored).map_err(|e| {
-                crate::error::TokenizerError::ConfigError(format!("invalid host pattern: {e}"))
-            })?;
+            let re = regex::RegexBuilder::new(&anchored)
+                .size_limit(HOST_PATTERN_REGEX_SIZE_LIMIT)
+                .dfa_size_limit(HOST_PATTERN_REGEX_SIZE_LIMIT)
+                .build()
+                .map_err(|e| {
+                    crate::error::TokenizerError::ConfigError(format!("invalid host pattern: {e}"))
+                })?;
             if re.is_match(host) {
                 return Ok(());
             }
@@ -796,5 +803,26 @@ mod tests {
         assert_eq!(replay.nonce, "nonce");
         assert_eq!(replay.max_uses, Some(5));
         assert_eq!(replay.nonce_ttl_seconds, Some(3600));
+    }
+
+    #[test]
+    fn test_host_pattern_rejects_oversized_regex() {
+        // Create a pattern that will exceed compiled regex size limits.
+        // Patterns with many optional groups that can match each other create
+        // exponential NFA state growth. This pattern creates a regex that
+        // exceeds the 10KB compiled size limit.
+        let huge_pattern = format!("({})?", "a|b|c|d|e|f|g|h|i|j").repeat(50);
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host_pattern(&huge_pattern)
+        .build();
+
+        let result = payload.validate_host("test.com");
+        assert!(matches!(
+            result,
+            Err(crate::error::TokenizerError::ConfigError(_))
+        ));
     }
 }

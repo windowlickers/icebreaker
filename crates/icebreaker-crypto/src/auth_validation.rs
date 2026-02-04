@@ -5,6 +5,9 @@
 //! the `Proxy-Authorization` header or mTLS connection info.
 
 use base64::Engine;
+
+/// Maximum compiled size for subject pattern regex (10KB).
+const SUBJECT_PATTERN_REGEX_SIZE_LIMIT: usize = 10 * 1024;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use subtle::ConstantTimeEq;
@@ -388,9 +391,13 @@ fn validate_mtls(
 
         // Use regex for precise DN matching to prevent overly broad patterns
         // like "CN=" from matching any DN containing that substring
-        let re = regex::Regex::new(pattern).map_err(|e| {
-            TokenizerError::ConfigError(format!("invalid subject pattern regex: {e}"))
-        })?;
+        let re = regex::RegexBuilder::new(pattern)
+            .size_limit(SUBJECT_PATTERN_REGEX_SIZE_LIMIT)
+            .dfa_size_limit(SUBJECT_PATTERN_REGEX_SIZE_LIMIT)
+            .build()
+            .map_err(|e| {
+                TokenizerError::ConfigError(format!("invalid subject pattern regex: {e}"))
+            })?;
 
         if !re.is_match(subject_dn) {
             debug!(
@@ -693,5 +700,18 @@ mod tests {
             result_with_prefix.is_ok(),
             "key with correct prefix should succeed"
         );
+    }
+
+    #[test]
+    fn test_mtls_subject_pattern_rejects_oversized_regex() {
+        // Create a pattern that will exceed compiled regex size limits.
+        // Patterns with many optional groups create exponential NFA state growth.
+        let huge_pattern = format!("({})?", "a|b|c|d|e|f|g|h|i|j").repeat(50);
+        let config = MutualTlsConfig::new("sha256:abc123").with_subject_pattern(&huge_pattern);
+        let tls_info =
+            TlsConnectionInfo::with_fingerprint("sha256:abc123").with_subject_dn("CN=client,O=Org");
+
+        let result = validate_mtls(&config, Some(&tls_info));
+        assert!(matches!(result, Err(TokenizerError::ConfigError(_))));
     }
 }
