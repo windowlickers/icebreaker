@@ -69,11 +69,9 @@ fn secret_leak_error(location: &str) -> FramePollResult {
 /// Scans HTTP trailers for secrets.
 fn scan_trailers(trailers: &http::HeaderMap, scanner: &mut StreamScanner) -> bool {
     for (_, value) in trailers.iter() {
-        if let Ok(value_str) = value.to_str() {
-            let value_bytes = Bytes::copy_from_slice(value_str.as_bytes());
-            if scanner.scan_chunk(&value_bytes, false) {
-                return true;
-            }
+        let value_bytes = Bytes::copy_from_slice(value.as_bytes());
+        if scanner.scan_chunk(&value_bytes, false) {
+            return true;
         }
     }
     false
@@ -254,5 +252,53 @@ mod tests {
 
         let result = scanning.collect().await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_scan_trailers_with_non_utf8_secret() {
+        // Create a pattern with non-UTF8 bytes (e.g., binary secret)
+        let binary_secret: Vec<u8> = vec![0x80, 0x81, 0x82, 0x83, 0x84];
+        let mut scanner = StreamScanner::new(vec![binary_secret.clone()]);
+
+        // Create trailers with non-UTF8 header value
+        let mut trailers = http::HeaderMap::new();
+        // HeaderValue::from_bytes accepts any bytes, including non-UTF8
+        let header_value =
+            http::HeaderValue::from_bytes(&binary_secret).expect("should create header value");
+        trailers.insert("x-binary-data", header_value);
+
+        // The scan should detect the secret in the non-UTF8 trailer
+        let detected = scan_trailers(&trailers, &mut scanner);
+        assert!(detected, "should detect non-UTF8 secret in trailers");
+    }
+
+    #[test]
+    fn test_scan_trailers_with_mixed_utf8_and_non_utf8() {
+        // Pattern that could appear in both UTF-8 and non-UTF8 contexts
+        let secret = b"secret_key_123".to_vec();
+        let mut scanner = StreamScanner::new(vec![secret.clone()]);
+
+        let mut trailers = http::HeaderMap::new();
+
+        // Add a valid UTF-8 trailer
+        trailers.insert(
+            "x-utf8-header",
+            http::HeaderValue::from_static("some safe value"),
+        );
+
+        // Add a non-UTF8 trailer containing the secret surrounded by invalid UTF-8 bytes
+        let mut binary_value = vec![0xFF, 0xFE]; // Invalid UTF-8 BOM-like sequence
+        binary_value.extend_from_slice(&secret);
+        binary_value.extend_from_slice(&[0xFD, 0xFC]);
+        let header_value =
+            http::HeaderValue::from_bytes(&binary_value).expect("should create header value");
+        trailers.insert("x-binary-trailer", header_value);
+
+        // The scan should detect the secret even when embedded in non-UTF8 bytes
+        let detected = scan_trailers(&trailers, &mut scanner);
+        assert!(
+            detected,
+            "should detect secret embedded in non-UTF8 trailer"
+        );
     }
 }
