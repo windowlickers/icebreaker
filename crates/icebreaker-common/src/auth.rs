@@ -47,6 +47,12 @@ pub struct ApiKeyConfig {
     /// Hash of the expected API key (for validation without storing plaintext).
     /// Uses HMAC-SHA256 with a key derived from the server's public key.
     pub key_hash: String,
+
+    /// Optional hash of the expected username for Basic auth.
+    /// When set, Basic auth requests must provide a matching username.
+    /// Uses HMAC-SHA256 with a key derived from the server's public key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username_hash: Option<String>,
 }
 
 impl ApiKeyConfig {
@@ -57,6 +63,7 @@ impl ApiKeyConfig {
             header_name: header_name.into(),
             prefix: None,
             key_hash: key_hash.into(),
+            username_hash: None,
         }
     }
 
@@ -64,6 +71,13 @@ impl ApiKeyConfig {
     #[must_use]
     pub fn with_prefix(mut self, prefix: impl Into<String>) -> Self {
         self.prefix = Some(prefix.into());
+        self
+    }
+
+    /// Sets the username hash for Basic auth validation.
+    #[must_use]
+    pub fn with_username_hash(mut self, username_hash: impl Into<String>) -> Self {
+        self.username_hash = Some(username_hash.into());
         self
     }
 }

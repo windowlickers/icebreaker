@@ -183,6 +183,41 @@ pub fn create_bearer_api_key_config(key: &str, hmac_key: &[u8]) -> Result<ApiKey
     )
 }
 
+/// Creates an [`ApiKeyConfig`] for Basic auth with username validation.
+///
+/// This configuration requires both username and password to match.
+/// Use this for Basic auth where the username must be validated.
+///
+/// The `hmac_key` should be derived from the recipient's public key using
+/// [`derive_api_key_hmac_key`].
+///
+/// # Example
+///
+/// ```
+/// use icebreaker_crypto::{create_basic_auth_config, derive_api_key_hmac_key};
+/// use icebreaker_common::auth::AuthConfig;
+///
+/// let public_key_bytes = [0u8; 32]; // Example public key
+/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes).unwrap();
+/// let config = create_basic_auth_config("admin", "secret-password", &hmac_key).unwrap();
+/// let auth = AuthConfig::ApiKey(config);
+/// ```
+///
+/// # Errors
+///
+/// Returns an error if HMAC computation fails.
+pub fn create_basic_auth_config(
+    username: &str,
+    password: &str,
+    hmac_key: &[u8],
+) -> Result<ApiKeyConfig> {
+    Ok(ApiKeyConfig::new(
+        PROXY_AUTHORIZATION_HEADER,
+        hash_api_key(password, hmac_key)?,
+    )
+    .with_username_hash(hash_api_key(username, hmac_key)?))
+}
+
 /// Parses credentials from an HTTP request's Proxy-Authorization header.
 ///
 /// Returns all valid credentials found. Multiple schemes may be present.
@@ -289,37 +324,85 @@ pub fn validate_auth<B>(
     }
 }
 
-/// Extracts the raw key from a credential, stripping any configured prefix.
+/// Extracted credential data from a request.
+struct ExtractedCredential {
+    /// The key/password portion.
+    key: String,
+    /// The username for Basic auth, None for Bearer.
+    username: Option<String>,
+}
+
+/// Extracts the raw key and username from a credential, stripping any configured prefix.
 ///
 /// Returns `None` if a prefix is configured but not present in the key.
-fn extract_key_from_credential(cred: &ProxyCredential, prefix: Option<&str>) -> Option<String> {
-    let provided_key = match cred {
-        ProxyCredential::Bearer(token) => token,
-        ProxyCredential::Basic { password, .. } => password,
-    };
-
-    match prefix {
-        Some(p) => provided_key.strip_prefix(p).map(|s| s.to_string()),
-        None => Some(provided_key.clone()),
+fn extract_key_from_credential(
+    cred: &ProxyCredential,
+    prefix: Option<&str>,
+) -> Option<ExtractedCredential> {
+    match cred {
+        ProxyCredential::Bearer(token) => {
+            let key = match prefix {
+                Some(p) => token.strip_prefix(p)?.to_string(),
+                None => token.clone(),
+            };
+            Some(ExtractedCredential {
+                key,
+                username: None,
+            })
+        }
+        ProxyCredential::Basic { username, password } => {
+            let key = match prefix {
+                Some(p) => password.strip_prefix(p)?.to_string(),
+                None => password.clone(),
+            };
+            Some(ExtractedCredential {
+                key,
+                username: Some(username.clone()),
+            })
+        }
     }
 }
 
-/// Checks if a single credential matches the expected key hash.
+/// Checks if a single credential matches the expected key hash and optional username hash.
 fn check_credential(
     cred: &ProxyCredential,
     prefix: Option<&str>,
-    expected_hash: &str,
+    expected_key_hash: &str,
+    expected_username_hash: Option<&str>,
     hmac_key: &[u8],
 ) -> bool {
-    let Some(key_to_hash) = extract_key_from_credential(cred, prefix) else {
+    let Some(extracted) = extract_key_from_credential(cred, prefix) else {
         return false;
     };
 
-    let Ok(provided_hash) = hash_api_key(&key_to_hash, hmac_key) else {
+    // Check the key/password hash
+    let Ok(provided_key_hash) = hash_api_key(&extracted.key, hmac_key) else {
         return false;
     };
 
-    constant_time_eq(provided_hash.as_bytes(), expected_hash.as_bytes())
+    if !constant_time_eq(provided_key_hash.as_bytes(), expected_key_hash.as_bytes()) {
+        return false;
+    }
+
+    // If username validation is configured, check the username
+    if let Some(expected_user_hash) = expected_username_hash {
+        let Some(ref username) = extracted.username else {
+            // Username required but not provided (Bearer auth instead of Basic)
+            debug!("username validation required but credential is not Basic auth");
+            return false;
+        };
+
+        let Ok(provided_user_hash) = hash_api_key(username, hmac_key) else {
+            return false;
+        };
+
+        if !constant_time_eq(provided_user_hash.as_bytes(), expected_user_hash.as_bytes()) {
+            debug!("username hash mismatch");
+            return false;
+        }
+    }
+
+    true
 }
 
 /// Validates API key authentication.
@@ -338,9 +421,10 @@ fn validate_api_key<B>(
     }
 
     let prefix = config.prefix.as_deref();
+    let username_hash = config.username_hash.as_deref();
     let is_valid = credentials
         .iter()
-        .any(|cred| check_credential(cred, prefix, &config.key_hash, hmac_key));
+        .any(|cred| check_credential(cred, prefix, &config.key_hash, username_hash, hmac_key));
 
     if is_valid {
         debug!("API key authentication successful");
@@ -713,5 +797,105 @@ mod tests {
 
         let result = validate_mtls(&config, Some(&tls_info));
         assert!(matches!(result, Err(TokenizerError::ConfigError(_))));
+    }
+
+    #[test]
+    fn test_basic_auth_validates_username_and_password() {
+        // Security test: Basic auth should validate BOTH username and password
+        let hmac_key = test_hmac_key();
+        let config =
+            create_basic_auth_config("admin", "secret-password", &hmac_key).expect("should create");
+
+        // Build Basic auth header: base64("admin:secret-password")
+        let credentials = base64::engine::general_purpose::STANDARD.encode("admin:secret-password");
+        let request = Request::builder()
+            .header(PROXY_AUTHORIZATION_HEADER, format!("Basic {}", credentials))
+            .body(())
+            .unwrap();
+
+        let result = validate_api_key(&config, &request, &hmac_key);
+        assert!(
+            result.is_ok(),
+            "correct username and password should succeed"
+        );
+    }
+
+    #[test]
+    fn test_basic_auth_wrong_username_rejected() {
+        // Security test: Wrong username must be rejected even with correct password
+        let hmac_key = test_hmac_key();
+        let config =
+            create_basic_auth_config("admin", "secret-password", &hmac_key).expect("should create");
+
+        // Build Basic auth header with wrong username: base64("hacker:secret-password")
+        let credentials =
+            base64::engine::general_purpose::STANDARD.encode("hacker:secret-password");
+        let request = Request::builder()
+            .header(PROXY_AUTHORIZATION_HEADER, format!("Basic {}", credentials))
+            .body(())
+            .unwrap();
+
+        let result = validate_api_key(&config, &request, &hmac_key);
+        assert!(
+            result.is_err(),
+            "wrong username should be rejected even with correct password"
+        );
+    }
+
+    #[test]
+    fn test_basic_auth_wrong_password_rejected() {
+        // Security test: Wrong password must be rejected even with correct username
+        let hmac_key = test_hmac_key();
+        let config =
+            create_basic_auth_config("admin", "secret-password", &hmac_key).expect("should create");
+
+        // Build Basic auth header with wrong password: base64("admin:wrong-password")
+        let credentials = base64::engine::general_purpose::STANDARD.encode("admin:wrong-password");
+        let request = Request::builder()
+            .header(PROXY_AUTHORIZATION_HEADER, format!("Basic {}", credentials))
+            .body(())
+            .unwrap();
+
+        let result = validate_api_key(&config, &request, &hmac_key);
+        assert!(
+            result.is_err(),
+            "wrong password should be rejected even with correct username"
+        );
+    }
+
+    #[test]
+    fn test_basic_auth_bearer_rejected_when_username_required() {
+        // Security test: Bearer auth must be rejected when username validation is configured
+        let hmac_key = test_hmac_key();
+        let config =
+            create_basic_auth_config("admin", "secret-password", &hmac_key).expect("should create");
+
+        // Attempt to authenticate with Bearer using the password
+        let request = Request::builder()
+            .header(PROXY_AUTHORIZATION_HEADER, "Bearer secret-password")
+            .body(())
+            .unwrap();
+
+        let result = validate_api_key(&config, &request, &hmac_key);
+        assert!(
+            result.is_err(),
+            "Bearer auth should be rejected when username validation is configured"
+        );
+    }
+
+    #[test]
+    fn test_create_basic_auth_config() {
+        let hmac_key = test_hmac_key();
+        let config = create_basic_auth_config("admin", "secret", &hmac_key).expect("should create");
+        assert_eq!(config.header_name, PROXY_AUTHORIZATION_HEADER);
+        assert!(config.prefix.is_none());
+        assert_eq!(
+            config.key_hash,
+            hash_api_key("secret", &hmac_key).expect("should hash")
+        );
+        assert_eq!(
+            config.username_hash,
+            Some(hash_api_key("admin", &hmac_key).expect("should hash"))
+        );
     }
 }
