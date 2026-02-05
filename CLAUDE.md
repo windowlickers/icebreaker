@@ -47,8 +47,10 @@ crates/
 ├── icebreaker-crypto/   # Keypair, seal/unseal, HKDF, HMAC, auth validation
 ├── icebreaker-proxy/    # Tower middleware, processors, response scanning, SSRF protection
 ├── icebreaker-audit/    # Optional audit logging (postgres/sqlite feature flags)
+├── icebreaker-nonce/    # Replay protection: in-memory and Redis nonce stores
+├── icebreaker-sso/      # OAuth orchestration (Google, GitHub, Microsoft, generic)
 ├── icebreaker-bench/    # Criterion benchmarks
-└── icebreaker-cli/      # CLI: serve, keygen, seal, inspect
+└── icebreaker-cli/      # CLI: serve, keygen, seal, inspect, sso
 ```
 
 ## Key Architecture
@@ -163,6 +165,7 @@ icebreaker serve   # Run proxy (requires ICEBREAKER_SECRET_KEY)
 icebreaker keygen  # Generate Curve25519 keypair
 icebreaker seal    # Create sealed token
 icebreaker inspect # Inspect token metadata
+icebreaker sso     # Run OAuth orchestration service
 ```
 
 ## Environment Variables
@@ -178,10 +181,12 @@ icebreaker inspect # Inspect token metadata
 | `ICEBREAKER_METRICS_PORT` | `9090` | Metrics port |
 | `ICEBREAKER_HEALTH_PORT` | `9091` | Health endpoint port |
 
-## Docker & Kubernetes
+## Container Images & Kubernetes
 
 ```bash
-docker build -t icebreaker:latest .
+nix build .#icebreaker-image     # Build OCI image
+nix run .#load                    # Load image into local Docker
+nix run .#push                    # Push to registry
 helm install icebreaker deploy/helm/icebreaker --set icebreaker.existingSecret="my-secret"
 ```
 
