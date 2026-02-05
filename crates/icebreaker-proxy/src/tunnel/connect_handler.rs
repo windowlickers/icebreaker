@@ -385,8 +385,8 @@ mod tests {
         );
 
         // Test with a public hostname (this makes a real DNS query)
-        // Skip in CI environments
-        if std::env::var("CI").is_err() {
+        // Skip in CI environments and Nix sandbox (no network access)
+        if std::env::var("CI").is_err() && std::env::var("NIX_BUILD_TOP").is_err() {
             // Use a well-known public service
             let result = handler.resolve_and_validate("dns.google", 443).await;
             // This should succeed as Google's DNS IPs are public

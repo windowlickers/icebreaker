@@ -90,6 +90,34 @@
           };
         });
 
+        # Container image
+        icebreakerImage = import ./image.nix {
+          inherit pkgs icebreaker-cli version;
+        };
+
+        # Load image into Docker
+        loadImage = pkgs.writeShellScriptBin "load" ''
+          set -euo pipefail
+          echo "Loading icebreaker:${version} into Docker..."
+          ${pkgs.docker}/bin/docker load < ${icebreakerImage}
+          echo "Loaded icebreaker:${version}"
+        '';
+
+        # Push image to Harbor
+        registry = "harbor.windowlicke.rs/windowlickers";
+        pushImage = pkgs.writeShellScriptBin "push" ''
+          set -euo pipefail
+          echo "Pushing to ${registry}/icebreaker:${version}..."
+          ${pkgs.skopeo}/bin/skopeo --insecure-policy copy \
+            docker-archive:${icebreakerImage} \
+            docker://${registry}/icebreaker:${version}
+          echo "Pushing to ${registry}/icebreaker:latest..."
+          ${pkgs.skopeo}/bin/skopeo --insecure-policy copy \
+            docker-archive:${icebreakerImage} \
+            docker://${registry}/icebreaker:latest
+          echo "Pushed ${version}"
+        '';
+
       in
       {
         # `nix flake check` runs all of these
@@ -111,7 +139,13 @@
 
         packages = {
           inherit icebreaker icebreaker-cli;
+          icebreaker-image = icebreakerImage;
           default = icebreaker;
+        };
+
+        apps = {
+          load = { type = "app"; program = "${loadImage}/bin/load"; };
+          push = { type = "app"; program = "${pushImage}/bin/push"; };
         };
 
         devShells.default = craneLib.devShell {
@@ -122,6 +156,8 @@
             cargo-outdated
             cargo-audit
             cargo-expand
+            skopeo
+            dive
           ];
 
           # Environment variables
