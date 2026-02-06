@@ -66,14 +66,15 @@ crates/
 
 ### Tower Middleware Stack
 ```rust
+// Rate limiting is conditionally composed (omitted when disabled)
 ServiceBuilder::new()
-    .layer(TraceLayer::new_for_http())
-    .layer(TimeoutLayer::new(Duration::from_secs(30)))
-    .layer(RateLimitLayer::new(config))
-    .layer(TokenInjectionLayer::new(crypto))
-    .layer(ResponseScanLayer::new(scanner))
-    .service(upstream_connector);
+    .layer(RateLimitLayer::new(rate_config))  // optional
+    .layer(MetricsLayer::new())
+    .layer(TokenInjectionLayer::with_all_options(...))
+    .layer(DynamicResponseScanLayer::new())   // must come after TokenInjectionLayer
+    .service(proxy_service);
 ```
+Timeout is applied per-request via `tokio::time::timeout`, not as a Tower layer.
 
 ### Processors
 | Type | Purpose |
@@ -89,8 +90,17 @@ ServiceBuilder::new()
 Strict linting enforced:
 - `unsafe_code = "forbid"`
 - `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro` = `"deny"`
+- `missing_docs = "warn"`, `print_stdout`, `print_stderr` = `"warn"`
+- `cognitive_complexity`, `large_enum_variant`, `needless_pass_by_value` = `"warn"`
 
 Use proper error handling with `?` and `Result` types.
+
+## Error Handling
+
+`TokenizerError` (in `icebreaker-common/src/error.rs`) uses `thiserror` and provides classification helpers:
+- `client_message()` - Returns sanitized messages safe for clients (no leaked hostnames/IPs)
+- `is_retryable()` - Identifies transient failures (timeouts, 5xx)
+- `is_client_error()` / `is_security_error()` - For routing error responses
 
 ## Secret Protection Patterns
 
@@ -98,6 +108,7 @@ Use proper error handling with `?` and `Result` types.
 - Keys implement `ZeroizeOnDrop`
 - Debug impls must redact: `field("secret_key", &"[REDACTED]")`
 - Use `subtle::ConstantTimeEq` for HMAC verification
+- Response scanning generates 7 encoded variants of secrets (raw, base64, URL-encoded, hex, HTML entities); secrets < 8 chars only scan raw to avoid false positives
 
 ## Adding New Processors
 
@@ -181,13 +192,12 @@ icebreaker sso     # Run OAuth orchestration service
 | `ICEBREAKER_METRICS_PORT` | `9090` | Metrics port |
 | `ICEBREAKER_HEALTH_PORT` | `9091` | Health endpoint port |
 
-## Container Images & Kubernetes
+## Container Images
 
 ```bash
 nix build .#icebreaker-image     # Build OCI image
 nix run .#load                    # Load image into local Docker
-nix run .#push                    # Push to registry
-helm install icebreaker deploy/helm/icebreaker --set icebreaker.existingSecret="my-secret"
+nix run .#push                    # Push to registry (harbor.windowlicke.rs/windowlickers)
 ```
 
 Health endpoints: `/healthz` (liveness), `/readyz` (readiness)
@@ -209,6 +219,28 @@ icebreaker serve --tls-cert server.crt --tls-key server.key \
 | `--tls-client-auth` | `ICEBREAKER_TLS_CLIENT_AUTH` | Client auth mode: `none`, `optional`, `required` |
 
 The `TlsConnectionInfo` (containing cert fingerprint and subject DN) is automatically extracted and passed to the middleware stack for token validation.
+
+## Feature Flags
+
+| Crate | Feature | Description |
+|-------|---------|-------------|
+| `icebreaker-audit` | `postgres` | PostgreSQL audit logging via sqlx |
+| `icebreaker-audit` | `sqlite` | SQLite audit logging via sqlx |
+| `icebreaker-nonce` | `redis` | Redis-backed nonce store (not yet implemented) |
+
+## CI
+
+No GitHub Actions—CI runs via Nix flake checks:
+```bash
+nix flake check   # Runs: build, cargo fmt, clippy (--all-targets --all-features -D warnings), tests (--all-features)
+```
+
+## Testing Patterns
+
+- Processor tests use `TestPayloadBuilder` from `icebreaker-proxy/src/processor/test_utils.rs`
+- Integration tests in `crates/icebreaker-proxy/tests/` use `TestProxyServer` and `TestCertificateAuthority` for mTLS testing
+- `wiremock` for HTTP mocking, `rcgen` for test certificate generation
+- Benchmarks in `icebreaker-bench` use Criterion (note: strict lints are relaxed for benchmarks)
 
 ## Known Limitations
 
