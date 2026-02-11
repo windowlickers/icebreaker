@@ -25,8 +25,8 @@ pub use config::{
 };
 pub use error::{Result, TokenizerError};
 pub use processor::{
-    CachedOAuthToken, HmacAlgorithm, HmacConfig, InjectBodyConfig, InjectConfig, OAuthConfig,
-    OAuthGrantType, ProcessorConfig, Sigv4Config,
+    CachedOAuthToken, HmacAlgorithm, HmacConfig, InjectBodyConfig, InjectConfig,
+    MultiProcessorConfig, OAuthConfig, OAuthGrantType, ProcessorConfig, Sigv4Config,
 };
 pub use token::{
     ExpirationStatus, OAuthMetadata, ReplayProtection, SealedToken, TokenMetadata, TokenPayload,

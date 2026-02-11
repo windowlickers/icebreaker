@@ -240,6 +240,11 @@ struct SealArgs {
     /// Nonce TTL in seconds (defaults to token expiration or 24 hours)
     #[arg(long)]
     nonce_ttl: Option<u64>,
+
+    /// Advanced: JSON processor configuration (overrides --header/--prefix).
+    /// Example: '{"type":"multi","processors":[{"type":"inject","header_name":"Authorization","prefix":"Bearer "},{"type":"inject","header_name":"X-Api-Key"}]}'
+    #[arg(long)]
+    processor_json: Option<String>,
 }
 
 #[derive(Parser)]
@@ -1442,17 +1447,33 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     pk_array.copy_from_slice(&public_key_bytes);
     let public_key = crypto_box::PublicKey::from(pk_array);
 
-    // Build inject config
-    let inject_config = if let Some(prefix) = args.prefix {
-        InjectConfig {
-            header_name: args.header,
-            prefix: Some(prefix),
-            suffix: None,
+    // Build processor config
+    let processor_config: ProcessorConfig = if let Some(ref json) = args.processor_json {
+        let config: ProcessorConfig =
+            serde_json::from_str(json).map_err(|e| format!("invalid processor JSON: {e}"))?;
+
+        // Validate multi-processor configs
+        if let ProcessorConfig::Multi(ref multi) = config {
+            multi
+                .validate()
+                .map_err(|e| format!("invalid multi-processor config: {e}"))?;
         }
-    } else if args.header.to_lowercase() == "authorization" {
-        InjectConfig::bearer(&args.header)
+
+        config
     } else {
-        InjectConfig::raw(&args.header)
+        let inject_config = if let Some(prefix) = args.prefix {
+            InjectConfig {
+                header_name: args.header,
+                prefix: Some(prefix),
+                suffix: None,
+            }
+        } else if args.header.to_lowercase() == "authorization" {
+            InjectConfig::bearer(&args.header)
+        } else {
+            InjectConfig::raw(&args.header)
+        };
+
+        ProcessorConfig::Inject(inject_config)
     };
 
     // Parse allowed hosts
@@ -1468,11 +1489,8 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Build payload
-    let mut builder = TokenPayload::builder(
-        SecretString::from(args.secret),
-        ProcessorConfig::Inject(inject_config),
-    )
-    .allowed_hosts(allowed_hosts);
+    let mut builder = TokenPayload::builder(SecretString::from(args.secret), processor_config)
+        .allowed_hosts(allowed_hosts);
 
     if let Some(expires_in) = args.expires_in {
         let expires_at = std::time::SystemTime::now()

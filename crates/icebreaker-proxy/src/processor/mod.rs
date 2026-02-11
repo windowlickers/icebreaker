@@ -40,7 +40,7 @@ use http_body::Body;
 use http_body_util::BodyExt;
 use icebreaker_common::{
     HmacConfig, InjectBodyConfig, InjectConfig, OAuthConfig, ProcessorConfig, Result, Sigv4Config,
-    TokenPayload,
+    TokenPayload, TokenizerError,
 };
 
 pub use hmac::HmacProcessor;
@@ -156,6 +156,8 @@ pub enum Processor {
     InjectBody(InjectBodyProcessor),
     /// AWS Signature Version 4 signing.
     Sigv4(Sigv4Processor),
+    /// Multiple processors applied in sequence.
+    Multi(Vec<Processor>),
 }
 
 impl Processor {
@@ -173,6 +175,13 @@ impl Processor {
             Processor::Sigv4(p) => p.process(request, payload),
             // Body processors don't modify headers
             Processor::InjectBody(_) => Ok(request),
+            Processor::Multi(processors) => {
+                let mut req = request;
+                for processor in processors {
+                    req = processor.process(req, payload)?;
+                }
+                Ok(req)
+            }
         }
     }
 
@@ -188,6 +197,7 @@ impl Processor {
         match self {
             Processor::InjectBody(_) => true,
             Processor::Hmac(p) => p.config().sign_body,
+            Processor::Multi(processors) => processors.iter().any(|p| p.is_body_processor()),
             _ => false,
         }
     }
@@ -200,38 +210,78 @@ impl Processor {
     /// # Errors
     ///
     /// Returns an error if the body cannot be collected or processed.
-    pub async fn process_body<B>(
+    #[allow(clippy::type_complexity)]
+    pub fn process_body<B>(
         &self,
         request: Request<B>,
         payload: &TokenPayload,
-    ) -> Result<Request<http_body_util::Full<Bytes>>>
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Request<http_body_util::Full<Bytes>>>> + Send>,
+    >
     where
-        B: Body,
-        B::Error: std::fmt::Display,
+        B: Body + Send + 'static,
+        B::Data: Send,
+        B::Error: std::fmt::Display + Send,
     {
         match self {
-            Processor::InjectBody(p) => p.process_body(request, payload.expose_secret()).await,
+            Processor::InjectBody(p) => {
+                let p = p.clone();
+                let secret = payload.expose_secret().to_string();
+                Box::pin(async move { p.process_body(request, &secret).await })
+            }
             // HMAC with body signing needs to include body hash in signature
             Processor::Hmac(p) if p.config().sign_body => {
-                p.process_body_signing(request, payload).await
+                let p = p.clone();
+                let payload = payload.clone();
+                Box::pin(async move { p.process_body_signing(request, &payload).await })
+            }
+            Processor::Multi(processors) => {
+                let processors = processors.clone();
+                let payload = payload.clone();
+                Box::pin(async move {
+                    // First apply all non-body header processors
+                    let mut req = request;
+                    for processor in &processors {
+                        if !processor.is_body_processor() {
+                            req = processor.process(req, &payload)?;
+                        }
+                    }
+
+                    // Find the body processor (if any) and delegate to it
+                    for processor in &processors {
+                        if processor.is_body_processor() {
+                            return processor.process_body(req, &payload).await;
+                        }
+                    }
+
+                    // No body processor: collect body to Full<Bytes> unchanged
+                    let (parts, body) = req.into_parts();
+                    let body_bytes = body
+                        .collect()
+                        .await
+                        .map_err(|e| {
+                            TokenizerError::HttpError(format!("failed to collect body: {e}"))
+                        })?
+                        .to_bytes();
+                    Ok(Request::from_parts(
+                        parts,
+                        http_body_util::Full::new(body_bytes),
+                    ))
+                })
             }
             // Non-body processors: convert body to Full<Bytes> unchanged
-            _ => {
+            _ => Box::pin(async move {
                 let (parts, body) = request.into_parts();
                 let body_bytes = body
                     .collect()
                     .await
-                    .map_err(|e| {
-                        icebreaker_common::TokenizerError::HttpError(format!(
-                            "failed to collect body: {e}"
-                        ))
-                    })?
+                    .map_err(|e| TokenizerError::HttpError(format!("failed to collect body: {e}")))?
                     .to_bytes();
                 Ok(Request::from_parts(
                     parts,
                     http_body_util::Full::new(body_bytes),
                 ))
-            }
+            }),
         }
     }
 
@@ -243,6 +293,7 @@ impl Processor {
     pub fn body_config(&self) -> Option<&InjectBodyConfig> {
         match self {
             Processor::InjectBody(p) => Some(p.config()),
+            Processor::Multi(processors) => processors.iter().find_map(|p| p.body_config()),
             _ => None,
         }
     }
@@ -279,7 +330,30 @@ pub fn create_processor(config: &ProcessorConfig) -> Processor {
         // InjectBody doesn't use ProcessorFactory since it's a body processor
         ProcessorConfig::InjectBody(c) => InjectBodyProcessor::new(c.clone()).into(),
         ProcessorConfig::Sigv4(c) => c.create_processor().into(),
+        ProcessorConfig::Multi(c) => {
+            let processors = c.processors.iter().map(create_processor).collect();
+            Processor::Multi(processors)
+        }
     }
+}
+
+/// Validates a processor configuration before creating the processor.
+///
+/// For `Multi` configs, this checks that:
+/// - The processor list is not empty
+/// - There are no nested `Multi` configs
+/// - At most one body processor is present
+///
+/// Non-`Multi` configs always pass validation.
+///
+/// # Errors
+///
+/// Returns [`TokenizerError::InvalidPayload`] if validation fails.
+pub fn validate_processor_config(config: &ProcessorConfig) -> Result<()> {
+    if let ProcessorConfig::Multi(c) = config {
+        c.validate().map_err(TokenizerError::InvalidPayload)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -441,5 +515,169 @@ mod processor_tests {
             .expect("should collect body")
             .to_bytes();
         assert_eq!(body_bytes.as_ref(), b"{\"data\":\"test\"}");
+    }
+
+    #[test]
+    fn test_multi_process_applies_multiple_headers() {
+        let processor = Processor::Multi(vec![
+            Processor::Inject(InjectProcessor::new(
+                icebreaker_common::InjectConfig::bearer("Authorization"),
+            )),
+            Processor::Inject(InjectProcessor::new(icebreaker_common::InjectConfig::raw(
+                "X-Api-Key",
+            ))),
+        ]);
+
+        let payload = create_test_payload(
+            "my-secret",
+            ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer("Authorization")),
+        );
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        let processed = processor
+            .process(request, &payload)
+            .expect("should process");
+
+        assert_eq!(
+            processed
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer my-secret")
+        );
+        assert_eq!(
+            processed
+                .headers()
+                .get("X-Api-Key")
+                .and_then(|v| v.to_str().ok()),
+            Some("my-secret")
+        );
+    }
+
+    #[test]
+    fn test_multi_is_body_processor_detects_inner_body_processor() {
+        let processor = Processor::Multi(vec![
+            Processor::Inject(InjectProcessor::new(
+                icebreaker_common::InjectConfig::bearer("Authorization"),
+            )),
+            Processor::InjectBody(InjectBodyProcessor::new(InjectBodyConfig::default())),
+        ]);
+
+        assert!(processor.is_body_processor());
+    }
+
+    #[test]
+    fn test_multi_is_not_body_processor_when_all_headers() {
+        let processor = Processor::Multi(vec![
+            Processor::Inject(InjectProcessor::new(
+                icebreaker_common::InjectConfig::bearer("Authorization"),
+            )),
+            Processor::Inject(InjectProcessor::new(icebreaker_common::InjectConfig::raw(
+                "X-Api-Key",
+            ))),
+        ]);
+
+        assert!(!processor.is_body_processor());
+    }
+
+    #[tokio::test]
+    async fn test_multi_process_body_with_header_and_body_processor() {
+        let processor = Processor::Multi(vec![
+            Processor::Inject(InjectProcessor::new(
+                icebreaker_common::InjectConfig::bearer("Authorization"),
+            )),
+            Processor::InjectBody(InjectBodyProcessor::new(InjectBodyConfig::default())),
+        ]);
+
+        let payload = create_test_payload(
+            "my-secret",
+            ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer("Authorization")),
+        );
+
+        let body = http_body_util::Full::new(Bytes::from("{\"token\": \"{{ACCESS_TOKEN}}\"}"));
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://api.example.com/data")
+            .body(body)
+            .expect("request should build");
+
+        let processed = processor
+            .process_body(request, &payload)
+            .await
+            .expect("should process");
+
+        // Header processor should have run
+        assert_eq!(
+            processed
+                .headers()
+                .get("Authorization")
+                .and_then(|v| v.to_str().ok()),
+            Some("Bearer my-secret")
+        );
+
+        // Body processor should have replaced placeholder
+        let body_bytes = processed
+            .into_body()
+            .collect()
+            .await
+            .expect("should collect body")
+            .to_bytes();
+        assert_eq!(body_bytes.as_ref(), b"{\"token\": \"my-secret\"}");
+    }
+
+    #[test]
+    fn test_create_processor_handles_multi_config() {
+        let config = ProcessorConfig::Multi(icebreaker_common::MultiProcessorConfig {
+            processors: vec![
+                ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer("Authorization")),
+                ProcessorConfig::Inject(icebreaker_common::InjectConfig::raw("X-Api-Key")),
+            ],
+        });
+
+        let processor = create_processor(&config);
+        assert!(matches!(processor, Processor::Multi(_)));
+    }
+
+    #[test]
+    fn test_multi_body_config_finds_inner() {
+        let processor = Processor::Multi(vec![
+            Processor::Inject(InjectProcessor::new(
+                icebreaker_common::InjectConfig::bearer("Authorization"),
+            )),
+            Processor::InjectBody(InjectBodyProcessor::new(InjectBodyConfig::new("{{TOKEN}}"))),
+        ]);
+
+        let config = processor.body_config();
+        assert!(config.is_some());
+        assert_eq!(config.expect("should have config").placeholder, "{{TOKEN}}");
+    }
+
+    #[test]
+    fn test_validate_processor_config_passes_for_non_multi() {
+        let config =
+            ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer("Authorization"));
+        assert!(validate_processor_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_processor_config_passes_for_valid_multi() {
+        let config = ProcessorConfig::Multi(icebreaker_common::MultiProcessorConfig {
+            processors: vec![
+                ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer("Authorization")),
+                ProcessorConfig::Inject(icebreaker_common::InjectConfig::raw("X-Api-Key")),
+            ],
+        });
+        assert!(validate_processor_config(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_processor_config_rejects_empty_multi() {
+        let config =
+            ProcessorConfig::Multi(icebreaker_common::MultiProcessorConfig { processors: vec![] });
+        assert!(validate_processor_config(&config).is_err());
     }
 }

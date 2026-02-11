@@ -29,8 +29,8 @@ pub use middleware::{
 };
 pub use network::{BlockReason, IpFilter, ValidatingConnector, ValidatingStream};
 pub use processor::{
-    create_processor, HmacProcessor, InjectBodyProcessor, InjectProcessor, OAuthProcessor,
-    Processor, ProcessorFactory, RequestProcessor, Sigv4Processor,
+    create_processor, validate_processor_config, HmacProcessor, InjectBodyProcessor,
+    InjectProcessor, OAuthProcessor, Processor, ProcessorFactory, RequestProcessor, Sigv4Processor,
 };
 pub use tls::{create_tls_acceptor, extract_client_cert_info, TlsAcceptorError};
 pub use tunnel::{is_connect_request, ConnectHandler, TunnelConfig};

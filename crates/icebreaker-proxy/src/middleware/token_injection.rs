@@ -35,7 +35,7 @@ use crate::metrics::{
     TokenValidationResult,
 };
 use crate::middleware::response_scan::ScanPatterns;
-use crate::processor::create_processor;
+use crate::processor::{create_processor, validate_processor_config};
 
 /// The header name for the sealed token.
 pub const TOKEN_HEADER: &str = "X-Tokenizer-Token";
@@ -460,6 +460,9 @@ where
 
             // Remove the token header before forwarding
             request.headers_mut().remove(TOKEN_HEADER);
+
+            // Validate processor config (rejects invalid Multi configs)
+            validate_processor_config(&payload.processor)?;
 
             // Create the processor and inject the secret
             let processor = create_processor(&payload.processor);

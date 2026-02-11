@@ -22,6 +22,9 @@ pub enum ProcessorConfig {
 
     /// AWS Signature Version 4 signing.
     Sigv4(Sigv4Config),
+
+    /// Multiple processors applied in sequence.
+    Multi(MultiProcessorConfig),
 }
 
 impl ProcessorConfig {
@@ -34,6 +37,18 @@ impl ProcessorConfig {
             Self::OAuth(_) => "oauth",
             Self::InjectBody(_) => "inject_body",
             Self::Sigv4(_) => "sigv4",
+            Self::Multi(_) => "multi",
+        }
+    }
+
+    /// Returns `true` if this config represents a body processor.
+    #[must_use]
+    pub fn is_body_processor(&self) -> bool {
+        match self {
+            Self::InjectBody(_) => true,
+            Self::InjectHmac(c) => c.sign_body,
+            Self::Multi(c) => c.processors.iter().any(|p| p.is_body_processor()),
+            _ => false,
         }
     }
 }
@@ -263,6 +278,53 @@ impl std::fmt::Debug for Sigv4Config {
     }
 }
 
+/// Configuration for chaining multiple processors in sequence.
+///
+/// All processors share the token's single secret and execute sequentially.
+/// Header processors run in Vec order; at most one body processor is allowed
+/// and always executes last.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MultiProcessorConfig {
+    /// The ordered list of processors to apply.
+    pub processors: Vec<ProcessorConfig>,
+}
+
+impl MultiProcessorConfig {
+    /// Validates the multi-processor configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The processor list is empty
+    /// - Any inner processor is itself a `Multi` (nesting not allowed)
+    /// - More than one body processor is present (`InjectBody` or `HmacConfig { sign_body: true }`)
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.processors.is_empty() {
+            return Err("multi-processor config must contain at least one processor".to_string());
+        }
+
+        let mut body_processor_count = 0u32;
+        for (i, p) in self.processors.iter().enumerate() {
+            if matches!(p, ProcessorConfig::Multi(_)) {
+                return Err(format!(
+                    "nested multi-processor at index {i} is not allowed"
+                ));
+            }
+            if p.is_body_processor() {
+                body_processor_count += 1;
+            }
+        }
+
+        if body_processor_count > 1 {
+            return Err(format!(
+                "at most one body processor allowed, found {body_processor_count}"
+            ));
+        }
+
+        Ok(())
+    }
+}
+
 /// Cached OAuth token with expiration.
 #[derive(Debug, Clone)]
 pub struct CachedOAuthToken {
@@ -328,5 +390,93 @@ mod tests {
 
         let sigv4 = ProcessorConfig::Sigv4(Sigv4Config::new("AKIAIOSFODNN7EXAMPLE"));
         assert_eq!(sigv4.processor_type(), "sigv4");
+
+        let multi = ProcessorConfig::Multi(MultiProcessorConfig {
+            processors: vec![ProcessorConfig::Inject(InjectConfig::bearer(
+                "Authorization",
+            ))],
+        });
+        assert_eq!(multi.processor_type(), "multi");
+    }
+
+    #[test]
+    fn test_multi_serialization_roundtrip() {
+        let config = ProcessorConfig::Multi(MultiProcessorConfig {
+            processors: vec![
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+                ProcessorConfig::Inject(InjectConfig::raw("X-Api-Key")),
+            ],
+        });
+
+        let json = serde_json::to_string(&config).expect("should serialize");
+        let deserialized: ProcessorConfig =
+            serde_json::from_str(&json).expect("should deserialize");
+        assert_eq!(deserialized.processor_type(), "multi");
+    }
+
+    #[test]
+    fn test_multi_validate_rejects_empty() {
+        let config = MultiProcessorConfig { processors: vec![] };
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn test_multi_validate_rejects_nested_multi() {
+        let config = MultiProcessorConfig {
+            processors: vec![ProcessorConfig::Multi(MultiProcessorConfig {
+                processors: vec![ProcessorConfig::Inject(InjectConfig::bearer(
+                    "Authorization",
+                ))],
+            })],
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("nested"));
+    }
+
+    #[test]
+    fn test_multi_validate_rejects_two_body_processors() {
+        let config = MultiProcessorConfig {
+            processors: vec![
+                ProcessorConfig::InjectBody(InjectBodyConfig::default()),
+                ProcessorConfig::InjectHmac(HmacConfig {
+                    sign_body: true,
+                    ..HmacConfig::default()
+                }),
+            ],
+        };
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("body processor"));
+    }
+
+    #[test]
+    fn test_multi_validate_accepts_single_element() {
+        let config = MultiProcessorConfig {
+            processors: vec![ProcessorConfig::Inject(InjectConfig::bearer(
+                "Authorization",
+            ))],
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_multi_validate_accepts_multiple_header_only() {
+        let config = MultiProcessorConfig {
+            processors: vec![
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+                ProcessorConfig::Inject(InjectConfig::raw("X-Api-Key")),
+            ],
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn test_multi_validate_accepts_header_plus_one_body() {
+        let config = MultiProcessorConfig {
+            processors: vec![
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+                ProcessorConfig::InjectBody(InjectBodyConfig::default()),
+            ],
+        };
+        assert!(config.validate().is_ok());
     }
 }
