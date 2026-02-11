@@ -241,6 +241,18 @@ struct SealArgs {
     #[arg(long)]
     nonce_ttl: Option<u64>,
 
+    /// Allowed HTTP methods (comma-separated, e.g., "GET,POST")
+    #[arg(long)]
+    allowed_methods: Option<String>,
+
+    /// Allowed request paths (comma-separated exact match, e.g., "/api/v1/users,/api/v1/items")
+    #[arg(long)]
+    allowed_paths: Option<String>,
+
+    /// Allowed path pattern (regex, e.g., "/api/v[12]/.*")
+    #[arg(long)]
+    allowed_path_pattern: Option<String>,
+
     /// Advanced: JSON processor configuration (overrides --header/--prefix).
     /// Example: '{"type":"multi","processors":[{"type":"inject","header_name":"Authorization","prefix":"Bearer "},{"type":"inject","header_name":"X-Api-Key"}]}'
     #[arg(long)]
@@ -1488,9 +1500,63 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err("at least one allowed host is required".into());
     }
 
+    // Parse allowed methods
+    if let Some(ref methods) = args.allowed_methods {
+        let method_list: Vec<String> = methods
+            .split(',')
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !method_list.is_empty() {
+            println!("Allowed methods: {}", method_list.join(", "));
+        }
+    }
+
+    // Parse allowed paths
+    if let Some(ref paths) = args.allowed_paths {
+        let path_list: Vec<String> = paths
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !path_list.is_empty() {
+            println!("Allowed paths: {}", path_list.join(", "));
+        }
+    }
+
+    if let Some(ref pattern) = args.allowed_path_pattern {
+        println!("Allowed path pattern: {}", pattern);
+    }
+
     // Build payload
     let mut builder = TokenPayload::builder(SecretString::from(args.secret), processor_config)
         .allowed_hosts(allowed_hosts);
+
+    if let Some(ref methods) = args.allowed_methods {
+        let method_list: Vec<String> = methods
+            .split(',')
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !method_list.is_empty() {
+            builder = builder.allowed_methods(method_list);
+        }
+    }
+
+    if let Some(ref paths) = args.allowed_paths {
+        let path_list: Vec<String> = paths
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !path_list.is_empty() {
+            builder = builder.allowed_paths(path_list);
+        }
+    }
+
+    if let Some(pattern) = args.allowed_path_pattern {
+        builder = builder.allowed_path_pattern(pattern);
+    }
 
     if let Some(expires_in) = args.expires_in {
         let expires_at = std::time::SystemTime::now()

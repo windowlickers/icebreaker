@@ -74,6 +74,10 @@ pub enum TokenValidationResult {
     Missing,
     /// Host validation failed (token used for unauthorized host).
     HostValidationFailed,
+    /// Method validation failed (token used for unauthorized HTTP method).
+    MethodValidationFailed,
+    /// Path validation failed (token used for unauthorized request path).
+    PathValidationFailed,
 }
 
 impl TokenValidationResult {
@@ -87,6 +91,8 @@ impl TokenValidationResult {
             Self::DecryptionFailed => "decryption_failed",
             Self::Missing => "missing",
             Self::HostValidationFailed => "host_validation_failed",
+            Self::MethodValidationFailed => "method_validation_failed",
+            Self::PathValidationFailed => "path_validation_failed",
         }
     }
 }
@@ -105,6 +111,24 @@ pub fn record_host_rejection(host: &str) {
     counter!(
         "icebreaker_host_rejections_total",
         "host" => host.to_string()
+    )
+    .increment(1);
+}
+
+/// Records a method rejection (token used for unauthorized HTTP method).
+pub fn record_method_rejection(method: &str) {
+    counter!(
+        "icebreaker_method_rejections_total",
+        "method" => method.to_string()
+    )
+    .increment(1);
+}
+
+/// Records a path rejection (token used for unauthorized request path).
+pub fn record_path_rejection(path: &str) {
+    counter!(
+        "icebreaker_path_rejections_total",
+        "path" => path.to_string()
     )
     .increment(1);
 }
@@ -224,6 +248,14 @@ mod tests {
         assert_eq!(
             TokenValidationResult::HostValidationFailed.as_str(),
             "host_validation_failed"
+        );
+        assert_eq!(
+            TokenValidationResult::MethodValidationFailed.as_str(),
+            "method_validation_failed"
+        );
+        assert_eq!(
+            TokenValidationResult::PathValidationFailed.as_str(),
+            "path_validation_failed"
         );
     }
 

@@ -59,10 +59,12 @@ crates/
 1. Client sends `X-Tokenizer-Token` header
 2. `TokenInjectionService` decrypts sealed token
 3. Host validation against allowlist
-4. IP validation (SSRF prevention)
-5. Processor injects secret (header, body, HMAC, SigV4, or OAuth)
-6. `ResponseScanLayer` wraps response with `ScanningBody` for leak detection
-7. `OverlapBuffer` (256-byte overlap) detects secrets spanning chunk boundaries
+4. Method validation against `allowed_methods` (if configured)
+5. Path validation against `allowed_paths` / `allowed_path_pattern` (if configured)
+6. IP validation (SSRF prevention)
+7. Processor injects secret (header, body, HMAC, SigV4, or OAuth)
+8. `ResponseScanLayer` wraps response with `ScanningBody` for leak detection
+9. `OverlapBuffer` (256-byte overlap) detects secrets spanning chunk boundaries
 
 ### Tower Middleware Stack
 ```rust
@@ -178,6 +180,21 @@ icebreaker seal    # Create sealed token
 icebreaker inspect # Inspect token metadata
 icebreaker sso     # Run OAuth orchestration service
 ```
+
+### Seal Options for Request Constraints
+
+```bash
+icebreaker seal --secret <SECRET> --allowed-hosts api.example.com --public-key <KEY> \
+    --allowed-methods GET,POST \
+    --allowed-paths /api/v1/users,/api/v1/items \
+    --allowed-path-pattern '/api/v[12]/.*'
+```
+
+| Option | Description |
+|--------|-------------|
+| `--allowed-methods` | Comma-separated HTTP methods (empty = all allowed) |
+| `--allowed-paths` | Comma-separated exact paths (empty = skip exact check) |
+| `--allowed-path-pattern` | Regex pattern for paths (auto-anchored, 10KB size limit) |
 
 ## Environment Variables
 

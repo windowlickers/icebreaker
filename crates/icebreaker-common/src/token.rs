@@ -6,6 +6,9 @@ use crate::config::ClockSkewConfig;
 
 /// Maximum compiled size for host pattern regex (10KB).
 const HOST_PATTERN_REGEX_SIZE_LIMIT: usize = 10 * 1024;
+
+/// Maximum compiled size for path pattern regex (10KB).
+const PATH_PATTERN_REGEX_SIZE_LIMIT: usize = 10 * 1024;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use zeroize::ZeroizeOnDrop;
 
@@ -201,6 +204,21 @@ pub struct TokenPayload {
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub oauth: Option<OAuthMetadata>,
 
+    /// Allowed HTTP methods this token can be used with.
+    #[zeroize(skip)]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub allowed_methods: Vec<String>,
+
+    /// Allowed request paths this token can be used with (exact match).
+    #[zeroize(skip)]
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub allowed_paths: Vec<String>,
+
+    /// Optional regex pattern for allowed request paths.
+    #[zeroize(skip)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub allowed_path_pattern: Option<String>,
+
     /// Optional replay protection configuration.
     ///
     /// When present, the proxy will track nonce usage and reject
@@ -218,6 +236,9 @@ impl std::fmt::Debug for TokenPayload {
             .field("auth", &self.auth)
             .field("allowed_hosts", &self.allowed_hosts)
             .field("allowed_host_pattern", &self.allowed_host_pattern)
+            .field("allowed_methods", &self.allowed_methods)
+            .field("allowed_paths", &self.allowed_paths)
+            .field("allowed_path_pattern", &self.allowed_path_pattern)
             .field("expires_at", &self.expires_at)
             .field("metadata", &self.metadata)
             .field("oauth", &self.oauth)
@@ -236,6 +257,9 @@ impl TokenPayload {
             auth: AuthConfig::default(),
             allowed_hosts: Vec::new(),
             allowed_host_pattern: None,
+            allowed_methods: Vec::new(),
+            allowed_paths: Vec::new(),
+            allowed_path_pattern: None,
             expires_at: None,
             metadata: None,
             oauth: None,
@@ -341,6 +365,65 @@ impl TokenPayload {
         })
     }
 
+    /// Validates that the given HTTP method is allowed.
+    pub fn validate_method(&self, method: &str) -> Result<()> {
+        if self.allowed_methods.is_empty() {
+            return Ok(());
+        }
+
+        if self
+            .allowed_methods
+            .iter()
+            .any(|m| m.eq_ignore_ascii_case(method))
+        {
+            return Ok(());
+        }
+
+        Err(crate::error::TokenizerError::MethodNotAllowed {
+            method: method.to_string(),
+        })
+    }
+
+    /// Validates that the given request path is allowed.
+    pub fn validate_path(&self, path: &str) -> Result<()> {
+        // If both exact list and pattern are unconstrained, allow all paths
+        if self.allowed_paths.is_empty() && self.allowed_path_pattern.is_none() {
+            return Ok(());
+        }
+
+        // Check explicit allowlist
+        if self.allowed_paths.iter().any(|p| p == path) {
+            return Ok(());
+        }
+
+        // Check pattern if provided
+        if let Some(ref pattern) = self.allowed_path_pattern {
+            let anchored = if pattern.starts_with('^') && pattern.ends_with('$') {
+                pattern.clone()
+            } else if pattern.starts_with('^') {
+                format!("{pattern}$")
+            } else if pattern.ends_with('$') {
+                format!("^{pattern}")
+            } else {
+                format!("^(?:{pattern})$")
+            };
+            let re = regex::RegexBuilder::new(&anchored)
+                .size_limit(PATH_PATTERN_REGEX_SIZE_LIMIT)
+                .dfa_size_limit(PATH_PATTERN_REGEX_SIZE_LIMIT)
+                .build()
+                .map_err(|e| {
+                    crate::error::TokenizerError::ConfigError(format!("invalid path pattern: {e}"))
+                })?;
+            if re.is_match(path) {
+                return Ok(());
+            }
+        }
+
+        Err(crate::error::TokenizerError::PathNotAllowed {
+            path: path.to_string(),
+        })
+    }
+
     /// Returns the secret value.
     ///
     /// This method provides controlled access to the secret. Use sparingly.
@@ -357,6 +440,9 @@ pub struct TokenPayloadBuilder {
     auth: AuthConfig,
     allowed_hosts: Vec<String>,
     allowed_host_pattern: Option<String>,
+    allowed_methods: Vec<String>,
+    allowed_paths: Vec<String>,
+    allowed_path_pattern: Option<String>,
     expires_at: Option<u64>,
     metadata: Option<TokenMetadata>,
     oauth: Option<OAuthMetadata>,
@@ -389,6 +475,41 @@ impl TokenPayloadBuilder {
     #[must_use]
     pub fn allowed_host_pattern(mut self, pattern: impl Into<String>) -> Self {
         self.allowed_host_pattern = Some(pattern.into());
+        self
+    }
+
+    /// Adds an allowed HTTP method.
+    #[must_use]
+    pub fn allowed_method(mut self, method: impl Into<String>) -> Self {
+        self.allowed_methods.push(method.into());
+        self
+    }
+
+    /// Sets the allowed HTTP methods.
+    #[must_use]
+    pub fn allowed_methods(mut self, methods: Vec<String>) -> Self {
+        self.allowed_methods = methods;
+        self
+    }
+
+    /// Adds an allowed request path.
+    #[must_use]
+    pub fn allowed_path(mut self, path: impl Into<String>) -> Self {
+        self.allowed_paths.push(path.into());
+        self
+    }
+
+    /// Sets the allowed request paths.
+    #[must_use]
+    pub fn allowed_paths(mut self, paths: Vec<String>) -> Self {
+        self.allowed_paths = paths;
+        self
+    }
+
+    /// Sets the allowed path pattern.
+    #[must_use]
+    pub fn allowed_path_pattern(mut self, pattern: impl Into<String>) -> Self {
+        self.allowed_path_pattern = Some(pattern.into());
         self
     }
 
@@ -429,6 +550,9 @@ impl TokenPayloadBuilder {
             auth: self.auth,
             allowed_hosts: self.allowed_hosts,
             allowed_host_pattern: self.allowed_host_pattern,
+            allowed_methods: self.allowed_methods,
+            allowed_paths: self.allowed_paths,
+            allowed_path_pattern: self.allowed_path_pattern,
             expires_at: self.expires_at,
             metadata: self.metadata,
             oauth: self.oauth,
@@ -970,6 +1094,164 @@ mod tests {
             result,
             Err(crate::error::TokenizerError::ConfigError(_))
         ));
+    }
+
+    #[test]
+    fn test_method_validation() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_method("GET")
+        .allowed_method("POST")
+        .build();
+
+        assert!(payload.validate_method("GET").is_ok());
+        assert!(payload.validate_method("POST").is_ok());
+        assert!(payload.validate_method("DELETE").is_err());
+        assert!(payload.validate_method("PUT").is_err());
+    }
+
+    #[test]
+    fn test_method_validation_case_insensitive() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_method("GET")
+        .build();
+
+        assert!(payload.validate_method("get").is_ok());
+        assert!(payload.validate_method("Get").is_ok());
+        assert!(payload.validate_method("GET").is_ok());
+    }
+
+    #[test]
+    fn test_method_validation_empty_allows_all() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .build();
+
+        assert!(payload.validate_method("GET").is_ok());
+        assert!(payload.validate_method("POST").is_ok());
+        assert!(payload.validate_method("DELETE").is_ok());
+    }
+
+    #[test]
+    fn test_path_validation_exact_match() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_path("/api/v1/users")
+        .allowed_path("/api/v1/items")
+        .build();
+
+        assert!(payload.validate_path("/api/v1/users").is_ok());
+        assert!(payload.validate_path("/api/v1/items").is_ok());
+        assert!(payload.validate_path("/api/v1/admin").is_err());
+        assert!(payload.validate_path("/other").is_err());
+    }
+
+    #[test]
+    fn test_path_validation_pattern() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_path_pattern(r"/api/v[12]/.*")
+        .build();
+
+        assert!(payload.validate_path("/api/v1/users").is_ok());
+        assert!(payload.validate_path("/api/v2/items").is_ok());
+        assert!(payload.validate_path("/admin").is_err());
+    }
+
+    #[test]
+    fn test_path_pattern_auto_anchoring() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_path_pattern(r"/api/v1/users")
+        .build();
+
+        // Exact match should work
+        assert!(payload.validate_path("/api/v1/users").is_ok());
+        // Should not match paths with extra prefix or suffix
+        assert!(payload.validate_path("/evil/api/v1/users").is_err());
+        assert!(payload.validate_path("/api/v1/users/admin").is_err());
+    }
+
+    #[test]
+    fn test_path_validation_empty_allows_all() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .build();
+
+        assert!(payload.validate_path("/any/path").is_ok());
+        assert!(payload.validate_path("/").is_ok());
+    }
+
+    #[test]
+    fn test_path_validation_exact_and_pattern_combined() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_path("/health")
+        .allowed_path_pattern(r"/api/.*")
+        .build();
+
+        // Exact match works
+        assert!(payload.validate_path("/health").is_ok());
+        // Pattern match works
+        assert!(payload.validate_path("/api/v1/users").is_ok());
+        // Neither matches
+        assert!(payload.validate_path("/admin").is_err());
+    }
+
+    #[test]
+    fn test_path_pattern_rejects_oversized_regex() {
+        let huge_pattern = format!("({})?", "a|b|c|d|e|f|g|h|i|j").repeat(50);
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_path_pattern(&huge_pattern)
+        .build();
+
+        let result = payload.validate_path("/test");
+        assert!(matches!(
+            result,
+            Err(crate::error::TokenizerError::ConfigError(_))
+        ));
+    }
+
+    #[test]
+    fn test_backward_compat_without_new_fields() {
+        // Simulates deserializing an old token without method/path fields
+        let json = r#"{
+            "secret": "test-secret",
+            "processor": {"type": "inject", "header_name": "Authorization", "prefix": "Bearer "},
+            "auth": {"type": "none"},
+            "allowed_hosts": ["api.example.com"],
+            "expires_at": null,
+            "metadata": null
+        }"#;
+
+        let payload: TokenPayload = serde_json::from_str(json).expect("should deserialize");
+        assert!(payload.allowed_methods.is_empty());
+        assert!(payload.allowed_paths.is_empty());
+        assert!(payload.allowed_path_pattern.is_none());
+
+        // Should allow everything
+        assert!(payload.validate_method("GET").is_ok());
+        assert!(payload.validate_path("/any").is_ok());
     }
 
     // Clock skew tolerance tests

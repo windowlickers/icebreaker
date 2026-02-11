@@ -31,8 +31,8 @@ use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 use icebreaker_nonce::{CheckResult, NonceStore};
 
 use crate::metrics::{
-    record_host_rejection, record_processor_used, record_replay_attempt, record_token_validation,
-    TokenValidationResult,
+    record_host_rejection, record_method_rejection, record_path_rejection, record_processor_used,
+    record_replay_attempt, record_token_validation, TokenValidationResult,
 };
 use crate::middleware::response_scan::ScanPatterns;
 use crate::processor::{create_processor, validate_processor_config};
@@ -376,6 +376,22 @@ where
             if let Err(e) = payload.validate_host(&host) {
                 record_token_validation(TokenValidationResult::HostValidationFailed);
                 record_host_rejection(&host);
+                return Err(e);
+            }
+
+            // Validate HTTP method
+            let method = request.method().as_str();
+            if let Err(e) = payload.validate_method(method) {
+                record_token_validation(TokenValidationResult::MethodValidationFailed);
+                record_method_rejection(method);
+                return Err(e);
+            }
+
+            // Validate request path
+            let path = request.uri().path();
+            if let Err(e) = payload.validate_path(path) {
+                record_token_validation(TokenValidationResult::PathValidationFailed);
+                record_path_rejection(path);
                 return Err(e);
             }
 
@@ -911,6 +927,106 @@ mod tests {
         if let Err(TokenizerError::InvalidPayload(msg)) = result {
             assert!(msg.contains("no host"));
         }
+    }
+
+    #[tokio::test]
+    async fn test_method_validation_rejection() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload that only allows GET
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .allowed_method("GET")
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // POST request should fail
+        let request = Request::builder()
+            .method(http::Method::POST)
+            .uri("https://api.example.com/data")
+            .header(
+                TOKEN_HEADER,
+                sealed_token.to_header().expect("token serialization"),
+            )
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(matches!(
+            result,
+            Err(TokenizerError::MethodNotAllowed { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_path_validation_rejection() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload that only allows /api paths
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .allowed_path("/api/v1/users")
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Request to a different path should fail
+        let request = Request::builder()
+            .uri("https://api.example.com/admin")
+            .header(
+                TOKEN_HEADER,
+                sealed_token.to_header().expect("token serialization"),
+            )
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(matches!(result, Err(TokenizerError::PathNotAllowed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_unconstrained_method_and_path_passes() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+
+        // Create a payload with no method/path constraints
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        // Any method and path should work
+        let request = Request::builder()
+            .method(http::Method::DELETE)
+            .uri("https://api.example.com/any/path/here")
+            .header(
+                TOKEN_HEADER,
+                sealed_token.to_header().expect("token serialization"),
+            )
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(result.is_ok());
     }
 
     mod scan_patterns {

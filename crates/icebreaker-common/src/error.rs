@@ -29,6 +29,20 @@ pub enum TokenizerError {
         host: String,
     },
 
+    /// The HTTP method is not allowed by the token.
+    #[error("method not allowed: {method}")]
+    MethodNotAllowed {
+        /// The disallowed HTTP method.
+        method: String,
+    },
+
+    /// The request path is not allowed by the token.
+    #[error("path not allowed: {path}")]
+    PathNotAllowed {
+        /// The disallowed request path.
+        path: String,
+    },
+
     /// The target IP address is blocked by network protection.
     #[error("blocked IP address: {ip} ({reason})")]
     BlockedAddress {
@@ -128,6 +142,8 @@ impl TokenizerError {
             Self::TokenExpired => "token expired",
             Self::InvalidPayload(_) => "invalid token",
             Self::HostNotAllowed { .. } => "destination not allowed",
+            Self::MethodNotAllowed { .. } => "request not allowed",
+            Self::PathNotAllowed { .. } => "request not allowed",
             Self::BlockedAddress { .. } => "destination not allowed",
             Self::ProxyAuthRequired { .. } => "proxy authentication required",
             Self::SecretLeakDetected => "request blocked",
@@ -168,6 +184,8 @@ impl TokenizerError {
             self,
             Self::InvalidPayload(_)
                 | Self::HostNotAllowed { .. }
+                | Self::MethodNotAllowed { .. }
+                | Self::PathNotAllowed { .. }
                 | Self::BlockedAddress { .. }
                 | Self::TokenExpired
                 | Self::DecryptionError(_)
@@ -184,6 +202,8 @@ impl TokenizerError {
             Self::SecretLeakDetected
                 | Self::DecryptionError(_)
                 | Self::HostNotAllowed { .. }
+                | Self::MethodNotAllowed { .. }
+                | Self::PathNotAllowed { .. }
                 | Self::BlockedAddress { .. }
                 | Self::ProxyAuthRequired { .. }
                 | Self::TokenReplayDetected { .. }
@@ -312,6 +332,44 @@ mod tests {
         let display = error.to_string();
         assert!(display.contains("192.168.1.1"));
         assert!(display.contains("private network"));
+    }
+
+    #[test]
+    fn test_method_not_allowed_error() {
+        let error = TokenizerError::MethodNotAllowed {
+            method: "DELETE".into(),
+        };
+
+        // Client message should not expose the method
+        assert_eq!(error.client_message(), "request not allowed");
+        assert!(!error.client_message().contains("DELETE"));
+
+        // Display should contain the method for logging
+        assert!(error.to_string().contains("DELETE"));
+
+        // Should be a client error and security error
+        assert!(error.is_client_error());
+        assert!(error.is_security_error());
+        assert!(!error.is_retryable());
+    }
+
+    #[test]
+    fn test_path_not_allowed_error() {
+        let error = TokenizerError::PathNotAllowed {
+            path: "/admin/secrets".into(),
+        };
+
+        // Client message should not expose the path
+        assert_eq!(error.client_message(), "request not allowed");
+        assert!(!error.client_message().contains("/admin"));
+
+        // Display should contain the path for logging
+        assert!(error.to_string().contains("/admin/secrets"));
+
+        // Should be a client error and security error
+        assert!(error.is_client_error());
+        assert!(error.is_security_error());
+        assert!(!error.is_retryable());
     }
 
     #[test]
