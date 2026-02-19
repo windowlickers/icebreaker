@@ -43,6 +43,13 @@ futures = { workspace = true }
 # For throughput benchmarks
 wiremock = { workspace = true }
 
+# Allocation profiling
+dhat = { workspace = true }
+
+[[bench]]
+name = "allocation_benchmarks"
+harness = false
+
 [[bench]]
 name = "crypto_benchmarks"
 harness = false

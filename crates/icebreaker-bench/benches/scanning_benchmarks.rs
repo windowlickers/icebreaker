@@ -307,6 +307,49 @@ fn bench_scan_chunk_sizes(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmarks scan pattern generation for various secret types.
+///
+/// This measures the cost of `generate_scan_patterns()`, which creates
+/// 6-7 encoded variants per secret on every request.
+fn bench_generate_scan_patterns(c: &mut Criterion) {
+    use icebreaker_proxy::generate_scan_patterns;
+
+    let mut group = c.benchmark_group("generate_scan_patterns");
+
+    // Short secret (below 8-char threshold, returns early)
+    group.bench_function("short_5char", |b| {
+        b.iter(|| black_box(generate_scan_patterns(black_box("abc12"))))
+    });
+
+    // Typical API key (alphanumeric, no URL encoding changes)
+    group.bench_function("api_key_22char", |b| {
+        b.iter(|| black_box(generate_scan_patterns(black_box("sk_live_abcdef12345678"))))
+    });
+
+    // Secret with special chars (triggers URL encoding + HTML entities)
+    group.bench_function("special_chars", |b| {
+        b.iter(|| {
+            black_box(generate_scan_patterns(black_box(
+                "api-key=value&token<>\"test'",
+            )))
+        })
+    });
+
+    // Large JWT-like secret (big base64/hex output)
+    let jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.\
+               eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4g\
+               RG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.\
+               POstGetfAytaZS82wHcjoTyoqhMyxXiWdR7Nn7A29DNSl0Ei\
+               XLdwJ6xC6AfgZWF1bOsS_TuYI3OG85AmiExREkrS6tDfTQ2\
+               B3WXlrr-wp5AokiRbz3_oB4OxG-W9KcEEbDRcZc0nH3L7Lz\
+               Yp1PtAylQGxHTWZXtGz4ht0bAecBgmpdgXMguEIcoqPJ1n3p";
+    group.bench_function("jwt_300char", |b| {
+        b.iter(|| black_box(generate_scan_patterns(black_box(jwt))))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     scanning_benches,
     bench_overlap_buffer_process,
@@ -319,6 +362,7 @@ criterion_group!(
     bench_scanning_body,
     bench_scanning_body_chunked,
     bench_scan_chunk_sizes,
+    bench_generate_scan_patterns,
 );
 
 criterion_main!(scanning_benches);

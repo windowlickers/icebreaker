@@ -13,4 +13,6 @@ pub use response_scan::{
     DynamicResponseScanLayer, DynamicResponseScanService, ResponseScanLayer, ResponseScanService,
     ScanPatterns,
 };
-pub use token_injection::{TokenInjectionLayer, TokenInjectionService, TOKEN_HEADER};
+pub use token_injection::{
+    generate_scan_patterns, TokenInjectionLayer, TokenInjectionService, TOKEN_HEADER,
+};

@@ -264,6 +264,134 @@ fn bench_token_payload_host_validation(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmarks TokenPayload method validation.
+///
+/// This exposes the cost of method matching including the case-insensitive
+/// comparison and the fast path for unconstrained tokens.
+fn bench_token_payload_method_validation(c: &mut Criterion) {
+    let payload_unconstrained = icebreaker_common::TokenPayload::builder(
+        secrecy::SecretString::from("secret"),
+        icebreaker_common::ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer(
+            "Authorization",
+        )),
+    )
+    .build();
+
+    let payload_single = icebreaker_common::TokenPayload::builder(
+        secrecy::SecretString::from("secret"),
+        icebreaker_common::ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer(
+            "Authorization",
+        )),
+    )
+    .allowed_method("GET")
+    .build();
+
+    let payload_multiple = icebreaker_common::TokenPayload::builder(
+        secrecy::SecretString::from("secret"),
+        icebreaker_common::ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer(
+            "Authorization",
+        )),
+    )
+    .allowed_method("GET")
+    .allowed_method("POST")
+    .allowed_method("PUT")
+    .allowed_method("DELETE")
+    .build();
+
+    let mut group = c.benchmark_group("token_payload_method_validation");
+
+    group.bench_function("unconstrained", |b| {
+        b.iter(|| black_box(payload_unconstrained.validate_method(black_box("DELETE"))))
+    });
+
+    group.bench_function("single_match", |b| {
+        b.iter(|| black_box(payload_single.validate_method(black_box("GET"))))
+    });
+
+    group.bench_function("single_no_match", |b| {
+        b.iter(|| black_box(payload_single.validate_method(black_box("POST"))))
+    });
+
+    group.bench_function("multiple_last_match", |b| {
+        b.iter(|| black_box(payload_multiple.validate_method(black_box("DELETE"))))
+    });
+
+    group.finish();
+}
+
+/// Benchmarks TokenPayload path validation.
+///
+/// This exposes the per-call regex compilation cost in `validate_path`
+/// when a path pattern is configured.
+fn bench_token_payload_path_validation(c: &mut Criterion) {
+    let payload_unconstrained = icebreaker_common::TokenPayload::builder(
+        secrecy::SecretString::from("secret"),
+        icebreaker_common::ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer(
+            "Authorization",
+        )),
+    )
+    .build();
+
+    let payload_exact = icebreaker_common::TokenPayload::builder(
+        secrecy::SecretString::from("secret"),
+        icebreaker_common::ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer(
+            "Authorization",
+        )),
+    )
+    .allowed_path("/api/v1/users")
+    .allowed_path("/api/v1/items")
+    .allowed_path("/api/v1/orders")
+    .build();
+
+    let payload_pattern = icebreaker_common::TokenPayload::builder(
+        secrecy::SecretString::from("secret"),
+        icebreaker_common::ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer(
+            "Authorization",
+        )),
+    )
+    .allowed_path_pattern(r"/api/v[12]/.*")
+    .build();
+
+    let payload_combined = icebreaker_common::TokenPayload::builder(
+        secrecy::SecretString::from("secret"),
+        icebreaker_common::ProcessorConfig::Inject(icebreaker_common::InjectConfig::bearer(
+            "Authorization",
+        )),
+    )
+    .allowed_path("/health")
+    .allowed_path("/ready")
+    .allowed_path_pattern(r"/api/v[12]/.*")
+    .build();
+
+    let mut group = c.benchmark_group("token_payload_path_validation");
+
+    group.bench_function("unconstrained", |b| {
+        b.iter(|| black_box(payload_unconstrained.validate_path(black_box("/any/path"))))
+    });
+
+    group.bench_function("exact_match", |b| {
+        b.iter(|| black_box(payload_exact.validate_path(black_box("/api/v1/users"))))
+    });
+
+    group.bench_function("pattern_match", |b| {
+        b.iter(|| black_box(payload_pattern.validate_path(black_box("/api/v1/users"))))
+    });
+
+    group.bench_function("pattern_no_match", |b| {
+        b.iter(|| black_box(payload_pattern.validate_path(black_box("/admin/panel"))))
+    });
+
+    group.bench_function("combined_exact_hit", |b| {
+        b.iter(|| black_box(payload_combined.validate_path(black_box("/health"))))
+    });
+
+    group.bench_function("combined_pattern_fallthrough", |b| {
+        b.iter(|| black_box(payload_combined.validate_path(black_box("/api/v2/widgets"))))
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     middleware_benches,
     bench_host_validation_exact,
@@ -274,6 +402,8 @@ criterion_group!(
     bench_rate_limiter_clear,
     bench_token_crypto_pipeline,
     bench_token_payload_host_validation,
+    bench_token_payload_method_validation,
+    bench_token_payload_path_validation,
 );
 
 criterion_main!(middleware_benches);

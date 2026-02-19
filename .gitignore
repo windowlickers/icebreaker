@@ -19,3 +19,4 @@ target/
 
 .direnv
 result
+dhat-heap.json

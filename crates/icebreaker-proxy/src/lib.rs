@@ -23,8 +23,8 @@ pub mod tunnel;
 // Re-exports for convenience
 pub use body::{OverlapBuffer, ScanningBody, SecretScannerConfig, StreamScanner};
 pub use middleware::{
-    DynamicResponseScanLayer, HostValidationConfig, HostValidationLayer, MetricsLayer,
-    MetricsService, RateLimitLayer, RateLimiter, ResponseScanLayer, ScanPatterns,
+    generate_scan_patterns, DynamicResponseScanLayer, HostValidationConfig, HostValidationLayer,
+    MetricsLayer, MetricsService, RateLimitLayer, RateLimiter, ResponseScanLayer, ScanPatterns,
     TokenInjectionLayer, TOKEN_HEADER,
 };
 pub use network::{BlockReason, IpFilter, ValidatingConnector, ValidatingStream};

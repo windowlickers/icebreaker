@@ -67,7 +67,7 @@ fn encode_html_entities(s: &str) -> Option<String> {
 /// Returns patterns for: raw bytes, base64 standard, base64 URL-safe, URL-encoded,
 /// hex lowercase, hex uppercase, and HTML entities.
 /// Short secrets (< 8 chars) only return the raw pattern to avoid false positives.
-fn generate_scan_patterns(secret: &str) -> Vec<Vec<u8>> {
+pub fn generate_scan_patterns(secret: &str) -> Vec<Vec<u8>> {
     let raw = secret.as_bytes().to_vec();
 
     // Skip very short secrets to avoid false positives

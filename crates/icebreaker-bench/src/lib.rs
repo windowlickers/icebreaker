@@ -54,6 +54,27 @@ pub fn generate_random_bytes(size: usize) -> Vec<u8> {
     bytes
 }
 
+/// Creates a test token payload with all constraints for validation benchmarks.
+///
+/// Includes allowed_hosts, allowed_methods, allowed_paths, and
+/// allowed_path_pattern to exercise the full validation gauntlet.
+pub fn create_constrained_payload(secret: &str) -> TokenPayload {
+    TokenPayload::builder(
+        SecretString::from(secret),
+        ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+    )
+    .allowed_host("api.example.com")
+    .allowed_host("api.staging.example.com")
+    .allowed_method("GET")
+    .allowed_method("POST")
+    .allowed_method("PUT")
+    .allowed_path("/api/v1/users")
+    .allowed_path("/api/v1/items")
+    .allowed_path("/api/v1/orders")
+    .allowed_path_pattern(r"/api/v[12]/.*")
+    .build()
+}
+
 /// Payload sizes for benchmarking.
 pub const PAYLOAD_SIZES: &[usize] = &[100, 1024, 10 * 1024];
 

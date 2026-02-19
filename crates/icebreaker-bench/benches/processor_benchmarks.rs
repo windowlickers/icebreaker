@@ -6,7 +6,8 @@ use http::Request;
 
 use icebreaker_bench::create_test_crypto;
 use icebreaker_common::{
-    HmacConfig, InjectBodyConfig, InjectConfig, ProcessorConfig, Sigv4Config, TokenPayload,
+    HmacConfig, InjectBodyConfig, InjectConfig, MultiProcessorConfig, OAuthConfig, OAuthMetadata,
+    ProcessorConfig, Sigv4Config, TokenPayload,
 };
 use icebreaker_proxy::{
     create_processor, HmacProcessor, InjectBodyProcessor, InjectProcessor, RequestProcessor,
@@ -462,6 +463,131 @@ fn bench_processor_comparison(c: &mut Criterion) {
     group.finish();
 }
 
+// ============================================================================
+// Multi Processor Benchmarks
+// ============================================================================
+
+/// Benchmarks multi-processor chaining with varying processor counts.
+fn bench_multi_processor(c: &mut Criterion) {
+    let mut group = c.benchmark_group("multi_processor");
+
+    // 2 header processors (Inject + Inject)
+    let multi_2_config = ProcessorConfig::Multi(MultiProcessorConfig {
+        processors: vec![
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            ProcessorConfig::Inject(InjectConfig::raw("X-Api-Key")),
+        ],
+    });
+    let multi_2_processor = create_processor(&multi_2_config);
+    let multi_2_payload = create_payload("my-secret-api-key", multi_2_config);
+
+    group.bench_function("2_header_processors", |b| {
+        b.iter(|| {
+            let request = Request::builder()
+                .uri("https://api.example.com/v1/data")
+                .body(())
+                .unwrap();
+            black_box(multi_2_processor.process(black_box(request), black_box(&multi_2_payload)))
+        })
+    });
+
+    // 3 header processors (Inject + Inject + HMAC)
+    let multi_3_config = ProcessorConfig::Multi(MultiProcessorConfig {
+        processors: vec![
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            ProcessorConfig::Inject(InjectConfig::raw("X-Api-Key")),
+            ProcessorConfig::InjectHmac(HmacConfig::default()),
+        ],
+    });
+    let multi_3_processor = create_processor(&multi_3_config);
+    let multi_3_payload = create_payload("hmac-secret-key-for-signing-32b!", multi_3_config);
+
+    group.bench_function("3_header_processors", |b| {
+        b.iter(|| {
+            let request = Request::builder()
+                .method("POST")
+                .uri("https://api.example.com/v1/webhook")
+                .header("Host", "api.example.com")
+                .header("Content-Type", "application/json")
+                .body(())
+                .unwrap();
+            black_box(multi_3_processor.process(black_box(request), black_box(&multi_3_payload)))
+        })
+    });
+
+    // create_processor for Multi config (measures Vec allocation cost)
+    let factory_config = ProcessorConfig::Multi(MultiProcessorConfig {
+        processors: vec![
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            ProcessorConfig::Inject(InjectConfig::raw("X-Api-Key")),
+            ProcessorConfig::InjectHmac(HmacConfig::default()),
+        ],
+    });
+
+    group.bench_function("create_multi_3", |b| {
+        b.iter(|| black_box(create_processor(black_box(&factory_config))))
+    });
+
+    group.finish();
+}
+
+// ============================================================================
+// OAuth Processor Benchmarks
+// ============================================================================
+
+/// Benchmarks the OAuthProcessor with various configurations.
+fn bench_oauth_processor(c: &mut Criterion) {
+    use icebreaker_proxy::{OAuthProcessor, RequestProcessor};
+
+    let config = OAuthConfig::default();
+    let processor = OAuthProcessor::new(config.clone());
+
+    let mut group = c.benchmark_group("oauth_processor");
+
+    // Simple injection (no OAuth metadata)
+    let simple_payload = create_payload(
+        "oauth-access-token-12345",
+        ProcessorConfig::OAuth(config.clone()),
+    );
+
+    group.bench_function("simple_no_metadata", |b| {
+        b.iter(|| {
+            let request = Request::builder()
+                .uri("https://api.example.com/v1/data")
+                .body(())
+                .unwrap();
+            black_box(processor.process(black_box(request), black_box(&simple_payload)))
+        })
+    });
+
+    // With expiry check (non-expired token with OAuthMetadata)
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let oauth_metadata = OAuthMetadata::new("google").with_expires_at(now + 60);
+
+    let payload_with_metadata = TokenPayload::builder(
+        SecretString::from("valid-access-token-12345"),
+        ProcessorConfig::OAuth(config),
+    )
+    .oauth(oauth_metadata)
+    .allowed_host("api.example.com")
+    .build();
+
+    group.bench_function("with_expiry_check", |b| {
+        b.iter(|| {
+            let request = Request::builder()
+                .uri("https://api.example.com/v1/data")
+                .body(())
+                .unwrap();
+            black_box(processor.process(black_box(request), black_box(&payload_with_metadata)))
+        })
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     processor_benches,
     bench_inject_processor,
@@ -473,6 +599,8 @@ criterion_group!(
     bench_processor_dispatch,
     bench_create_processor,
     bench_processor_comparison,
+    bench_multi_processor,
+    bench_oauth_processor,
 );
 
 criterion_main!(processor_benches);

@@ -11,7 +11,8 @@ use http_body_util::BodyExt;
 
 use http::Request;
 use icebreaker_bench::{
-    create_test_crypto, create_test_payload_with_secret, generate_random_bytes,
+    create_constrained_payload, create_test_crypto, create_test_payload_with_secret,
+    generate_random_bytes,
 };
 use icebreaker_common::{
     HmacAlgorithm, InjectConfig, NetworkProtectionConfig, ProcessorConfig, RateLimitConfig,
@@ -19,8 +20,8 @@ use icebreaker_common::{
 };
 use icebreaker_crypto::{CanonicalRequestBuilder, RequestSigner};
 use icebreaker_proxy::{
-    create_processor, HostValidationConfig, IpFilter, OverlapBuffer, RateLimiter, ScanningBody,
-    StreamScanner,
+    create_processor, generate_scan_patterns, HostValidationConfig, IpFilter, OverlapBuffer,
+    RateLimiter, ScanningBody, StreamScanner,
 };
 use secrecy::SecretString;
 use std::net::IpAddr;
@@ -139,9 +140,9 @@ fn bench_response_pipeline(c: &mut Criterion) {
         .build()
         .unwrap();
 
-    // Simulate a real API response
+    // Use realistic scan patterns (6-7 encoded variants)
     let secret = "sk_live_abcdef123456789";
-    let patterns = vec![secret.as_bytes().to_vec()];
+    let patterns = generate_scan_patterns(secret);
 
     let response_sizes = [1024, 8 * 1024, 64 * 1024, 256 * 1024];
 
@@ -204,7 +205,7 @@ fn bench_full_request_cycle(c: &mut Criterion) {
 
     let host_config = HostValidationConfig::new().allow_host("api.example.com");
     let inject_config = InjectConfig::bearer("Authorization");
-    let patterns = vec![secret.as_bytes().to_vec()];
+    let patterns = generate_scan_patterns(secret);
 
     let rate_config = RateLimitConfig {
         max_requests: 10000,
@@ -489,7 +490,7 @@ fn bench_full_cycle_with_network(c: &mut Criterion) {
     let host_config = HostValidationConfig::new().allow_host("api.example.com");
     let inject_config = InjectConfig::bearer("Authorization");
     let ip_filter = IpFilter::new(&NetworkProtectionConfig::default()).unwrap();
-    let patterns = vec![secret.as_bytes().to_vec()];
+    let patterns = generate_scan_patterns(secret);
 
     let rate_config = RateLimitConfig {
         max_requests: 10000,
@@ -520,6 +521,68 @@ fn bench_full_cycle_with_network(c: &mut Criterion) {
                 let _header = inject_config.format_value(payload.expose_secret());
 
                 // 6. Scan response body
+                let body = http_body_util::Full::new(Bytes::from(response_body.clone()));
+                let scanning = ScanningBody::new(body, patterns.clone());
+                black_box(scanning.collect().await)
+            })
+        })
+    });
+}
+
+/// Benchmarks full cycle with all token constraints enabled.
+///
+/// This exercises the complete validation gauntlet: hosts + methods + paths
+/// + path pattern + realistic scan patterns.
+fn bench_full_cycle_with_all_constraints(c: &mut Criterion) {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let crypto = create_test_crypto();
+    let secret = "sk_live_abcdef123456789";
+    let payload = create_constrained_payload(secret);
+    let sealed = crypto.seal(&payload).unwrap();
+
+    let inject_config = InjectConfig::bearer("Authorization");
+    let ip_filter = IpFilter::new(&NetworkProtectionConfig::default()).unwrap();
+    let patterns = generate_scan_patterns(secret);
+
+    let rate_config = RateLimitConfig {
+        max_requests: 10000,
+        period: Duration::from_secs(60),
+        burst: 1000,
+    };
+    let rate_limiter = RateLimiter::new(rate_config);
+
+    let response_body = generate_random_bytes(4096);
+    let target_ip: IpAddr = "8.8.8.8".parse().unwrap();
+
+    c.bench_function("full_cycle_all_constraints_4kb", |b| {
+        b.iter(|| {
+            rt.block_on(async {
+                // 1. Rate limit check
+                rate_limiter.check(black_box("client-ip")).await;
+
+                // 2. Unseal token
+                let payload = crypto.unseal(black_box(&sealed)).unwrap();
+
+                // 3. Validate host
+                payload.validate_host(black_box("api.example.com")).unwrap();
+
+                // 4. Validate method
+                payload.validate_method(black_box("GET")).unwrap();
+
+                // 5. Validate path (exercises regex compilation)
+                payload.validate_path(black_box("/api/v1/users")).unwrap();
+
+                // 6. Validate IP (SSRF prevention)
+                ip_filter.validate_ip(black_box(&target_ip)).unwrap();
+
+                // 7. Format header (simulates injection)
+                let _header = inject_config.format_value(payload.expose_secret());
+
+                // 8. Scan response body
                 let body = http_body_util::Full::new(Bytes::from(response_body.clone()));
                 let scanning = ScanningBody::new(body, patterns.clone());
                 black_box(scanning.collect().await)
@@ -597,6 +660,7 @@ criterion_group!(
     bench_sigv4_pipeline,
     bench_network_protection_pipeline,
     bench_full_cycle_with_network,
+    bench_full_cycle_with_all_constraints,
     bench_processor_overhead_comparison,
 );
 
