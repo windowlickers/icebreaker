@@ -189,7 +189,7 @@ Icebreaker supports multiple credential injection methods:
 ## Kubernetes Deployment
 
 ```bash
-helm install icebreaker deploy/helm/icebreaker \
+helm install icebreaker helm/icebreaker \
   --set icebreaker.existingSecret="my-secret"
 ```
 
