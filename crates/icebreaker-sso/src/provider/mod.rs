@@ -18,8 +18,6 @@ pub use google::GoogleProfile;
 pub use microsoft::MicrosoftProfile;
 pub use profile::{OAuthErrorResponse, ProviderProfile, TokenResponse};
 
-use std::collections::HashMap;
-
 /// Built-in provider profile types.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinProfile {
@@ -60,23 +58,16 @@ impl BuiltinProfile {
 
 /// Registry of provider profiles.
 #[derive(Debug)]
-pub struct ProviderRegistry {
-    /// Custom profiles (not implemented yet, placeholder for extensibility).
-    _custom_profiles: HashMap<String, ()>,
-}
+pub struct ProviderRegistry;
 
 impl ProviderRegistry {
     /// Creates a new provider registry with built-in profiles.
     #[must_use]
     pub fn new() -> Self {
-        Self {
-            _custom_profiles: HashMap::new(),
-        }
+        Self
     }
 
     /// Gets a provider profile by name.
-    ///
-    /// First checks built-in profiles, then custom profiles.
     #[must_use]
     pub fn get(&self, name: &str) -> Option<Box<dyn ProviderProfile + Send + Sync>> {
         BuiltinProfile::from_name(name).map(|b| b.profile())
