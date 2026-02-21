@@ -1501,27 +1501,37 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Parse allowed methods
-    if let Some(ref methods) = args.allowed_methods {
-        let method_list: Vec<String> = methods
-            .split(',')
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !method_list.is_empty() {
-            println!("Allowed methods: {}", method_list.join(", "));
-        }
+    let method_list: Vec<String> = args
+        .allowed_methods
+        .as_deref()
+        .map(|methods| {
+            methods
+                .split(',')
+                .map(|s| s.trim().to_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !method_list.is_empty() {
+        println!("Allowed methods: {}", method_list.join(", "));
     }
 
     // Parse allowed paths
-    if let Some(ref paths) = args.allowed_paths {
-        let path_list: Vec<String> = paths
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !path_list.is_empty() {
-            println!("Allowed paths: {}", path_list.join(", "));
-        }
+    let path_list: Vec<String> = args
+        .allowed_paths
+        .as_deref()
+        .map(|paths| {
+            paths
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if !path_list.is_empty() {
+        println!("Allowed paths: {}", path_list.join(", "));
     }
 
     if let Some(ref pattern) = args.allowed_path_pattern {
@@ -1532,26 +1542,12 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mut builder = TokenPayload::builder(SecretString::from(args.secret), processor_config)
         .allowed_hosts(allowed_hosts);
 
-    if let Some(ref methods) = args.allowed_methods {
-        let method_list: Vec<String> = methods
-            .split(',')
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !method_list.is_empty() {
-            builder = builder.allowed_methods(method_list);
-        }
+    if !method_list.is_empty() {
+        builder = builder.allowed_methods(method_list);
     }
 
-    if let Some(ref paths) = args.allowed_paths {
-        let path_list: Vec<String> = paths
-            .split(',')
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !path_list.is_empty() {
-            builder = builder.allowed_paths(path_list);
-        }
+    if !path_list.is_empty() {
+        builder = builder.allowed_paths(path_list);
     }
 
     if let Some(pattern) = args.allowed_path_pattern {
