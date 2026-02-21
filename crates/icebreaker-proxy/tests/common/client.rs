@@ -1,10 +1,10 @@
 //! Test client infrastructure for mTLS integration tests.
 
-use std::io::{BufReader, Cursor};
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::RootCertStore;
+use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
@@ -84,10 +84,10 @@ fn create_client_config(
     client_cert: Option<&GeneratedCert>,
 ) -> rustls::ClientConfig {
     // Parse CA certificate
-    let mut ca_reader = BufReader::new(Cursor::new(ca.ca_cert_pem.as_bytes()));
-    let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_reader)
-        .filter_map(|r| r.ok())
-        .collect();
+    let ca_certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(ca.ca_cert_pem.as_bytes())
+            .filter_map(|r| r.ok())
+            .collect();
 
     let mut root_store = RootCertStore::empty();
     for cert in ca_certs {
@@ -99,14 +99,14 @@ fn create_client_config(
     match client_cert {
         Some(cert) => {
             // Parse client certificate
-            let mut cert_reader = BufReader::new(Cursor::new(cert.cert_pem.as_bytes()));
-            let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-                .filter_map(|r| r.ok())
-                .collect();
+            let certs: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_slice_iter(cert.cert_pem.as_bytes())
+                    .filter_map(|r| r.ok())
+                    .collect();
 
             // Parse client private key
-            let mut key_reader = BufReader::new(Cursor::new(cert.key_pem.as_bytes()));
-            let key = read_private_key(&mut key_reader).expect("failed to parse client key");
+            let key = PrivateKeyDer::from_pem_slice(cert.key_pem.as_bytes())
+                .expect("failed to parse client key");
 
             builder
                 .with_client_auth_cert(certs, key)
@@ -114,23 +114,6 @@ fn create_client_config(
         }
         None => builder.with_no_client_auth(),
     }
-}
-
-fn read_private_key<R: std::io::BufRead>(reader: &mut R) -> Option<PrivateKeyDer<'static>> {
-    let items: Vec<_> = rustls_pemfile::read_all(reader)
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for item in items {
-        match item {
-            rustls_pemfile::Item::Pkcs1Key(key) => return Some(PrivateKeyDer::Pkcs1(key)),
-            rustls_pemfile::Item::Pkcs8Key(key) => return Some(PrivateKeyDer::Pkcs8(key)),
-            rustls_pemfile::Item::Sec1Key(key) => return Some(PrivateKeyDer::Sec1(key)),
-            _ => continue,
-        }
-    }
-
-    None
 }
 
 fn parse_http_response(response: &str) -> Result<HttpResponse, String> {

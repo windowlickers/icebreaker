@@ -1,12 +1,12 @@
 //! Test server infrastructure for mTLS integration tests.
 
-use std::io::{BufReader, Cursor};
 use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
+use rustls_pki_types::pem::PemObject;
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tokio_rustls::TlsAcceptor;
@@ -80,14 +80,14 @@ fn create_tls_acceptor(
     client_auth: ClientAuthMode,
 ) -> TlsAcceptor {
     // Parse server certificate
-    let mut cert_reader = BufReader::new(Cursor::new(server_cert.cert_pem.as_bytes()));
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-        .filter_map(|r| r.ok())
-        .collect();
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(server_cert.cert_pem.as_bytes())
+            .filter_map(|r| r.ok())
+            .collect();
 
     // Parse server private key
-    let mut key_reader = BufReader::new(Cursor::new(server_cert.key_pem.as_bytes()));
-    let key = read_private_key(&mut key_reader).expect("failed to parse server key");
+    let key = PrivateKeyDer::from_pem_slice(server_cert.key_pem.as_bytes())
+        .expect("failed to parse server key");
 
     let server_config = match client_auth {
         ClientAuthMode::None => rustls::ServerConfig::builder()
@@ -96,10 +96,10 @@ fn create_tls_acceptor(
             .expect("failed to create server config"),
         ClientAuthMode::Optional | ClientAuthMode::Required => {
             // Parse CA certificate for client verification
-            let mut ca_reader = BufReader::new(Cursor::new(ca.ca_cert_pem.as_bytes()));
-            let ca_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_reader)
-                .filter_map(|r| r.ok())
-                .collect();
+            let ca_certs: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_slice_iter(ca.ca_cert_pem.as_bytes())
+                    .filter_map(|r| r.ok())
+                    .collect();
 
             let mut root_store = RootCertStore::empty();
             for cert in ca_certs {
@@ -125,23 +125,6 @@ fn create_tls_acceptor(
     };
 
     TlsAcceptor::from(Arc::new(server_config))
-}
-
-fn read_private_key<R: std::io::BufRead>(reader: &mut R) -> Option<PrivateKeyDer<'static>> {
-    let items: Vec<_> = rustls_pemfile::read_all(reader)
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for item in items {
-        match item {
-            rustls_pemfile::Item::Pkcs1Key(key) => return Some(PrivateKeyDer::Pkcs1(key)),
-            rustls_pemfile::Item::Pkcs8Key(key) => return Some(PrivateKeyDer::Pkcs8(key)),
-            rustls_pemfile::Item::Sec1Key(key) => return Some(PrivateKeyDer::Sec1(key)),
-            _ => continue,
-        }
-    }
-
-    None
 }
 
 async fn run_server(

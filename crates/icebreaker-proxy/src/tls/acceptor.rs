@@ -1,13 +1,12 @@
 //! TLS acceptor creation with mTLS support.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::sync::Arc;
 
 use icebreaker_common::{ClientAuthMode, TlsConfig};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::RootCertStore;
+use rustls_pki_types::pem::PemObject;
 use tokio_rustls::TlsAcceptor;
 
 /// Errors that can occur when creating a TLS acceptor.
@@ -127,14 +126,17 @@ impl std::error::Error for TlsAcceptorError {
 /// - TLS configuration fails
 pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, TlsAcceptorError> {
     // Load server certificate chain
-    let cert_file = File::open(&config.cert_path).map_err(|e| TlsAcceptorError::ReadCert {
-        path: config.cert_path.clone(),
-        source: e,
-    })?;
-    let mut cert_reader = BufReader::new(cert_file);
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut cert_reader)
-        .filter_map(|r| r.ok())
-        .collect();
+    let cert_bytes =
+        std::fs::read(&config.cert_path).map_err(|e| {
+            TlsAcceptorError::ReadCert {
+                path: config.cert_path.clone(),
+                source: e,
+            }
+        })?;
+    let certs: Vec<CertificateDer<'static>> =
+        CertificateDer::pem_slice_iter(&cert_bytes)
+            .filter_map(|r| r.ok())
+            .collect();
 
     if certs.is_empty() {
         return Err(TlsAcceptorError::ParseCert {
@@ -143,14 +145,17 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, TlsAccepto
     }
 
     // Load server private key
-    let key_file = File::open(&config.key_path).map_err(|e| TlsAcceptorError::ReadKey {
-        path: config.key_path.clone(),
-        source: e,
-    })?;
-    let mut key_reader = BufReader::new(key_file);
-    let key = read_private_key(&mut key_reader).ok_or_else(|| TlsAcceptorError::ParseKey {
-        path: config.key_path.clone(),
-    })?;
+    let key_bytes =
+        std::fs::read(&config.key_path).map_err(|e| {
+            TlsAcceptorError::ReadKey {
+                path: config.key_path.clone(),
+                source: e,
+            }
+        })?;
+    let key = PrivateKeyDer::from_pem_slice(&key_bytes)
+        .map_err(|_| TlsAcceptorError::ParseKey {
+            path: config.key_path.clone(),
+        })?;
 
     // Build server config based on client auth mode
     let server_config = match config.client_auth {
@@ -169,15 +174,17 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, TlsAccepto
                 }
             })?;
 
-            let client_ca_file =
-                File::open(client_ca_path).map_err(|e| TlsAcceptorError::ReadCert {
-                    path: client_ca_path.clone(),
-                    source: e,
+            let ca_bytes =
+                std::fs::read(client_ca_path).map_err(|e| {
+                    TlsAcceptorError::ReadCert {
+                        path: client_ca_path.clone(),
+                        source: e,
+                    }
                 })?;
-            let mut ca_reader = BufReader::new(client_ca_file);
-            let client_certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut ca_reader)
-                .filter_map(|r| r.ok())
-                .collect();
+            let client_certs: Vec<CertificateDer<'static>> =
+                CertificateDer::pem_slice_iter(&ca_bytes)
+                    .filter_map(|r| r.ok())
+                    .collect();
 
             if client_certs.is_empty() {
                 return Err(TlsAcceptorError::ParseClientCa {
@@ -213,25 +220,6 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, TlsAccepto
     };
 
     Ok(TlsAcceptor::from(Arc::new(server_config)))
-}
-
-/// Reads a private key from a PEM file, trying multiple formats.
-fn read_private_key(reader: &mut BufReader<File>) -> Option<PrivateKeyDer<'static>> {
-    // Try to read as PKCS#8 first
-    let items: Vec<_> = rustls_pemfile::read_all(reader)
-        .filter_map(|r| r.ok())
-        .collect();
-
-    for item in items {
-        match item {
-            rustls_pemfile::Item::Pkcs1Key(key) => return Some(PrivateKeyDer::Pkcs1(key)),
-            rustls_pemfile::Item::Pkcs8Key(key) => return Some(PrivateKeyDer::Pkcs8(key)),
-            rustls_pemfile::Item::Sec1Key(key) => return Some(PrivateKeyDer::Sec1(key)),
-            _ => continue,
-        }
-    }
-
-    None
 }
 
 #[cfg(test)]
