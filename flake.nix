@@ -59,7 +59,7 @@
           meta = with pkgs.lib; {
             description = "A Rust library for secure API proxy with cryptographic audit trails";
             homepage = "https://github.com/windowlickers/icebreaker";
-            license = licenses.mit;
+            license = licenses.asl20;
             maintainers = [
               {
                 name = "Evan Dobry";
@@ -78,7 +78,7 @@
           meta = with pkgs.lib; {
             description = "CLI for Icebreaker - A Rust library for secure API proxy with cryptographic audit trails";
             homepage = "https://github.com/windowlickers/icebreaker";
-            license = licenses.mit;
+            license = licenses.asl20;
             maintainers = [
               {
                 name = "Evan Dobry";

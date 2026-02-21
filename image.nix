@@ -35,7 +35,7 @@ pkgs.dockerTools.buildLayeredImage {
       "org.opencontainers.image.description" = "Stateless tokenizer proxy for secure API credential injection";
       "org.opencontainers.image.version" = version;
       "org.opencontainers.image.source" = "https://git.windowlicke.rs/windowlickers/icebreaker";
-      "org.opencontainers.image.licenses" = "MIT";
+      "org.opencontainers.image.licenses" = "Apache-2.0";
     };
   };
 }
