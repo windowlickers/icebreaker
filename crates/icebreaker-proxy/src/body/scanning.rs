@@ -230,6 +230,12 @@ impl SecretScannerConfig {
     pub fn is_encoding_allowed(&self, encoding: &str) -> bool {
         self.response_scan_config.is_encoding_allowed(encoding)
     }
+
+    /// Returns the response scan configuration.
+    #[must_use]
+    pub fn response_scan_config(&self) -> &ResponseScanConfig {
+        &self.response_scan_config
+    }
 }
 
 #[cfg(test)]

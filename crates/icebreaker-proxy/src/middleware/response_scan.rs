@@ -16,6 +16,108 @@ use icebreaker_common::{ResponseScanConfig, TokenizerError, UnsupportedEncodingB
 use crate::body::{scan_header_values, DecompressingBody, ScanningBody, SecretScannerConfig};
 use crate::metrics::{record_secret_leak_detected, record_unsupported_encoding_blocked};
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+/// Resolves `Content-Encoding` into a `DecompressingBody`, stripping
+/// encoding/length headers when decompression is applied.
+fn resolve_encoding<B>(
+    parts: &mut http::response::Parts,
+    body: B,
+    config: &ResponseScanConfig,
+) -> Result<DecompressingBody<B>, BoxError>
+where
+    B: Body<Data = Bytes> + Send + Unpin + 'static,
+    B::Error: Into<BoxError>,
+{
+    let encodings: Vec<&str> = parts
+        .headers
+        .get(header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.split(',').map(str::trim).collect())
+        .unwrap_or_default();
+
+    match encodings.as_slice() {
+        [] => Ok(DecompressingBody::identity(body)),
+        [single] => {
+            let encoding = single.to_lowercase();
+            match encoding.as_str() {
+                "gzip" | "deflate" | "br" | "zstd" => {
+                    parts.headers.remove(header::CONTENT_ENCODING);
+                    parts.headers.remove(header::CONTENT_LENGTH);
+                    Ok(match encoding.as_str() {
+                        "gzip" => DecompressingBody::gzip(body),
+                        "deflate" => DecompressingBody::deflate(body),
+                        "br" => DecompressingBody::brotli(body),
+                        "zstd" => DecompressingBody::zstd(body),
+                        _ => unreachable!(),
+                    })
+                }
+                "identity" => Ok(DecompressingBody::identity(body)),
+                unknown => {
+                    if config.is_encoding_allowed(unknown) {
+                        tracing::debug!(
+                            encoding = %unknown,
+                            "using allowed additional encoding as identity"
+                        );
+                        Ok(DecompressingBody::identity(body))
+                    } else {
+                        match &config.unsupported_encoding {
+                            UnsupportedEncodingBehavior::Block => {
+                                tracing::warn!(
+                                    encoding = %unknown,
+                                    "blocking response with \
+                                     unsupported Content-Encoding"
+                                );
+                                record_unsupported_encoding_blocked(unknown);
+                                Err(Box::new(
+                                    TokenizerError::UnsupportedContentEncoding {
+                                        encoding: unknown.to_string(),
+                                    },
+                                ))
+                            }
+                            UnsupportedEncodingBehavior::PassthroughWithWarning => {
+                                tracing::warn!(
+                                    encoding = %unknown,
+                                    "unsupported Content-Encoding, \
+                                     scanning compressed data \
+                                     (may miss secrets)"
+                                );
+                                Ok(DecompressingBody::identity(body))
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        multiple => {
+            let encoding_str = multiple.join(", ");
+            match &config.unsupported_encoding {
+                UnsupportedEncodingBehavior::Block => {
+                    tracing::warn!(
+                        encodings = %encoding_str,
+                        "blocking response with multiple \
+                         stacked Content-Encodings"
+                    );
+                    record_unsupported_encoding_blocked(&encoding_str);
+                    Err(Box::new(
+                        TokenizerError::UnsupportedContentEncoding {
+                            encoding: encoding_str,
+                        },
+                    ))
+                }
+                UnsupportedEncodingBehavior::PassthroughWithWarning => {
+                    tracing::warn!(
+                        encodings = %encoding_str,
+                        "multiple stacked Content-Encodings, \
+                         scanning compressed data (may miss secrets)"
+                    );
+                    Ok(DecompressingBody::identity(body))
+                }
+            }
+        }
+    }
+}
+
 /// Layer that scans responses for secret leaks.
 #[derive(Clone)]
 pub struct ResponseScanLayer {
@@ -101,102 +203,15 @@ where
                 return Err(err);
             }
 
-            // Determine encoding and create decompressing body
-            // Parse comma-separated encodings per RFC 7231
-            let encodings: Vec<&str> = parts
-                .headers
-                .get(header::CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.split(',').map(str::trim).collect())
-                .unwrap_or_default();
-
-            let decompressing = match encodings.as_slice() {
-                [] => DecompressingBody::identity(body),
-                [single] => {
-                    let encoding = single.to_lowercase();
-                    match encoding.as_str() {
-                        "gzip" => {
-                            parts.headers.remove(header::CONTENT_ENCODING);
-                            parts.headers.remove(header::CONTENT_LENGTH);
-                            DecompressingBody::gzip(body)
-                        }
-                        "deflate" => {
-                            parts.headers.remove(header::CONTENT_ENCODING);
-                            parts.headers.remove(header::CONTENT_LENGTH);
-                            DecompressingBody::deflate(body)
-                        }
-                        "br" => {
-                            parts.headers.remove(header::CONTENT_ENCODING);
-                            parts.headers.remove(header::CONTENT_LENGTH);
-                            DecompressingBody::brotli(body)
-                        }
-                        "zstd" => {
-                            parts.headers.remove(header::CONTENT_ENCODING);
-                            parts.headers.remove(header::CONTENT_LENGTH);
-                            DecompressingBody::zstd(body)
-                        }
-                        "identity" => DecompressingBody::identity(body),
-                        unknown => {
-                            if config.is_encoding_allowed(unknown) {
-                                tracing::debug!(encoding = %unknown, "using allowed additional encoding as identity");
-                                DecompressingBody::identity(body)
-                            } else {
-                                match config.unsupported_encoding_behavior() {
-                                    UnsupportedEncodingBehavior::Block => {
-                                        tracing::warn!(encoding = %unknown, "blocking response with unsupported Content-Encoding");
-                                        record_unsupported_encoding_blocked(unknown);
-                                        let err: Box<dyn std::error::Error + Send + Sync> =
-                                            Box::new(TokenizerError::UnsupportedContentEncoding {
-                                                encoding: unknown.to_string(),
-                                            });
-                                        return Err(err);
-                                    }
-                                    UnsupportedEncodingBehavior::PassthroughWithWarning => {
-                                        tracing::warn!(
-                                            encoding = %unknown,
-                                            "unsupported Content-Encoding, scanning compressed data (may miss secrets)"
-                                        );
-                                        DecompressingBody::identity(body)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                multiple => {
-                    // Multiple stacked encodings are not supported - they could be used
-                    // to bypass secret scanning by hiding secrets in inner compression layers
-                    let encoding_str = multiple.join(", ");
-                    match config.unsupported_encoding_behavior() {
-                        UnsupportedEncodingBehavior::Block => {
-                            tracing::warn!(
-                                encodings = %encoding_str,
-                                "blocking response with multiple stacked Content-Encodings"
-                            );
-                            record_unsupported_encoding_blocked(&encoding_str);
-                            let err: Box<dyn std::error::Error + Send + Sync> =
-                                Box::new(TokenizerError::UnsupportedContentEncoding {
-                                    encoding: encoding_str,
-                                });
-                            return Err(err);
-                        }
-                        UnsupportedEncodingBehavior::PassthroughWithWarning => {
-                            tracing::warn!(
-                                encodings = %encoding_str,
-                                "multiple stacked Content-Encodings, scanning compressed data (may miss secrets)"
-                            );
-                            DecompressingBody::identity(body)
-                        }
-                    }
-                }
-            };
+            let decompressing = resolve_encoding(
+                &mut parts,
+                body,
+                config.response_scan_config(),
+            )?;
 
             let scanning_body = config.wrap_body(decompressing);
 
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::from_parts(
-                parts,
-                scanning_body,
-            ))
+            Ok::<_, BoxError>(Response::from_parts(parts, scanning_body))
         })
     }
 }
@@ -302,102 +317,15 @@ where
                 }
             }
 
-            // Determine encoding and create decompressing body
-            // Parse comma-separated encodings per RFC 7231
-            let encodings: Vec<&str> = parts
-                .headers
-                .get(header::CONTENT_ENCODING)
-                .and_then(|v| v.to_str().ok())
-                .map(|s| s.split(',').map(str::trim).collect())
-                .unwrap_or_default();
-
-            let decompressing = match encodings.as_slice() {
-                [] => DecompressingBody::identity(body),
-                [single] => {
-                    let encoding = single.to_lowercase();
-                    match encoding.as_str() {
-                        "gzip" => {
-                            parts.headers.remove(header::CONTENT_ENCODING);
-                            parts.headers.remove(header::CONTENT_LENGTH);
-                            DecompressingBody::gzip(body)
-                        }
-                        "deflate" => {
-                            parts.headers.remove(header::CONTENT_ENCODING);
-                            parts.headers.remove(header::CONTENT_LENGTH);
-                            DecompressingBody::deflate(body)
-                        }
-                        "br" => {
-                            parts.headers.remove(header::CONTENT_ENCODING);
-                            parts.headers.remove(header::CONTENT_LENGTH);
-                            DecompressingBody::brotli(body)
-                        }
-                        "zstd" => {
-                            parts.headers.remove(header::CONTENT_ENCODING);
-                            parts.headers.remove(header::CONTENT_LENGTH);
-                            DecompressingBody::zstd(body)
-                        }
-                        "identity" => DecompressingBody::identity(body),
-                        unknown => {
-                            if response_scan_config.is_encoding_allowed(unknown) {
-                                tracing::debug!(encoding = %unknown, "using allowed additional encoding as identity");
-                                DecompressingBody::identity(body)
-                            } else {
-                                match &response_scan_config.unsupported_encoding {
-                                    UnsupportedEncodingBehavior::Block => {
-                                        tracing::warn!(encoding = %unknown, "blocking response with unsupported Content-Encoding");
-                                        record_unsupported_encoding_blocked(unknown);
-                                        let err: Box<dyn std::error::Error + Send + Sync> =
-                                            Box::new(TokenizerError::UnsupportedContentEncoding {
-                                                encoding: unknown.to_string(),
-                                            });
-                                        return Err(err);
-                                    }
-                                    UnsupportedEncodingBehavior::PassthroughWithWarning => {
-                                        tracing::warn!(
-                                            encoding = %unknown,
-                                            "unsupported Content-Encoding, scanning compressed data (may miss secrets)"
-                                        );
-                                        DecompressingBody::identity(body)
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                multiple => {
-                    // Multiple stacked encodings are not supported - they could be used
-                    // to bypass secret scanning by hiding secrets in inner compression layers
-                    let encoding_str = multiple.join(", ");
-                    match &response_scan_config.unsupported_encoding {
-                        UnsupportedEncodingBehavior::Block => {
-                            tracing::warn!(
-                                encodings = %encoding_str,
-                                "blocking response with multiple stacked Content-Encodings"
-                            );
-                            record_unsupported_encoding_blocked(&encoding_str);
-                            let err: Box<dyn std::error::Error + Send + Sync> =
-                                Box::new(TokenizerError::UnsupportedContentEncoding {
-                                    encoding: encoding_str,
-                                });
-                            return Err(err);
-                        }
-                        UnsupportedEncodingBehavior::PassthroughWithWarning => {
-                            tracing::warn!(
-                                encodings = %encoding_str,
-                                "multiple stacked Content-Encodings, scanning compressed data (may miss secrets)"
-                            );
-                            DecompressingBody::identity(body)
-                        }
-                    }
-                }
-            };
+            let decompressing = resolve_encoding(
+                &mut parts,
+                body,
+                &response_scan_config,
+            )?;
 
             let scanning_body = ScanningBody::new(decompressing, patterns);
 
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Response::from_parts(
-                parts,
-                scanning_body,
-            ))
+            Ok::<_, BoxError>(Response::from_parts(parts, scanning_body))
         })
     }
 }
