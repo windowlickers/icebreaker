@@ -126,17 +126,13 @@ impl std::error::Error for TlsAcceptorError {
 /// - TLS configuration fails
 pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, TlsAcceptorError> {
     // Load server certificate chain
-    let cert_bytes =
-        std::fs::read(&config.cert_path).map_err(|e| {
-            TlsAcceptorError::ReadCert {
-                path: config.cert_path.clone(),
-                source: e,
-            }
-        })?;
-    let certs: Vec<CertificateDer<'static>> =
-        CertificateDer::pem_slice_iter(&cert_bytes)
-            .filter_map(|r| r.ok())
-            .collect();
+    let cert_bytes = std::fs::read(&config.cert_path).map_err(|e| TlsAcceptorError::ReadCert {
+        path: config.cert_path.clone(),
+        source: e,
+    })?;
+    let certs: Vec<CertificateDer<'static>> = CertificateDer::pem_slice_iter(&cert_bytes)
+        .filter_map(|r| r.ok())
+        .collect();
 
     if certs.is_empty() {
         return Err(TlsAcceptorError::ParseCert {
@@ -145,15 +141,12 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, TlsAccepto
     }
 
     // Load server private key
-    let key_bytes =
-        std::fs::read(&config.key_path).map_err(|e| {
-            TlsAcceptorError::ReadKey {
-                path: config.key_path.clone(),
-                source: e,
-            }
-        })?;
-    let key = PrivateKeyDer::from_pem_slice(&key_bytes)
-        .map_err(|_| TlsAcceptorError::ParseKey {
+    let key_bytes = std::fs::read(&config.key_path).map_err(|e| TlsAcceptorError::ReadKey {
+        path: config.key_path.clone(),
+        source: e,
+    })?;
+    let key =
+        PrivateKeyDer::from_pem_slice(&key_bytes).map_err(|_| TlsAcceptorError::ParseKey {
             path: config.key_path.clone(),
         })?;
 
@@ -175,11 +168,9 @@ pub fn create_tls_acceptor(config: &TlsConfig) -> Result<TlsAcceptor, TlsAccepto
             })?;
 
             let ca_bytes =
-                std::fs::read(client_ca_path).map_err(|e| {
-                    TlsAcceptorError::ReadCert {
-                        path: client_ca_path.clone(),
-                        source: e,
-                    }
+                std::fs::read(client_ca_path).map_err(|e| TlsAcceptorError::ReadCert {
+                    path: client_ca_path.clone(),
+                    source: e,
                 })?;
             let client_certs: Vec<CertificateDer<'static>> =
                 CertificateDer::pem_slice_iter(&ca_bytes)

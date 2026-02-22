@@ -1,5 +1,7 @@
 //! Token types for sealed secrets.
 
+use std::sync::OnceLock;
+
 use secrecy::{ExposeSecret, SecretString};
 
 use crate::config::ClockSkewConfig;
@@ -226,6 +228,16 @@ pub struct TokenPayload {
     #[zeroize(skip)]
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub replay_protection: Option<ReplayProtection>,
+
+    /// Cached compiled host pattern regex.
+    #[zeroize(skip)]
+    #[serde(skip)]
+    cached_host_regex: OnceLock<std::result::Result<regex::Regex, String>>,
+
+    /// Cached compiled path pattern regex.
+    #[zeroize(skip)]
+    #[serde(skip)]
+    cached_path_regex: OnceLock<std::result::Result<regex::Regex, String>>,
 }
 
 impl std::fmt::Debug for TokenPayload {
@@ -245,6 +257,32 @@ impl std::fmt::Debug for TokenPayload {
             .field("replay_protection", &self.replay_protection)
             .finish()
     }
+}
+
+/// Wraps a pattern in `^(?:...)$`, preserving existing anchors.
+fn anchor_pattern(pattern: &str) -> String {
+    if pattern.starts_with('^') && pattern.ends_with('$') {
+        pattern.to_string()
+    } else if pattern.starts_with('^') {
+        format!("{pattern}$")
+    } else if pattern.ends_with('$') {
+        format!("^{pattern}")
+    } else {
+        format!("^(?:{pattern})$")
+    }
+}
+
+/// Anchors and compiles a regex pattern with the given size limit.
+fn compile_anchored_regex(
+    pattern: &str,
+    size_limit: usize,
+) -> std::result::Result<regex::Regex, String> {
+    let anchored = anchor_pattern(pattern);
+    regex::RegexBuilder::new(&anchored)
+        .size_limit(size_limit)
+        .dfa_size_limit(size_limit)
+        .build()
+        .map_err(|e| format!("{e}"))
 }
 
 impl TokenPayload {
@@ -336,25 +374,12 @@ impl TokenPayload {
 
         // Check pattern if provided
         if let Some(ref pattern) = self.allowed_host_pattern {
-            // Auto-anchor patterns to prevent partial matches (e.g., "api.example.com"
-            // matching "evil.api.example.com"). Wrap in non-capturing group to preserve
-            // any alternation in the original pattern.
-            let anchored = if pattern.starts_with('^') && pattern.ends_with('$') {
-                pattern.clone()
-            } else if pattern.starts_with('^') {
-                format!("{pattern}$")
-            } else if pattern.ends_with('$') {
-                format!("^{pattern}")
-            } else {
-                format!("^(?:{pattern})$")
-            };
-            let re = regex::RegexBuilder::new(&anchored)
-                .size_limit(HOST_PATTERN_REGEX_SIZE_LIMIT)
-                .dfa_size_limit(HOST_PATTERN_REGEX_SIZE_LIMIT)
-                .build()
-                .map_err(|e| {
-                    crate::error::TokenizerError::ConfigError(format!("invalid host pattern: {e}"))
-                })?;
+            let compiled = self
+                .cached_host_regex
+                .get_or_init(|| compile_anchored_regex(pattern, HOST_PATTERN_REGEX_SIZE_LIMIT));
+            let re = compiled.as_ref().map_err(|e| {
+                crate::error::TokenizerError::ConfigError(format!("invalid host pattern: {e}"))
+            })?;
             if re.is_match(host) {
                 return Ok(());
             }
@@ -398,22 +423,12 @@ impl TokenPayload {
 
         // Check pattern if provided
         if let Some(ref pattern) = self.allowed_path_pattern {
-            let anchored = if pattern.starts_with('^') && pattern.ends_with('$') {
-                pattern.clone()
-            } else if pattern.starts_with('^') {
-                format!("{pattern}$")
-            } else if pattern.ends_with('$') {
-                format!("^{pattern}")
-            } else {
-                format!("^(?:{pattern})$")
-            };
-            let re = regex::RegexBuilder::new(&anchored)
-                .size_limit(PATH_PATTERN_REGEX_SIZE_LIMIT)
-                .dfa_size_limit(PATH_PATTERN_REGEX_SIZE_LIMIT)
-                .build()
-                .map_err(|e| {
-                    crate::error::TokenizerError::ConfigError(format!("invalid path pattern: {e}"))
-                })?;
+            let compiled = self
+                .cached_path_regex
+                .get_or_init(|| compile_anchored_regex(pattern, PATH_PATTERN_REGEX_SIZE_LIMIT));
+            let re = compiled.as_ref().map_err(|e| {
+                crate::error::TokenizerError::ConfigError(format!("invalid path pattern: {e}"))
+            })?;
             if re.is_match(path) {
                 return Ok(());
             }
@@ -557,6 +572,8 @@ impl TokenPayloadBuilder {
             metadata: self.metadata,
             oauth: self.oauth,
             replay_protection: self.replay_protection,
+            cached_host_regex: OnceLock::new(),
+            cached_path_regex: OnceLock::new(),
         }
     }
 }
@@ -1252,6 +1269,49 @@ mod tests {
         // Should allow everything
         assert!(payload.validate_method("GET").is_ok());
         assert!(payload.validate_path("/any").is_ok());
+    }
+
+    #[test]
+    fn test_host_pattern_regex_is_cached() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host_pattern(r".*\.example\.com")
+        .build();
+
+        assert!(payload.cached_host_regex.get().is_none());
+        assert!(payload.validate_host("api.example.com").is_ok());
+        assert!(payload.cached_host_regex.get().is_some());
+    }
+
+    #[test]
+    fn test_path_pattern_regex_is_cached() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_path_pattern(r"/api/.*")
+        .build();
+
+        assert!(payload.cached_path_regex.get().is_none());
+        assert!(payload.validate_path("/api/v1/users").is_ok());
+        assert!(payload.cached_path_regex.get().is_some());
+    }
+
+    #[test]
+    fn test_invalid_pattern_error_is_cached() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host_pattern(r"[invalid")
+        .build();
+
+        assert!(payload.validate_host("any.com").is_err());
+        let cached = payload.cached_host_regex.get();
+        assert!(cached.is_some());
+        assert!(cached.is_some_and(|r: &std::result::Result<regex::Regex, String>| r.is_err(),));
     }
 
     // Clock skew tolerance tests

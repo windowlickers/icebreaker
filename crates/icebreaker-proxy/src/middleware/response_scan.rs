@@ -69,11 +69,9 @@ where
                                      unsupported Content-Encoding"
                                 );
                                 record_unsupported_encoding_blocked(unknown);
-                                Err(Box::new(
-                                    TokenizerError::UnsupportedContentEncoding {
-                                        encoding: unknown.to_string(),
-                                    },
-                                ))
+                                Err(Box::new(TokenizerError::UnsupportedContentEncoding {
+                                    encoding: unknown.to_string(),
+                                }))
                             }
                             UnsupportedEncodingBehavior::PassthroughWithWarning => {
                                 tracing::warn!(
@@ -99,11 +97,9 @@ where
                          stacked Content-Encodings"
                     );
                     record_unsupported_encoding_blocked(&encoding_str);
-                    Err(Box::new(
-                        TokenizerError::UnsupportedContentEncoding {
-                            encoding: encoding_str,
-                        },
-                    ))
+                    Err(Box::new(TokenizerError::UnsupportedContentEncoding {
+                        encoding: encoding_str,
+                    }))
                 }
                 UnsupportedEncodingBehavior::PassthroughWithWarning => {
                     tracing::warn!(
@@ -203,11 +199,7 @@ where
                 return Err(err);
             }
 
-            let decompressing = resolve_encoding(
-                &mut parts,
-                body,
-                config.response_scan_config(),
-            )?;
+            let decompressing = resolve_encoding(&mut parts, body, config.response_scan_config())?;
 
             let scanning_body = config.wrap_body(decompressing);
 
@@ -317,11 +309,7 @@ where
                 }
             }
 
-            let decompressing = resolve_encoding(
-                &mut parts,
-                body,
-                &response_scan_config,
-            )?;
+            let decompressing = resolve_encoding(&mut parts, body, &response_scan_config)?;
 
             let scanning_body = ScanningBody::new(decompressing, patterns);
 
