@@ -10,7 +10,7 @@
 //! - Seal secrets in encrypted tokens that can be safely stored client-side
 //! - Decrypt tokens and inject secrets into outbound API requests
 //! - Scan responses for credential leaks
-//! - Rate limit and audit all proxy requests
+//! - Rate limit all proxy requests
 //!
 //! ## Architecture
 //!
@@ -43,13 +43,7 @@
 //! println!("Token: {}", sealed_token.to_header().expect("serialization"));
 //! ```
 //!
-//! ## Feature Flags
-//!
-//! - `audit-postgres`: Enable PostgreSQL backend for audit logging
-//! - `audit-sqlite`: Enable SQLite backend for audit logging
-
 // Re-export sub-crates
-pub use icebreaker_audit as audit;
 pub use icebreaker_common as common;
 pub use icebreaker_crypto as crypto;
 pub use icebreaker_proxy as proxy;
@@ -87,11 +81,6 @@ pub mod prelude {
     // Processors
     pub use icebreaker_proxy::{HmacProcessor, InjectProcessor, OAuthProcessor, RequestProcessor};
 
-    // Audit
-    pub use icebreaker_audit::{
-        AuditEvent, AuditEventId, AuditEventType, AuditFilter, AuditRepository,
-        InMemoryAuditRepository, NoOpAuditRepository,
-    };
 }
 
 #[cfg(test)]

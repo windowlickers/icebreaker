@@ -10,16 +10,10 @@ rust-version.workspace = true
 [lints]
 workspace = true
 
-[features]
-default = []
-audit-postgres = ["icebreaker-audit/postgres"]
-audit-sqlite = ["icebreaker-audit/sqlite"]
-
 [dependencies]
 icebreaker-common = { path = "../icebreaker-common" }
 icebreaker-crypto = { path = "../icebreaker-crypto" }
 icebreaker-proxy = { path = "../icebreaker-proxy" }
-icebreaker-audit = { path = "../icebreaker-audit" }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

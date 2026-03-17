@@ -18,7 +18,6 @@ workspace = true
 icebreaker-common = { path = "../icebreaker-common" }
 icebreaker-crypto = { path = "../icebreaker-crypto" }
 icebreaker-proxy = { path = "../icebreaker-proxy" }
-icebreaker-audit = { path = "../icebreaker-audit" }
 icebreaker-sso = { path = "../icebreaker-sso" }
 
 # Async runtime
