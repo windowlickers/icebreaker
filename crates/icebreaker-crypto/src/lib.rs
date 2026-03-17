@@ -22,7 +22,7 @@ pub use auth_validation::{
     derive_api_key_hmac_key, hash_api_key, parse_proxy_authorization, validate_auth,
     ConnectionInfo, ProxyCredential, TlsConnectionInfo, PROXY_AUTHORIZATION_HEADER,
 };
-pub use hkdf::{derive_hmac_key, derive_keypair, derive_keypairs, MasterKeyManager};
+pub use hkdf::{derive_hmac_key, derive_keypair, derive_keypairs, MasterKeyManager, DEFAULT_HKDF_SALT};
 pub use hmac::{
     compute_signature, signature_from_base64, signature_from_hex, signature_to_base64,
     signature_to_hex, verify_signature, CanonicalRequestBuilder, RequestSigner,

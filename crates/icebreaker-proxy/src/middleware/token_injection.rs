@@ -649,7 +649,7 @@ mod tests {
     async fn test_auth_validation_success() {
         let keypair = Keypair::generate();
         let hmac_key =
-            derive_api_key_hmac_key(&keypair.public_key_bytes()).expect("should derive hmac key");
+            derive_api_key_hmac_key(&keypair.public_key_bytes(), None).expect("should derive hmac key");
         let crypto = Arc::new(TokenCrypto::with_keypair(keypair, "test-key"));
 
         // Create a payload with API key auth
@@ -689,7 +689,7 @@ mod tests {
     async fn test_auth_validation_failure() {
         let keypair = Keypair::generate();
         let hmac_key =
-            derive_api_key_hmac_key(&keypair.public_key_bytes()).expect("should derive hmac key");
+            derive_api_key_hmac_key(&keypair.public_key_bytes(), None).expect("should derive hmac key");
         let crypto = Arc::new(TokenCrypto::with_keypair(keypair, "test-key"));
 
         // Create a payload with API key auth
@@ -731,7 +731,7 @@ mod tests {
     async fn test_auth_validation_missing_header() {
         let keypair = Keypair::generate();
         let hmac_key =
-            derive_api_key_hmac_key(&keypair.public_key_bytes()).expect("should derive hmac key");
+            derive_api_key_hmac_key(&keypair.public_key_bytes(), None).expect("should derive hmac key");
         let crypto = Arc::new(TokenCrypto::with_keypair(keypair, "test-key"));
 
         // Create a payload with API key auth

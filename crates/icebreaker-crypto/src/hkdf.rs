@@ -8,15 +8,26 @@ use icebreaker_common::{Result, TokenizerError};
 
 use crate::keypair::Keypair;
 
+/// Default salt for HKDF operations, providing domain separation.
+pub const DEFAULT_HKDF_SALT: &[u8] = b"icebreaker-v1";
+
 /// Info string prefix for key derivation.
 const KEY_INFO_PREFIX: &[u8] = b"icebreaker-v1-key-";
 
 /// Derives a keypair from a master key using HKDF.
 ///
-/// This allows deterministic generation of versioned keys from a single
-/// master secret.
-pub fn derive_keypair(master_key: &[u8], key_id: &str, version: u32) -> Result<Keypair> {
-    let hk = Hkdf::<Sha256>::new(None, master_key);
+/// Uses the provided `salt` for domain separation, or
+/// [`DEFAULT_HKDF_SALT`] when `None`.
+pub fn derive_keypair(
+    master_key: &[u8],
+    key_id: &str,
+    version: u32,
+    salt: Option<&[u8]>,
+) -> Result<Keypair> {
+    let hk = Hkdf::<Sha256>::new(
+        Some(salt.unwrap_or(DEFAULT_HKDF_SALT)),
+        master_key,
+    );
 
     // Create info string: "icebreaker-v1-key-{key_id}-{version}"
     let mut info = Vec::with_capacity(KEY_INFO_PREFIX.len() + key_id.len() + 16);
@@ -34,16 +45,28 @@ pub fn derive_keypair(master_key: &[u8], key_id: &str, version: u32) -> Result<K
 }
 
 /// Derives multiple versioned keypairs from a master key.
-pub fn derive_keypairs(master_key: &[u8], key_id: &str, versions: &[u32]) -> Result<Vec<Keypair>> {
+pub fn derive_keypairs(
+    master_key: &[u8],
+    key_id: &str,
+    versions: &[u32],
+    salt: Option<&[u8]>,
+) -> Result<Vec<Keypair>> {
     versions
         .iter()
-        .map(|&v| derive_keypair(master_key, key_id, v))
+        .map(|&v| derive_keypair(master_key, key_id, v, salt))
         .collect()
 }
 
 /// Derives a symmetric key for HMAC operations.
-pub fn derive_hmac_key(master_key: &[u8], purpose: &str) -> Result<Zeroizing<[u8; 32]>> {
-    let hk = Hkdf::<Sha256>::new(None, master_key);
+pub fn derive_hmac_key(
+    master_key: &[u8],
+    purpose: &str,
+    salt: Option<&[u8]>,
+) -> Result<Zeroizing<[u8; 32]>> {
+    let hk = Hkdf::<Sha256>::new(
+        Some(salt.unwrap_or(DEFAULT_HKDF_SALT)),
+        master_key,
+    );
 
     let info = format!("icebreaker-v1-hmac-{purpose}");
 
@@ -60,6 +83,7 @@ pub struct MasterKeyManager {
     key_id: String,
     // The actual master key bytes are stored in Zeroizing
     master_key: Zeroizing<Vec<u8>>,
+    salt: Option<Vec<u8>>,
 }
 
 impl MasterKeyManager {
@@ -68,7 +92,15 @@ impl MasterKeyManager {
         Self {
             key_id: key_id.into(),
             master_key: Zeroizing::new(master_key.into()),
+            salt: None,
         }
+    }
+
+    /// Sets a custom HKDF salt for key derivation.
+    #[must_use]
+    pub fn with_salt(mut self, salt: impl Into<Vec<u8>>) -> Self {
+        self.salt = Some(salt.into());
+        self
     }
 
     /// Generates a new master key manager with a random 32-byte key.
@@ -81,7 +113,12 @@ impl MasterKeyManager {
 
     /// Derives a keypair for the given version.
     pub fn derive_keypair(&self, version: u32) -> Result<Keypair> {
-        derive_keypair(&self.master_key, &self.key_id, version)
+        derive_keypair(
+            &self.master_key,
+            &self.key_id,
+            version,
+            self.salt.as_deref(),
+        )
     }
 
     /// Returns the key ID.
@@ -100,8 +137,8 @@ mod tests {
         let master_key = b"test-master-key-32-bytes-long!!";
         let key_id = "test-key";
 
-        let kp1 = derive_keypair(master_key, key_id, 1).expect("should derive");
-        let kp2 = derive_keypair(master_key, key_id, 1).expect("should derive");
+        let kp1 = derive_keypair(master_key, key_id, 1, None).expect("should derive");
+        let kp2 = derive_keypair(master_key, key_id, 1, None).expect("should derive");
 
         assert_eq!(kp1.public_key_bytes(), kp2.public_key_bytes());
     }
@@ -111,8 +148,8 @@ mod tests {
         let master_key = b"test-master-key-32-bytes-long!!";
         let key_id = "test-key";
 
-        let kp1 = derive_keypair(master_key, key_id, 1).expect("should derive");
-        let kp2 = derive_keypair(master_key, key_id, 2).expect("should derive");
+        let kp1 = derive_keypair(master_key, key_id, 1, None).expect("should derive");
+        let kp2 = derive_keypair(master_key, key_id, 2, None).expect("should derive");
 
         assert_ne!(kp1.public_key_bytes(), kp2.public_key_bytes());
     }
@@ -121,8 +158,8 @@ mod tests {
     fn test_different_key_ids_different_keys() {
         let master_key = b"test-master-key-32-bytes-long!!";
 
-        let kp1 = derive_keypair(master_key, "key-a", 1).expect("should derive");
-        let kp2 = derive_keypair(master_key, "key-b", 1).expect("should derive");
+        let kp1 = derive_keypair(master_key, "key-a", 1, None).expect("should derive");
+        let kp2 = derive_keypair(master_key, "key-b", 1, None).expect("should derive");
 
         assert_ne!(kp1.public_key_bytes(), kp2.public_key_bytes());
     }
@@ -131,10 +168,23 @@ mod tests {
     fn test_derive_hmac_key_deterministic() {
         let master_key = b"test-master-key-32-bytes-long!!";
 
-        let hmac1 = derive_hmac_key(master_key, "signing").expect("should derive");
-        let hmac2 = derive_hmac_key(master_key, "signing").expect("should derive");
+        let hmac1 = derive_hmac_key(master_key, "signing", None).expect("should derive");
+        let hmac2 = derive_hmac_key(master_key, "signing", None).expect("should derive");
 
         assert_eq!(hmac1.as_ref(), hmac2.as_ref());
+    }
+
+    #[test]
+    fn test_custom_salt_produces_different_keys() {
+        let master_key = b"test-master-key-32-bytes-long!!";
+        let key_id = "test-key";
+
+        let default_kp = derive_keypair(master_key, key_id, 1, None)
+            .expect("should derive");
+        let custom_kp = derive_keypair(master_key, key_id, 1, Some(b"custom-salt"))
+            .expect("should derive");
+
+        assert_ne!(default_kp.public_key_bytes(), custom_kp.public_key_bytes());
     }
 
     #[test]

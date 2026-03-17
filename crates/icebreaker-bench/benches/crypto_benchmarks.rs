@@ -21,7 +21,7 @@ fn bench_key_derivation(c: &mut Criterion) {
     let master_key = b"master-key-for-benchmark-32bytes";
 
     c.bench_function("hkdf_derive_keypair", |b| {
-        b.iter(|| black_box(derive_keypair(black_box(master_key), "bench-key", 1).unwrap()))
+        b.iter(|| black_box(derive_keypair(black_box(master_key), "bench-key", 1, None).unwrap()))
     });
 }
 

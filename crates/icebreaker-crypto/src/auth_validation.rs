@@ -129,11 +129,20 @@ impl ConnectionInfo {
 /// token creation time (client has public key) and validation time
 /// (server derives public key from secret key).
 ///
+/// Uses the provided `salt` for domain separation, or
+/// [`crate::hkdf::DEFAULT_HKDF_SALT`] when `None`.
+///
 /// # Errors
 ///
 /// Returns an error if HKDF expansion fails (should not happen for valid inputs).
-pub fn derive_api_key_hmac_key(public_key_bytes: &[u8]) -> Result<[u8; 32]> {
-    let hk = Hkdf::<Sha256>::new(None, public_key_bytes);
+pub fn derive_api_key_hmac_key(
+    public_key_bytes: &[u8],
+    salt: Option<&[u8]>,
+) -> Result<[u8; 32]> {
+    let hk = Hkdf::<Sha256>::new(
+        Some(salt.unwrap_or(crate::hkdf::DEFAULT_HKDF_SALT)),
+        public_key_bytes,
+    );
     let info = b"icebreaker-v1-api-key-auth";
     let mut okm = [0u8; 32];
     hk.expand(info, &mut okm)
@@ -157,7 +166,7 @@ pub fn derive_api_key_hmac_key(public_key_bytes: &[u8]) -> Result<[u8; 32]> {
 /// use icebreaker_crypto::{hash_api_key, derive_api_key_hmac_key};
 ///
 /// let public_key_bytes = [0u8; 32]; // Example public key
-/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes).unwrap();
+/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes, None).unwrap();
 /// let hash = hash_api_key("my-secret-key", &hmac_key).unwrap();
 /// assert_eq!(hash.len(), 64); // HMAC-SHA256 produces 64 hex chars
 /// ```
@@ -185,7 +194,7 @@ pub fn hash_api_key(key: &str, hmac_key: &[u8]) -> Result<String> {
 /// use icebreaker_common::auth::AuthConfig;
 ///
 /// let public_key_bytes = [0u8; 32]; // Example public key
-/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes).unwrap();
+/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes, None).unwrap();
 /// let config = create_api_key_config("Proxy-Authorization", "my-secret-key", &hmac_key).unwrap();
 /// let auth = AuthConfig::ApiKey(config);
 /// ```
@@ -215,7 +224,7 @@ pub fn create_api_key_config(
 /// use icebreaker_common::auth::AuthConfig;
 ///
 /// let public_key_bytes = [0u8; 32]; // Example public key
-/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes).unwrap();
+/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes, None).unwrap();
 /// let config = create_bearer_api_key_config("my-secret-key", &hmac_key).unwrap();
 /// let auth = AuthConfig::ApiKey(config);
 /// ```
@@ -245,7 +254,7 @@ pub fn create_bearer_api_key_config(key: &str, hmac_key: &[u8]) -> Result<ApiKey
 /// use icebreaker_common::auth::AuthConfig;
 ///
 /// let public_key_bytes = [0u8; 32]; // Example public key
-/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes).unwrap();
+/// let hmac_key = derive_api_key_hmac_key(&public_key_bytes, None).unwrap();
 /// let config = create_basic_auth_config("admin", "secret-password", &hmac_key).unwrap();
 /// let auth = AuthConfig::ApiKey(config);
 /// ```
@@ -559,19 +568,19 @@ mod tests {
 
     // Test HMAC key derived from a fixed public key
     fn test_hmac_key() -> [u8; 32] {
-        derive_api_key_hmac_key(&[0u8; 32]).expect("should derive HMAC key")
+        derive_api_key_hmac_key(&[0u8; 32], None).expect("should derive HMAC key")
     }
 
     #[test]
     fn test_derive_api_key_hmac_key() {
-        let hmac_key1 = derive_api_key_hmac_key(&[0u8; 32]).expect("should derive");
-        let hmac_key2 = derive_api_key_hmac_key(&[0u8; 32]).expect("should derive");
+        let hmac_key1 = derive_api_key_hmac_key(&[0u8; 32], None).expect("should derive");
+        let hmac_key2 = derive_api_key_hmac_key(&[0u8; 32], None).expect("should derive");
 
         // Same input produces same key
         assert_eq!(hmac_key1, hmac_key2);
 
         // Different input produces different key
-        let hmac_key3 = derive_api_key_hmac_key(&[1u8; 32]).expect("should derive");
+        let hmac_key3 = derive_api_key_hmac_key(&[1u8; 32], None).expect("should derive");
         assert_ne!(hmac_key1, hmac_key3);
     }
 
@@ -594,7 +603,7 @@ mod tests {
         );
 
         // Different HMAC keys produce different hashes for same API key
-        let other_hmac_key = derive_api_key_hmac_key(&[1u8; 32]).expect("should derive");
+        let other_hmac_key = derive_api_key_hmac_key(&[1u8; 32], None).expect("should derive");
         assert_ne!(
             hash,
             hash_api_key("my-secret-key", &other_hmac_key).expect("should hash")
