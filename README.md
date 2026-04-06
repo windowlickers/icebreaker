@@ -201,7 +201,6 @@ crates/
 ├── icebreaker-common/   # Core types and error handling
 ├── icebreaker-crypto/   # Encryption, HKDF, HMAC
 ├── icebreaker-proxy/    # Tower middleware stack
-├── icebreaker-audit/    # Audit logging (postgres/sqlite)
 ├── icebreaker-nonce/    # Replay protection
 ├── icebreaker-sso/      # OAuth orchestration
 └── icebreaker-cli/      # CLI binary

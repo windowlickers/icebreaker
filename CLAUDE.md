@@ -46,7 +46,6 @@ crates/
 ├── icebreaker-common/   # Core types: TokenizerError, ProxyConfig, SealedToken, ProcessorConfig
 ├── icebreaker-crypto/   # Keypair, seal/unseal, HKDF, HMAC, auth validation
 ├── icebreaker-proxy/    # Tower middleware, processors, response scanning, SSRF protection
-├── icebreaker-audit/    # Optional audit logging (postgres/sqlite feature flags)
 ├── icebreaker-nonce/    # Replay protection: in-memory and Redis nonce stores
 ├── icebreaker-sso/      # OAuth orchestration (Google, GitHub, Microsoft, generic)
 ├── icebreaker-bench/    # Criterion benchmarks
@@ -241,8 +240,6 @@ The `TlsConnectionInfo` (containing cert fingerprint and subject DN) is automati
 
 | Crate | Feature | Description |
 |-------|---------|-------------|
-| `icebreaker-audit` | `postgres` | PostgreSQL audit logging via sqlx |
-| `icebreaker-audit` | `sqlite` | SQLite audit logging via sqlx |
 | `icebreaker-nonce` | `redis` | Redis-backed nonce store (not yet implemented) |
 
 ## CI
