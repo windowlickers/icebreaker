@@ -10,7 +10,7 @@ cargo build --workspace
 cargo build --workspace --release
 
 # Test
-cargo test --workspace                              # All tests (155+)
+cargo test --workspace                              # All tests (446+)
 cargo test -p icebreaker-crypto                     # Single crate
 cargo test -p icebreaker-proxy -- network::ip_filter  # Specific module
 cargo test -p icebreaker-proxy -- processor::sigv4    # Specific processor
@@ -81,10 +81,16 @@ Timeout is applied per-request via `tokio::time::timeout`, not as a Tower layer.
 | Type | Purpose |
 |------|---------|
 | `Inject` | Header injection (Bearer, Basic, raw) |
-| `InjectHmac` | HMAC request signing |
+| `InjectHmac` | HMAC request signing (with optional `sign_body`) |
 | `OAuth` | OAuth token with refresh |
 | `InjectBody` | Body placeholder replacement (`{{ACCESS_TOKEN}}`) |
 | `Sigv4` | AWS Signature Version 4 re-signing |
+| `Multi` | Chain multiple processors in sequence |
+
+#### Multi Processor Validation
+- Must contain at least one processor
+- No nested Multi (prevents recursion)
+- At most one body processor in the chain
 
 ## Workspace Lints
 
@@ -92,7 +98,7 @@ Strict linting enforced:
 - `unsafe_code = "forbid"`
 - `unwrap_used`, `expect_used`, `panic`, `todo`, `unimplemented`, `dbg_macro` = `"deny"`
 - `missing_docs = "warn"`, `print_stdout`, `print_stderr` = `"warn"`
-- `cognitive_complexity`, `large_enum_variant`, `needless_pass_by_value` = `"warn"`
+- `cognitive_complexity`, `large_enum_variant`, `large_types_passed_by_value`, `needless_pass_by_value` = `"warn"`
 
 Use proper error handling with `?` and `Result` types.
 
@@ -180,13 +186,14 @@ icebreaker inspect # Inspect token metadata
 icebreaker sso     # Run OAuth orchestration service
 ```
 
-### Seal Options for Request Constraints
+### Seal Options
 
 ```bash
 icebreaker seal --secret <SECRET> --allowed-hosts api.example.com --public-key <KEY> \
     --allowed-methods GET,POST \
     --allowed-paths /api/v1/users,/api/v1/items \
-    --allowed-path-pattern '/api/v[12]/.*'
+    --allowed-path-pattern '/api/v[12]/.*' \
+    --single-use --expires-in 3600
 ```
 
 | Option | Description |
@@ -194,19 +201,40 @@ icebreaker seal --secret <SECRET> --allowed-hosts api.example.com --public-key <
 | `--allowed-methods` | Comma-separated HTTP methods (empty = all allowed) |
 | `--allowed-paths` | Comma-separated exact paths (empty = skip exact check) |
 | `--allowed-path-pattern` | Regex pattern for paths (auto-anchored, 10KB size limit) |
+| `--single-use` | Make token single-use (enables replay protection) |
+| `--max-uses` | Max number of uses for the token |
+| `--nonce` / `--nonce-ttl` | Custom nonce and TTL for replay protection |
+| `--expires-in` | Token expiration in seconds from now |
+| `--processor-json` | Advanced JSON processor config (overrides `--header`/`--prefix`, enables Multi) |
 
 ## Environment Variables
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `ICEBREAKER_SECRET_KEY` | (required) | Base64-encoded secret key |
+| `ICEBREAKER_KEY_ID` | `primary` | Key ID for the secret key |
 | `ICEBREAKER_BIND` | `127.0.0.1` | Bind address |
 | `ICEBREAKER_PORT` | `8080` | Listen port |
 | `ICEBREAKER_TIMEOUT` | `30` | Request timeout (seconds) |
 | `ICEBREAKER_LOG_LEVEL` | `info` | Log level |
+| `ICEBREAKER_LOG_JSON` | `false` | Output logs as JSON |
 | `ICEBREAKER_METRICS_ENABLED` | `false` | Enable Prometheus metrics |
 | `ICEBREAKER_METRICS_PORT` | `9090` | Metrics port |
+| `ICEBREAKER_HEALTH_ENABLED` | `true` | Enable health endpoint |
 | `ICEBREAKER_HEALTH_PORT` | `9091` | Health endpoint port |
+| `ICEBREAKER_SHUTDOWN_TIMEOUT` | `30` | Graceful shutdown timeout (seconds) |
+| `ICEBREAKER_SHUTDOWN_DELAY` | `0` | Delay before shutdown for LB draining (seconds) |
+| `ICEBREAKER_RESPONSE_SCAN_ENABLED` | `true` | Enable response body scanning |
+| `ICEBREAKER_RATE_LIMIT_ENABLED` | `true` | Enable rate limiting |
+| `ICEBREAKER_RATE_LIMIT_MAX_REQUESTS` | `100` | Requests per second |
+| `ICEBREAKER_RATE_LIMIT_BURST` | `20` | Burst capacity for rate limiting |
+| `ICEBREAKER_REPLAY_DETECTION` | `false` | Enable replay detection (nonce tracking) |
+| `ICEBREAKER_REPLAY_BACKEND` | `memory` | Replay backend: `memory` or `redis` |
+| `ICEBREAKER_REPLAY_REDIS_URL` | - | Redis URL (when backend=redis) |
+| `ICEBREAKER_NONCE_TTL` | `86400` | Default nonce TTL in seconds |
+| `ICEBREAKER_CLOCK_SKEW_TOLERANCE` | `30` | Clock skew tolerance (seconds) for token expiration |
+| `ICEBREAKER_MAX_FUTURE_TOKEN` | `300` | Max seconds token expiration can be in future |
+| `ICEBREAKER_REQUIRE_EXPIRATION` | `false` | Require tokens to have expiration time |
 
 ## Container Images
 
@@ -240,7 +268,7 @@ The `TlsConnectionInfo` (containing cert fingerprint and subject DN) is automati
 
 | Crate | Feature | Description |
 |-------|---------|-------------|
-| `icebreaker-nonce` | `redis` | Redis-backed nonce store (not yet implemented) |
+| `icebreaker-nonce` | `redis` | Redis-backed nonce store for replay protection |
 
 ## CI
 
