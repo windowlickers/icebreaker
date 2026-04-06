@@ -80,6 +80,14 @@ icebreaker:
   existingSecret: ""
   existingSecretKey: "secret-key"
 
+  # Replay detection configuration
+  replayDetection:
+    enabled: false
+    # Backend: "memory" or "redis"
+    backend: redis
+    # Nonce TTL in seconds
+    nonceTtl: 86400
+
   # Key ID for the secret key
   keyId: "primary"
 
@@ -179,6 +187,22 @@ networkPolicy:
   ingress: []
   # Allow egress to specific destinations
   egress: []
+
+# Redis for replay detection
+redis:
+  enabled: false
+  image:
+    repository: redis
+    tag: "8.0.2"
+    pullPolicy: IfNotPresent
+  port: 6379
+  resources:
+    limits:
+      cpu: 250m
+      memory: 128Mi
+    requests:
+      cpu: 50m
+      memory: 64Mi
 
 # ServiceMonitor for Prometheus Operator
 serviceMonitor:

@@ -66,12 +66,23 @@ spec:
             - {{ .Values.icebreaker.shutdown.timeout | quote }}
             - --shutdown-delay
             - {{ .Values.icebreaker.shutdown.delay | quote }}
+            {{- if .Values.icebreaker.replayDetection.enabled }}
+            - --replay-detection
+            - --replay-backend
+            - {{ .Values.icebreaker.replayDetection.backend | quote }}
+            - --nonce-ttl
+            - {{ .Values.icebreaker.replayDetection.nonceTtl | quote }}
+            {{- end }}
           env:
             - name: ICEBREAKER_SECRET_KEY
               valueFrom:
                 secretKeyRef:
                   name: {{ include "icebreaker.secretName" . }}
                   key: {{ .Values.icebreaker.existingSecretKey }}
+            {{- if and .Values.icebreaker.replayDetection.enabled .Values.redis.enabled (eq .Values.icebreaker.replayDetection.backend "redis") }}
+            - name: ICEBREAKER_REPLAY_REDIS_URL
+              value: "redis://{{ include "icebreaker.fullname" . }}-redis:{{ .Values.redis.port }}"
+            {{- end }}
           ports:
             - name: http
               containerPort: {{ .Values.icebreaker.port }}
