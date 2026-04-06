@@ -48,7 +48,7 @@ fn bench_ip_filter_public_v4(c: &mut Criterion) {
     let mut group = c.benchmark_group("ip_filter_public_v4");
 
     for ip in public_ips {
-        group.bench_with_input(BenchmarkId::from_parameter(&ip), &ip, |b, ip| {
+        group.bench_with_input(BenchmarkId::from_parameter(ip), &ip, |b, ip| {
             b.iter(|| black_box(filter.is_allowed(black_box(ip))))
         });
     }

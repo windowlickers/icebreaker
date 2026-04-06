@@ -2,6 +2,8 @@
 //!
 //! This binary provides the main entry point for running the Icebreaker proxy.
 
+#![allow(clippy::print_stdout, clippy::print_stderr)]
+
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -291,10 +293,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Serve(args) => run_server(args),
-        Commands::Sso(args) => run_sso(args),
-        Commands::Keygen(args) => keygen(args),
+        Commands::Sso(args) => run_sso(&args),
+        Commands::Keygen(args) => keygen(&args),
         Commands::Seal(args) => seal(args),
-        Commands::Inspect(args) => inspect(args),
+        Commands::Inspect(args) => inspect(&args),
     }
 }
 
@@ -606,6 +608,7 @@ impl Service<Request<Incoming>> for ProxyService {
 }
 
 /// Handles an HTTP connection, applying the middleware stack and serving requests.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<I>(
     io: I,
     crypto: Arc<TokenCrypto>,
@@ -1134,7 +1137,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn run_sso(args: SsoArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn run_sso(args: &SsoArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(&args.log_level));
@@ -1299,7 +1302,7 @@ async fn handle_sso_request(
                             .body(Full::new(Bytes::new()))
                             .unwrap_or_default())
                     }
-                    Err(e) => error_response(e),
+                    Err(e) => error_response(&e),
                 }
             }
             ("GET", "callback") => {
@@ -1327,7 +1330,7 @@ async fn handle_sso_request(
                             .body(Full::new(Bytes::from(http_resp.into_body())))
                             .unwrap_or_default())
                     }
-                    Err(e) => error_response(e),
+                    Err(e) => error_response(&e),
                 }
             }
             ("POST", "refresh") => match handle_refresh(service, provider_id, auth_header).await {
@@ -1347,7 +1350,7 @@ async fn handle_sso_request(
                         .body(Full::new(Bytes::from(http_resp.into_body())))
                         .unwrap_or_default())
                 }
-                Err(e) => error_response(e),
+                Err(e) => error_response(&e),
             },
             _ => not_found_response(),
         }
@@ -1371,7 +1374,7 @@ fn parse_provider_path(path: &str) -> Option<(&str, &str)> {
 
 /// Creates an error response for SSO errors.
 fn error_response(
-    error: icebreaker_sso::SsoError,
+    error: &icebreaker_sso::SsoError,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let status = error.status_code();
     let body = serde_json::json!({
@@ -1394,7 +1397,7 @@ fn not_found_response() -> Result<Response<Full<Bytes>>, std::convert::Infallibl
         .unwrap_or_default())
 }
 
-fn keygen(args: KeygenArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn keygen(args: &KeygenArgs) -> Result<(), Box<dyn std::error::Error>> {
     let keypair = Keypair::generate();
 
     println!("Generated keypair for key ID: {}", args.key_id);
@@ -1621,7 +1624,7 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn inspect(args: InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn inspect(args: &InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
     use icebreaker_common::SealedToken;
 
     let token =

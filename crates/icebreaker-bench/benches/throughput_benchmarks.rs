@@ -296,7 +296,7 @@ fn bench_streaming_scan_throughput(c: &mut Criterion) {
         let chunk_size = 4096;
         let chunks: Vec<Bytes> = data
             .chunks(chunk_size)
-            .map(|c| Bytes::copy_from_slice(c))
+            .map(Bytes::copy_from_slice)
             .collect();
 
         group.throughput(Throughput::Bytes(size as u64));
@@ -332,7 +332,7 @@ fn bench_overlap_buffer_large_stream(c: &mut Criterion) {
         let data = generate_random_bytes(total_size);
         let chunks: Vec<Bytes> = data
             .chunks(chunk_size)
-            .map(|c| Bytes::copy_from_slice(c))
+            .map(Bytes::copy_from_slice)
             .collect();
 
         group.throughput(Throughput::Bytes(total_size as u64));
