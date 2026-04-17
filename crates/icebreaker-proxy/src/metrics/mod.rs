@@ -78,6 +78,8 @@ pub enum TokenValidationResult {
     MethodValidationFailed,
     /// Path validation failed (token used for unauthorized request path).
     PathValidationFailed,
+    /// Token requested replay protection but no nonce store is configured.
+    ReplayProtectionUnavailable,
 }
 
 impl TokenValidationResult {
@@ -93,6 +95,7 @@ impl TokenValidationResult {
             Self::HostValidationFailed => "host_validation_failed",
             Self::MethodValidationFailed => "method_validation_failed",
             Self::PathValidationFailed => "path_validation_failed",
+            Self::ReplayProtectionUnavailable => "replay_protection_unavailable",
         }
     }
 }

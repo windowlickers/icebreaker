@@ -228,7 +228,7 @@ icebreaker seal --secret <SECRET> --allowed-hosts api.example.com --public-key <
 | `ICEBREAKER_RATE_LIMIT_ENABLED` | `true` | Enable rate limiting |
 | `ICEBREAKER_RATE_LIMIT_MAX_REQUESTS` | `100` | Requests per second |
 | `ICEBREAKER_RATE_LIMIT_BURST` | `20` | Burst capacity for rate limiting |
-| `ICEBREAKER_REPLAY_DETECTION` | `false` | Enable replay detection (nonce tracking) |
+| `ICEBREAKER_REPLAY_DETECTION` | `true` | Enable replay detection (nonce tracking). When disabled, tokens carrying replay protection are rejected (fail-closed) rather than silently allowed to replay. |
 | `ICEBREAKER_REPLAY_BACKEND` | `memory` | Replay backend: `memory` or `redis` |
 | `ICEBREAKER_REPLAY_REDIS_URL` | - | Redis URL (when backend=redis) |
 | `ICEBREAKER_NONCE_TTL` | `86400` | Default nonce TTL in seconds |

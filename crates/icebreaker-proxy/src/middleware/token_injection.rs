@@ -461,10 +461,13 @@ where
                         }
                     }
                 } else {
-                    tracing::debug!(
+                    record_token_validation(TokenValidationResult::ReplayProtectionUnavailable);
+                    tracing::warn!(
                         nonce = %replay.nonce,
-                        "replay protection configured but no nonce store available"
+                        max_uses = ?replay.max_uses,
+                        "rejecting token with replay protection: nonce store is not configured"
                     );
+                    return Err(TokenizerError::ReplayProtectionUnavailable);
                 }
             }
 
@@ -1330,7 +1333,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_replay_protection_without_nonce_store() {
+        async fn test_replay_protection_without_nonce_store_is_rejected() {
             let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
 
             // Create a single-use token
@@ -1345,24 +1348,21 @@ mod tests {
             let sealed_token = crypto.seal(&payload).expect("should seal");
             let token_header = sealed_token.to_header().expect("token serialization");
 
-            // Use layer WITHOUT nonce store
+            // Use layer WITHOUT nonce store — proxy should fail closed so that a
+            // misconfiguration can't silently allow replay of a single-use token.
             let layer = TokenInjectionLayer::new(crypto.clone());
+            let service = layer.layer(MockService);
+            let request = Request::builder()
+                .uri("https://api.example.com/data")
+                .header(TOKEN_HEADER, &token_header)
+                .body(())
+                .expect("request should build");
 
-            // Should work unlimited times (nonce store not configured)
-            for i in 1..=5 {
-                let service = layer.clone().layer(MockService);
-                let request = Request::builder()
-                    .uri("https://api.example.com/data")
-                    .header(TOKEN_HEADER, &token_header)
-                    .body(())
-                    .expect("request should build");
-
-                let result = service.oneshot(request).await;
-                assert!(
-                    result.is_ok(),
-                    "Request {i} should succeed (no nonce store)"
-                );
-            }
+            let result = service.oneshot(request).await;
+            assert!(
+                matches!(result, Err(TokenizerError::ReplayProtectionUnavailable)),
+                "token requiring replay protection must be rejected when no nonce store is configured, got {result:?}"
+            );
         }
 
         #[tokio::test]

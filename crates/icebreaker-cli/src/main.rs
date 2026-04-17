@@ -154,8 +154,11 @@ struct ServeArgs {
     #[arg(long, default_value = "20", env = "ICEBREAKER_RATE_LIMIT_BURST")]
     rate_limit_burst: u32,
 
-    /// Enable replay detection (nonce tracking)
-    #[arg(long, env = "ICEBREAKER_REPLAY_DETECTION")]
+    /// Enable replay detection (nonce tracking). Enabled by default so that
+    /// tokens carrying replay protection are enforced. Setting this to `false`
+    /// causes the proxy to reject any token that requires replay protection
+    /// rather than silently allowing reuse.
+    #[arg(long, default_value = "true", env = "ICEBREAKER_REPLAY_DETECTION")]
     replay_detection: bool,
 
     /// Replay detection backend: memory or redis

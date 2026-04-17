@@ -117,6 +117,15 @@ pub enum TokenizerError {
     #[error("nonce store error: {0}")]
     NonceStoreError(String),
 
+    /// Token carries replay protection but the proxy has no nonce store configured.
+    ///
+    /// Returned when a sealed token requests replay protection (single-use or
+    /// bounded uses) but the proxy was started with replay detection disabled.
+    /// Accepting such a token would silently allow unlimited reuse, so the
+    /// proxy fails closed.
+    #[error("replay protection unavailable: token requires nonce tracking but it is disabled")]
+    ReplayProtectionUnavailable,
+
     /// Response uses an unsupported Content-Encoding that cannot be scanned.
     #[error("unsupported content encoding: {encoding}")]
     UnsupportedContentEncoding {
@@ -157,6 +166,7 @@ impl TokenizerError {
             Self::AuditError(_) => "audit error",
             Self::TokenReplayDetected { .. } => "token already used",
             Self::NonceStoreError(_) => "internal error",
+            Self::ReplayProtectionUnavailable => "token rejected",
             Self::UnsupportedContentEncoding { .. } => "unsupported response encoding",
             Self::InternalError(_) => "internal error",
         }
@@ -191,6 +201,7 @@ impl TokenizerError {
                 | Self::DecryptionError(_)
                 | Self::ProxyAuthRequired { .. }
                 | Self::TokenReplayDetected { .. }
+                | Self::ReplayProtectionUnavailable
         )
     }
 
@@ -207,6 +218,7 @@ impl TokenizerError {
                 | Self::BlockedAddress { .. }
                 | Self::ProxyAuthRequired { .. }
                 | Self::TokenReplayDetected { .. }
+                | Self::ReplayProtectionUnavailable
                 | Self::UnsupportedContentEncoding { .. }
         )
     }
