@@ -17,9 +17,9 @@ unwrap_used = "allow"
 expect_used = "allow"
 
 [dependencies]
-icebreaker-common = { path = "../icebreaker-common" }
-icebreaker-crypto = { path = "../icebreaker-crypto" }
-icebreaker-proxy = { path = "../icebreaker-proxy" }
+icebreaker-common = { workspace = true }
+icebreaker-crypto = { workspace = true }
+icebreaker-proxy = { workspace = true }
 
 # Criterion for benchmarking
 criterion = { workspace = true }

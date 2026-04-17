@@ -15,7 +15,7 @@ default = []
 redis = ["dep:redis"]
 
 [dependencies]
-icebreaker-common = { path = "../icebreaker-common" }
+icebreaker-common = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

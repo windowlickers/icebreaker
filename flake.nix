@@ -9,9 +9,13 @@
     };
     crane.url = "github:ipetkov/crane";
     flake-utils.url = "github:numtide/flake-utils";
+    advisory-db = {
+      url = "github:rustsec/advisory-db";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, rust-overlay, crane, flake-utils }:
+  outputs = { self, nixpkgs, rust-overlay, crane, flake-utils, advisory-db }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -27,8 +31,14 @@
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
 
-        # Common source filtering
-        src = craneLib.cleanCargoSource ./.;
+        # Common source filtering — extend with cargo-deny.toml so cargoDeny can find it
+        src = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (craneLib.filterCargoSources path type)
+            || (baseNameOf (toString path) == "cargo-deny.toml");
+          name = "source";
+        };
 
         # Common build inputs (runtime dependencies)
         commonBuildInputs = with pkgs; [ openssl ]
@@ -135,6 +145,14 @@
             inherit cargoArtifacts;
             cargoTestExtraArgs = "--all-features";
           });
+
+          audit = craneLib.cargoAudit {
+            inherit src advisory-db;
+          };
+
+          deny = craneLib.cargoDeny (commonArgs // {
+            cargoDenyChecks = "--config cargo-deny.toml bans licenses sources";
+          });
         };
 
         packages = {
@@ -171,6 +189,7 @@
             cargo-edit
             cargo-outdated
             cargo-audit
+            cargo-deny
             cargo-expand
             skopeo
             dive

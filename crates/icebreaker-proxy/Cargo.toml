@@ -11,9 +11,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-icebreaker-common = { path = "../icebreaker-common" }
-icebreaker-crypto = { path = "../icebreaker-crypto" }
-icebreaker-nonce = { path = "../icebreaker-nonce" }
+icebreaker-common = { workspace = true }
+icebreaker-crypto = { workspace = true }
+icebreaker-nonce = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

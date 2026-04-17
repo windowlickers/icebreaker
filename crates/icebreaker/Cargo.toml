@@ -11,9 +11,9 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-icebreaker-common = { path = "../icebreaker-common" }
-icebreaker-crypto = { path = "../icebreaker-crypto" }
-icebreaker-proxy = { path = "../icebreaker-proxy" }
+icebreaker-common = { workspace = true }
+icebreaker-crypto = { workspace = true }
+icebreaker-proxy = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

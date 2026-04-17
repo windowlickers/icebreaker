@@ -12,8 +12,8 @@ workspace = true
 
 [dependencies]
 # Internal crates
-icebreaker-common = { path = "../icebreaker-common" }
-icebreaker-crypto = { path = "../icebreaker-crypto" }
+icebreaker-common = { workspace = true }
+icebreaker-crypto = { workspace = true }
 
 # Async runtime
 tokio.workspace = true

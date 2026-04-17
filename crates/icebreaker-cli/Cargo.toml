@@ -15,10 +15,10 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
-icebreaker-common = { path = "../icebreaker-common" }
-icebreaker-crypto = { path = "../icebreaker-crypto" }
-icebreaker-proxy = { path = "../icebreaker-proxy" }
-icebreaker-sso = { path = "../icebreaker-sso" }
+icebreaker-common = { workspace = true }
+icebreaker-crypto = { workspace = true }
+icebreaker-proxy = { workspace = true }
+icebreaker-sso = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

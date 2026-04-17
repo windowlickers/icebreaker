@@ -40,6 +40,13 @@ large_types_passed_by_value = "warn"
 needless_pass_by_value = "warn"
 
 [workspace.dependencies]
+# Internal crates
+icebreaker-common = { path = "crates/icebreaker-common", version = "0.1.0" }
+icebreaker-crypto = { path = "crates/icebreaker-crypto", version = "0.1.0" }
+icebreaker-nonce = { path = "crates/icebreaker-nonce", version = "0.1.0" }
+icebreaker-proxy = { path = "crates/icebreaker-proxy", version = "0.1.0" }
+icebreaker-sso = { path = "crates/icebreaker-sso", version = "0.1.0" }
+
 # Async runtime
 tokio = { version = "1.43", features = ["full"] }
 
