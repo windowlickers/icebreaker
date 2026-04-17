@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  fmt:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: cargo fmt
+        run: nix build .#checks.x86_64-linux.fmt --print-build-logs
+
+  clippy:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: cargo clippy
+        run: nix build .#checks.x86_64-linux.clippy --print-build-logs
+
+  tests:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: cargo test
+        run: nix build .#checks.x86_64-linux.tests --print-build-logs
+
+  build:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build icebreaker
+        run: nix build .#icebreaker --print-build-logs
+      - name: Build icebreaker-cli
+        run: nix build .#icebreaker-cli --print-build-logs
+      - name: Verify CLI binary
+        run: |
+          test -x result/bin/icebreaker
+          result/bin/icebreaker --version
+
+  image:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Build container image
+        run: nix build .#icebreaker-image --print-build-logs
+      - name: Verify image archive
+        run: test -f result
