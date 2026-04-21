@@ -10,7 +10,7 @@ cargo build --workspace
 cargo build --workspace --release
 
 # Test
-cargo test --workspace                              # All tests (446+)
+cargo test --workspace
 cargo test -p icebreaker-crypto                     # Single crate
 cargo test -p icebreaker-proxy -- network::ip_filter  # Specific module
 cargo test -p icebreaker-proxy -- processor::sigv4    # Specific processor
@@ -20,6 +20,10 @@ RUST_LOG=debug cargo test                           # With logging
 cargo clippy --workspace --all-targets
 cargo fmt --check
 cargo fmt --all
+
+# Supply chain
+cargo deny check --config cargo-deny.toml   # bans/licenses/sources
+cargo audit                                 # RustSec advisory scan
 
 # Benchmarks
 cargo bench -p icebreaker-bench
@@ -246,6 +250,8 @@ nix run .#push                    # Push to registry (harbor.windowlicke.rs/wind
 
 Health endpoints: `/healthz` (liveness), `/readyz` (readiness)
 
+A Helm chart lives at `helm/icebreaker/` (includes an optional Redis sidecar for replay-detection state).
+
 ## mTLS Client Authentication
 
 mTLS is fully supported with the following CLI arguments:
@@ -274,7 +280,7 @@ The `TlsConnectionInfo` (containing cert fingerprint and subject DN) is automati
 
 No GitHub Actions—CI runs via Nix flake checks:
 ```bash
-nix flake check   # Runs: build, cargo fmt, clippy (--all-targets --all-features -D warnings), tests (--all-features)
+nix flake check   # Runs: build, cargo fmt, clippy (--all-targets --all-features -D warnings), tests (--all-features), cargoAudit, cargoDeny
 ```
 
 ## Testing Patterns
