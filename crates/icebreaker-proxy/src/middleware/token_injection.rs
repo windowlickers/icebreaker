@@ -122,7 +122,9 @@ pub struct TokenInjectionLayer {
 }
 
 impl TokenInjectionLayer {
-    /// Creates a new token injection layer with response scanning enabled.
+    /// Creates a new token injection layer with default options: response scanning
+    /// enabled, no nonce store, and default clock skew tolerance. Use the `with_*`
+    /// methods to override.
     pub fn new(crypto: Arc<TokenCrypto>) -> Self {
         Self {
             crypto,
@@ -132,53 +134,25 @@ impl TokenInjectionLayer {
         }
     }
 
-    /// Creates a new token injection layer with configurable response scanning.
-    pub fn with_response_scan(crypto: Arc<TokenCrypto>, enabled: bool) -> Self {
-        Self {
-            crypto,
-            response_scan_enabled: enabled,
-            nonce_store: None,
-            clock_skew: ClockSkewConfig::default(),
-        }
+    /// Enables or disables response body scanning for secret leaks.
+    #[must_use]
+    pub fn with_response_scan(mut self, enabled: bool) -> Self {
+        self.response_scan_enabled = enabled;
+        self
     }
 
-    /// Creates a new token injection layer with nonce store for replay protection.
-    pub fn with_nonce_store(crypto: Arc<TokenCrypto>, nonce_store: Arc<dyn NonceStore>) -> Self {
-        Self {
-            crypto,
-            response_scan_enabled: true,
-            nonce_store: Some(nonce_store),
-            clock_skew: ClockSkewConfig::default(),
-        }
+    /// Attaches a nonce store to enable replay protection for single-use / bounded-use tokens.
+    #[must_use]
+    pub fn with_nonce_store(mut self, nonce_store: Arc<dyn NonceStore>) -> Self {
+        self.nonce_store = Some(nonce_store);
+        self
     }
 
-    /// Creates a new token injection layer with all options.
-    pub fn with_options(
-        crypto: Arc<TokenCrypto>,
-        response_scan_enabled: bool,
-        nonce_store: Option<Arc<dyn NonceStore>>,
-    ) -> Self {
-        Self {
-            crypto,
-            response_scan_enabled,
-            nonce_store,
-            clock_skew: ClockSkewConfig::default(),
-        }
-    }
-
-    /// Creates a new token injection layer with all options including clock skew configuration.
-    pub fn with_all_options(
-        crypto: Arc<TokenCrypto>,
-        response_scan_enabled: bool,
-        nonce_store: Option<Arc<dyn NonceStore>>,
-        clock_skew: ClockSkewConfig,
-    ) -> Self {
-        Self {
-            crypto,
-            response_scan_enabled,
-            nonce_store,
-            clock_skew,
-        }
+    /// Overrides the clock skew tolerance used when computing nonce TTLs from token expirations.
+    #[must_use]
+    pub fn with_clock_skew(mut self, clock_skew: ClockSkewConfig) -> Self {
+        self.clock_skew = clock_skew;
+        self
     }
 }
 
@@ -204,63 +178,6 @@ pub struct TokenInjectionService<S> {
     response_scan_enabled: bool,
     nonce_store: Option<Arc<dyn NonceStore>>,
     clock_skew: ClockSkewConfig,
-}
-
-impl<S> TokenInjectionService<S> {
-    /// Creates a new token injection service with response scanning enabled.
-    pub fn new(inner: S, crypto: Arc<TokenCrypto>) -> Self {
-        Self {
-            inner,
-            crypto,
-            response_scan_enabled: true,
-            nonce_store: None,
-            clock_skew: ClockSkewConfig::default(),
-        }
-    }
-
-    /// Creates a new token injection service with configurable response scanning.
-    pub fn with_response_scan(inner: S, crypto: Arc<TokenCrypto>, enabled: bool) -> Self {
-        Self {
-            inner,
-            crypto,
-            response_scan_enabled: enabled,
-            nonce_store: None,
-            clock_skew: ClockSkewConfig::default(),
-        }
-    }
-
-    /// Creates a new token injection service with all options.
-    pub fn with_options(
-        inner: S,
-        crypto: Arc<TokenCrypto>,
-        response_scan_enabled: bool,
-        nonce_store: Option<Arc<dyn NonceStore>>,
-    ) -> Self {
-        Self {
-            inner,
-            crypto,
-            response_scan_enabled,
-            nonce_store,
-            clock_skew: ClockSkewConfig::default(),
-        }
-    }
-
-    /// Creates a new token injection service with all options including clock skew.
-    pub fn with_all_options(
-        inner: S,
-        crypto: Arc<TokenCrypto>,
-        response_scan_enabled: bool,
-        nonce_store: Option<Arc<dyn NonceStore>>,
-        clock_skew: ClockSkewConfig,
-    ) -> Self {
-        Self {
-            inner,
-            crypto,
-            response_scan_enabled,
-            nonce_store,
-            clock_skew,
-        }
-    }
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for TokenInjectionService<S>
@@ -1212,7 +1129,8 @@ mod tests {
             let sealed_token = crypto.seal(&payload).expect("should seal");
             let token_header = sealed_token.to_header().expect("token serialization");
 
-            let layer = TokenInjectionLayer::with_nonce_store(crypto.clone(), nonce_store.clone());
+            let layer =
+                TokenInjectionLayer::new(crypto.clone()).with_nonce_store(nonce_store.clone());
 
             // First request should succeed
             {
@@ -1263,7 +1181,8 @@ mod tests {
             let sealed_token = crypto.seal(&payload).expect("should seal");
             let token_header = sealed_token.to_header().expect("token serialization");
 
-            let layer = TokenInjectionLayer::with_nonce_store(crypto.clone(), nonce_store.clone());
+            let layer =
+                TokenInjectionLayer::new(crypto.clone()).with_nonce_store(nonce_store.clone());
 
             // First 3 requests should succeed
             for i in 1..=3 {
@@ -1313,7 +1232,8 @@ mod tests {
             let sealed_token = crypto.seal(&payload).expect("should seal");
             let token_header = sealed_token.to_header().expect("token serialization");
 
-            let layer = TokenInjectionLayer::with_nonce_store(crypto.clone(), nonce_store.clone());
+            let layer =
+                TokenInjectionLayer::new(crypto.clone()).with_nonce_store(nonce_store.clone());
 
             // Should work multiple times
             for i in 1..=10 {
@@ -1372,7 +1292,8 @@ mod tests {
                 InMemoryNonceStore::with_cleanup_interval(Duration::from_secs(3600)),
             );
 
-            let layer = TokenInjectionLayer::with_nonce_store(crypto.clone(), nonce_store.clone());
+            let layer =
+                TokenInjectionLayer::new(crypto.clone()).with_nonce_store(nonce_store.clone());
 
             // Create two single-use tokens with different nonces
             for nonce in ["nonce-a", "nonce-b"] {

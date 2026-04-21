@@ -75,7 +75,7 @@ crates/
 ServiceBuilder::new()
     .layer(RateLimitLayer::new(rate_config))  // optional
     .layer(MetricsLayer::new())
-    .layer(TokenInjectionLayer::with_all_options(...))
+    .layer(TokenInjectionLayer::new(crypto).with_nonce_store(...).with_clock_skew(...))
     .layer(DynamicResponseScanLayer::new())   // must come after TokenInjectionLayer
     .service(proxy_service);
 ```

@@ -690,12 +690,15 @@ async fn handle_connection<I>(
         let service = ServiceBuilder::new()
             .layer(RateLimitLayer::new(rate_config))
             .layer(MetricsLayer::new())
-            .layer(TokenInjectionLayer::with_all_options(
-                crypto,
-                response_scan_enabled,
-                nonce_store,
-                clock_skew,
-            ))
+            .layer({
+                let mut layer = TokenInjectionLayer::new(crypto)
+                    .with_response_scan(response_scan_enabled)
+                    .with_clock_skew(clock_skew);
+                if let Some(store) = nonce_store {
+                    layer = layer.with_nonce_store(store);
+                }
+                layer
+            })
             .layer(DynamicResponseScanLayer::new())
             .service(proxy_service);
 
@@ -752,12 +755,15 @@ async fn handle_connection<I>(
     } else {
         let service = ServiceBuilder::new()
             .layer(MetricsLayer::new())
-            .layer(TokenInjectionLayer::with_all_options(
-                crypto,
-                response_scan_enabled,
-                nonce_store,
-                clock_skew,
-            ))
+            .layer({
+                let mut layer = TokenInjectionLayer::new(crypto)
+                    .with_response_scan(response_scan_enabled)
+                    .with_clock_skew(clock_skew);
+                if let Some(store) = nonce_store {
+                    layer = layer.with_nonce_store(store);
+                }
+                layer
+            })
             .layer(DynamicResponseScanLayer::new())
             .service(proxy_service);
 

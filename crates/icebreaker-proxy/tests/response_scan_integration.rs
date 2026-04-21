@@ -27,9 +27,7 @@ use tower::{ServiceBuilder, ServiceExt};
 use wiremock::matchers::method;
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use icebreaker_common::{
-    ClockSkewConfig, InjectConfig, ProcessorConfig, TokenPayload, TokenizerError,
-};
+use icebreaker_common::{InjectConfig, ProcessorConfig, TokenPayload, TokenizerError};
 use icebreaker_crypto::{Keypair, TokenCrypto};
 use icebreaker_proxy::{DynamicResponseScanLayer, TokenInjectionLayer, TOKEN_HEADER};
 
@@ -81,12 +79,7 @@ async fn test_raw_secret_in_body_blocks_stream() {
     });
 
     let svc = ServiceBuilder::new()
-        .layer(TokenInjectionLayer::with_all_options(
-            crypto,
-            true,
-            None,
-            ClockSkewConfig::default(),
-        ))
+        .layer(TokenInjectionLayer::new(crypto))
         .layer(DynamicResponseScanLayer::new())
         .service(forwarder);
 
@@ -122,12 +115,7 @@ async fn test_base64_encoded_secret_in_body_blocks_stream() {
     });
 
     let svc = ServiceBuilder::new()
-        .layer(TokenInjectionLayer::with_all_options(
-            crypto,
-            true,
-            None,
-            ClockSkewConfig::default(),
-        ))
+        .layer(TokenInjectionLayer::new(crypto))
         .layer(DynamicResponseScanLayer::new())
         .service(forwarder);
 
@@ -162,12 +150,7 @@ async fn test_clean_response_passes_through() {
     });
 
     let svc = ServiceBuilder::new()
-        .layer(TokenInjectionLayer::with_all_options(
-            crypto,
-            true,
-            None,
-            ClockSkewConfig::default(),
-        ))
+        .layer(TokenInjectionLayer::new(crypto))
         .layer(DynamicResponseScanLayer::new())
         .service(forwarder);
 
@@ -204,12 +187,7 @@ async fn test_secret_in_response_header_blocks_response() {
     });
 
     let svc = ServiceBuilder::new()
-        .layer(TokenInjectionLayer::with_all_options(
-            crypto,
-            true,
-            None,
-            ClockSkewConfig::default(),
-        ))
+        .layer(TokenInjectionLayer::new(crypto))
         .layer(DynamicResponseScanLayer::new())
         .service(forwarder);
 
