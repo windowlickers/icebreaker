@@ -13,7 +13,9 @@ use tower::{Layer, Service};
 
 use icebreaker_common::{ResponseScanConfig, TokenizerError, UnsupportedEncodingBehavior};
 
-use crate::body::{scan_header_values, DecompressingBody, ScanningBody, SecretScannerConfig};
+use crate::body::{
+    scan_header_values, DecompressingBody, ScanningBody, SecretScannerConfig, StreamScanner,
+};
 use crate::metrics::{record_secret_leak_detected, record_unsupported_encoding_blocked};
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -109,6 +111,19 @@ where
             Ok(DecompressingBody::identity(body))
         }
     }
+}
+
+/// Scans response headers and errors if a secret leaks.
+fn scan_response_headers(
+    headers: &http::HeaderMap,
+    scanner: &mut StreamScanner,
+) -> Result<(), BoxError> {
+    if scan_header_values(headers, scanner) {
+        record_secret_leak_detected();
+        tracing::warn!("secret leak detected in response headers");
+        return Err(Box::new(TokenizerError::SecretLeakDetected));
+    }
+    Ok(())
 }
 
 /// Resolves `Content-Encoding` into a `DecompressingBody`, stripping
@@ -220,15 +235,8 @@ where
             // Decompress and wrap the response body with scanning
             let (mut parts, body) = response.into_parts();
 
-            // Scan response headers for secrets
             let mut scanner = config.create_scanner();
-            if scan_header_values(&parts.headers, &mut scanner) {
-                record_secret_leak_detected();
-                tracing::warn!("secret leak detected in response headers");
-                let err: Box<dyn std::error::Error + Send + Sync> =
-                    Box::new(TokenizerError::SecretLeakDetected);
-                return Err(err);
-            }
+            scan_response_headers(&parts.headers, &mut scanner)?;
 
             let decompressing = resolve_encoding(&mut parts, body, config.response_scan_config())?;
 
@@ -328,16 +336,9 @@ where
 
             let (mut parts, body) = response.into_parts();
 
-            // Scan response headers for secrets
             if !patterns.is_empty() {
-                let mut scanner = crate::body::StreamScanner::new(patterns.clone());
-                if scan_header_values(&parts.headers, &mut scanner) {
-                    record_secret_leak_detected();
-                    tracing::warn!("secret leak detected in response headers");
-                    let err: Box<dyn std::error::Error + Send + Sync> =
-                        Box::new(TokenizerError::SecretLeakDetected);
-                    return Err(err);
-                }
+                let mut scanner = StreamScanner::new(patterns.clone());
+                scan_response_headers(&parts.headers, &mut scanner)?;
             }
 
             let decompressing = resolve_encoding(&mut parts, body, &response_scan_config)?;
