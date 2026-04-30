@@ -4,6 +4,9 @@ on:
   push:
   pull_request:
 
+env:
+  ATTIC_TOKEN: ${{ secrets.ATTIC_TOKEN }}
+
 jobs:
   fmt:
     runs-on: nix-latest
@@ -12,8 +15,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci http://atticd.attic.svc.cluster.local:8080/ "$ATTIC_TOKEN"
+          attic use ci
       - name: cargo fmt
         run: nix build .#checks.x86_64-linux.fmt --print-build-logs
+      - name: Push to attic
+        run: attic push ci ./result
 
   clippy:
     runs-on: nix-latest
@@ -22,8 +31,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci http://atticd.attic.svc.cluster.local:8080/ "$ATTIC_TOKEN"
+          attic use ci
       - name: cargo clippy
         run: nix build .#checks.x86_64-linux.clippy --print-build-logs
+      - name: Push to attic
+        run: attic push ci ./result
 
   tests:
     runs-on: nix-latest
@@ -32,8 +47,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci http://atticd.attic.svc.cluster.local:8080/ "$ATTIC_TOKEN"
+          attic use ci
       - name: cargo test
         run: nix build .#checks.x86_64-linux.tests --print-build-logs
+      - name: Push to attic
+        run: attic push ci ./result
 
   build:
     runs-on: nix-latest
@@ -42,10 +63,18 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci http://atticd.attic.svc.cluster.local:8080/ "$ATTIC_TOKEN"
+          attic use ci
       - name: Build icebreaker
         run: nix build .#icebreaker --print-build-logs
+      - name: Push icebreaker to attic
+        run: attic push ci ./result
       - name: Build icebreaker-cli
         run: nix build .#icebreaker-cli --print-build-logs
+      - name: Push icebreaker-cli to attic
+        run: attic push ci ./result
       - name: Verify CLI binary
         run: |
           test -x result/bin/icebreaker
@@ -58,7 +87,13 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci http://atticd.attic.svc.cluster.local:8080/ "$ATTIC_TOKEN"
+          attic use ci
       - name: Build container image
         run: nix build .#icebreaker-image --print-build-logs
+      - name: Push to attic
+        run: attic push ci ./result
       - name: Verify image archive
         run: test -f result
