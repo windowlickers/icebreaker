@@ -364,6 +364,53 @@ impl ShutdownState {
     }
 }
 
+/// Builds a plain-text response with the given status and body.
+fn plain_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from(body))))
+}
+
+/// Builds a readiness response, including the active connection count header.
+fn readiness_response(
+    state: &ShutdownState,
+    status: StatusCode,
+    body: &'static str,
+) -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(status)
+        .header("X-Active-Connections", state.active_count().to_string())
+        .body(Full::new(Bytes::from(body)))
+        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from(body))))
+}
+
+/// Routes a health-server request to the appropriate liveness/readiness response.
+fn build_health_response(
+    state: &ShutdownState,
+    liveness_path: &str,
+    readiness_path: &str,
+    req: &Request<Incoming>,
+) -> Response<Full<Bytes>> {
+    let path = req.uri().path();
+
+    if path == liveness_path {
+        if state.is_alive() {
+            plain_response(StatusCode::OK, "OK")
+        } else {
+            plain_response(StatusCode::SERVICE_UNAVAILABLE, "NOT OK")
+        }
+    } else if path == readiness_path {
+        if state.is_ready() {
+            readiness_response(state, StatusCode::OK, "READY")
+        } else {
+            readiness_response(state, StatusCode::SERVICE_UNAVAILABLE, "NOT READY")
+        }
+    } else {
+        plain_response(StatusCode::NOT_FOUND, "NOT FOUND")
+    }
+}
+
 /// Runs the health server on a separate port.
 async fn run_health_server(
     health_config: HealthConfig,
@@ -392,69 +439,12 @@ async fn run_health_server(
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
-                let (stream, _remote_addr) = match accept_result {
-                    Ok(conn) => conn,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "health server: failed to accept connection");
-                        continue;
-                    }
-                };
-
-                let state = shutdown_state.clone();
-                let liveness_path = health_config.liveness_path.clone();
-                let readiness_path = health_config.readiness_path.clone();
-
-                tokio::spawn(async move {
-                    let io = TokioIo::new(stream);
-                    let service = hyper::service::service_fn(move |req: Request<Incoming>| {
-                        let state = state.clone();
-                        let liveness_path = liveness_path.clone();
-                        let readiness_path = readiness_path.clone();
-                        async move {
-                            let path = req.uri().path();
-                            let response: Response<Full<Bytes>> = if path == liveness_path {
-                                // Liveness: is the process running?
-                                if state.is_alive() {
-                                    Response::builder()
-                                        .status(StatusCode::OK)
-                                        .body(Full::new(Bytes::from("OK")))
-                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("OK"))))
-                                } else {
-                                    Response::builder()
-                                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                                        .body(Full::new(Bytes::from("NOT OK")))
-                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("NOT OK"))))
-                                }
-                            } else if path == readiness_path {
-                                // Readiness: is the process ready to accept traffic?
-                                if state.is_ready() {
-                                    Response::builder()
-                                        .status(StatusCode::OK)
-                                        .header("X-Active-Connections", state.active_count().to_string())
-                                        .body(Full::new(Bytes::from("READY")))
-                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("READY"))))
-                                } else {
-                                    Response::builder()
-                                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                                        .header("X-Active-Connections", state.active_count().to_string())
-                                        .body(Full::new(Bytes::from("NOT READY")))
-                                        .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("NOT READY"))))
-                                }
-                            } else {
-                                Response::builder()
-                                    .status(StatusCode::NOT_FOUND)
-                                    .body(Full::new(Bytes::from("NOT FOUND")))
-                                    .unwrap_or_else(|_| Response::new(Full::new(Bytes::from("NOT FOUND"))))
-                            };
-
-                            Ok::<_, std::convert::Infallible>(response)
-                        }
-                    });
-
-                    if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
-                        tracing::debug!(error = %e, "health server: connection error");
-                    }
-                });
+                spawn_health_connection(
+                    accept_result,
+                    &shutdown_state,
+                    &health_config.liveness_path,
+                    &health_config.readiness_path,
+                );
             }
             _ = shutdown_rx.changed() => {
                 if *shutdown_rx.borrow() {
@@ -466,6 +456,43 @@ async fn run_health_server(
     }
 
     Ok(())
+}
+
+/// Spawns a task to serve a single health-server connection.
+fn spawn_health_connection(
+    accept_result: std::io::Result<(tokio::net::TcpStream, SocketAddr)>,
+    shutdown_state: &Arc<ShutdownState>,
+    liveness_path: &str,
+    readiness_path: &str,
+) {
+    let (stream, _remote_addr) = match accept_result {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::warn!(error = %e, "health server: failed to accept connection");
+            return;
+        }
+    };
+
+    let state = shutdown_state.clone();
+    let liveness_path = liveness_path.to_string();
+    let readiness_path = readiness_path.to_string();
+
+    tokio::spawn(async move {
+        let io = TokioIo::new(stream);
+        let service = hyper::service::service_fn(move |req: Request<Incoming>| {
+            let state = state.clone();
+            let liveness_path = liveness_path.clone();
+            let readiness_path = readiness_path.clone();
+            async move {
+                let response = build_health_response(&state, &liveness_path, &readiness_path, &req);
+                Ok::<_, std::convert::Infallible>(response)
+            }
+        });
+
+        if let Err(e) = http1::Builder::new().serve_connection(io, service).await {
+            tracing::debug!(error = %e, "health server: connection error");
+        }
+    });
 }
 
 /// Waits for shutdown signals (SIGTERM or SIGINT).
@@ -607,22 +634,38 @@ impl Service<Request<Incoming>> for ProxyService {
     }
 }
 
+/// Shared per-process state required to serve a proxy connection.
+#[derive(Clone)]
+struct ProxyContext {
+    crypto: Arc<TokenCrypto>,
+    ip_filter: Arc<IpFilter>,
+    nonce_store: Option<Arc<dyn NonceStore>>,
+    clock_skew: ClockSkewConfig,
+    rate_limit_config: Option<RateLimitConfig>,
+    response_scan_enabled: bool,
+    request_timeout: Duration,
+}
+
 /// Handles an HTTP connection, applying the middleware stack and serving requests.
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection<I>(
     io: I,
-    crypto: Arc<TokenCrypto>,
-    ip_filter: Arc<IpFilter>,
+    ctx: ProxyContext,
     tls_info: Option<TlsConnectionInfo>,
     remote_addr: SocketAddr,
-    response_scan_enabled: bool,
-    request_timeout: Duration,
-    rate_limit_config: Option<RateLimitConfig>,
-    nonce_store: Option<Arc<dyn NonceStore>>,
-    clock_skew: ClockSkewConfig,
 ) where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
 {
+    let ProxyContext {
+        crypto,
+        ip_filter,
+        nonce_store,
+        clock_skew,
+        rate_limit_config,
+        response_scan_enabled,
+        request_timeout,
+    } = ctx;
+
     // Create the proxy service for this connection with SSRF protection
     let proxy_service = ProxyService::new(ip_filter);
 
@@ -991,6 +1034,17 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             "proxy server listening"
         );
 
+        // Bundle shared per-connection dependencies for cheap per-spawn cloning.
+        let proxy_ctx = ProxyContext {
+            crypto,
+            ip_filter,
+            nonce_store,
+            clock_skew,
+            rate_limit_config,
+            response_scan_enabled,
+            request_timeout,
+        };
+
         // Accept connections until shutdown signal
         let accept_state = shutdown_state.clone();
         let accept_handle = tokio::spawn(async move {
@@ -1015,13 +1069,9 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                     }
                 };
 
-                let crypto = crypto.clone();
-                let ip_filter = ip_filter.clone();
+                let ctx = proxy_ctx.clone();
                 let conn_state = accept_state.clone();
                 let tls_acceptor = tls_acceptor.clone();
-                let rate_limit_config = rate_limit_config.clone();
-                let nonce_store = nonce_store.clone();
-                let clock_skew = clock_skew.clone();
 
                 // Track connection
                 conn_state.connection_started();
@@ -1034,19 +1084,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                             Ok(tls_stream) => {
                                 let tls_info = extract_client_cert_info(&tls_stream);
                                 let io = TokioIo::new(tls_stream);
-                                handle_connection(
-                                    io,
-                                    crypto,
-                                    ip_filter,
-                                    tls_info,
-                                    remote_addr,
-                                    response_scan_enabled,
-                                    request_timeout,
-                                    rate_limit_config,
-                                    nonce_store,
-                                    clock_skew.clone(),
-                                )
-                                .await;
+                                handle_connection(io, ctx, tls_info, remote_addr).await;
                             }
                             Err(e) => {
                                 tracing::warn!(
@@ -1059,19 +1097,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                     } else {
                         // Plain TCP connection
                         let io = TokioIo::new(stream);
-                        handle_connection(
-                            io,
-                            crypto,
-                            ip_filter,
-                            None,
-                            remote_addr,
-                            response_scan_enabled,
-                            request_timeout,
-                            rate_limit_config,
-                            nonce_store,
-                            clock_skew,
-                        )
-                        .await;
+                        handle_connection(io, ctx, None, remote_addr).await;
                     }
 
                     // Connection finished
