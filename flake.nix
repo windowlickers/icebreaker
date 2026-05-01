@@ -144,8 +144,24 @@
         };
 
         apps = {
-          load = { type = "app"; program = "${loadImage}/bin/load"; };
-          push = { type = "app"; program = "${pushImage}/bin/push"; };
+          load = {
+            type = "app";
+            program = "${loadImage}/bin/load";
+            meta = with pkgs.lib; {
+              description = "Load the icebreaker OCI image into the local Docker daemon";
+              license = licenses.asl20;
+              platforms = platforms.linux;
+            };
+          };
+          push = {
+            type = "app";
+            program = "${pushImage}/bin/push";
+            meta = with pkgs.lib; {
+              description = "Push the icebreaker OCI image to the configured registry";
+              license = licenses.asl20;
+              platforms = platforms.linux;
+            };
+          };
         };
 
         devShells.default = craneLib.devShell {
