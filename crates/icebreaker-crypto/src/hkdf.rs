@@ -24,10 +24,7 @@ pub fn derive_keypair(
     version: u32,
     salt: Option<&[u8]>,
 ) -> Result<Keypair> {
-    let hk = Hkdf::<Sha256>::new(
-        Some(salt.unwrap_or(DEFAULT_HKDF_SALT)),
-        master_key,
-    );
+    let hk = Hkdf::<Sha256>::new(Some(salt.unwrap_or(DEFAULT_HKDF_SALT)), master_key);
 
     // Create info string: "icebreaker-v1-key-{key_id}-{version}"
     let mut info = Vec::with_capacity(KEY_INFO_PREFIX.len() + key_id.len() + 16);
@@ -63,10 +60,7 @@ pub fn derive_hmac_key(
     purpose: &str,
     salt: Option<&[u8]>,
 ) -> Result<Zeroizing<[u8; 32]>> {
-    let hk = Hkdf::<Sha256>::new(
-        Some(salt.unwrap_or(DEFAULT_HKDF_SALT)),
-        master_key,
-    );
+    let hk = Hkdf::<Sha256>::new(Some(salt.unwrap_or(DEFAULT_HKDF_SALT)), master_key);
 
     let info = format!("icebreaker-v1-hmac-{purpose}");
 
@@ -179,10 +173,9 @@ mod tests {
         let master_key = b"test-master-key-32-bytes-long!!";
         let key_id = "test-key";
 
-        let default_kp = derive_keypair(master_key, key_id, 1, None)
-            .expect("should derive");
-        let custom_kp = derive_keypair(master_key, key_id, 1, Some(b"custom-salt"))
-            .expect("should derive");
+        let default_kp = derive_keypair(master_key, key_id, 1, None).expect("should derive");
+        let custom_kp =
+            derive_keypair(master_key, key_id, 1, Some(b"custom-salt")).expect("should derive");
 
         assert_ne!(default_kp.public_key_bytes(), custom_kp.public_key_bytes());
     }

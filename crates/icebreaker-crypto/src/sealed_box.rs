@@ -280,10 +280,7 @@ impl TokenCrypto {
             TokenizerError::DecryptionError("decryption failed".to_string())
         })?;
 
-        crate::auth_validation::derive_api_key_hmac_key(
-            &versioned.keypair.public_key_bytes(),
-            None,
-        )
+        crate::auth_validation::derive_api_key_hmac_key(&versioned.keypair.public_key_bytes(), None)
     }
 }
 

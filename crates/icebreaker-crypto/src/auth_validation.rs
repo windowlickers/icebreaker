@@ -135,10 +135,7 @@ impl ConnectionInfo {
 /// # Errors
 ///
 /// Returns an error if HKDF expansion fails (should not happen for valid inputs).
-pub fn derive_api_key_hmac_key(
-    public_key_bytes: &[u8],
-    salt: Option<&[u8]>,
-) -> Result<[u8; 32]> {
+pub fn derive_api_key_hmac_key(public_key_bytes: &[u8], salt: Option<&[u8]>) -> Result<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(
         Some(salt.unwrap_or(crate::hkdf::DEFAULT_HKDF_SALT)),
         public_key_bytes,

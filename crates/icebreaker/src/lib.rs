@@ -80,7 +80,6 @@ pub mod prelude {
 
     // Processors
     pub use icebreaker_proxy::{HmacProcessor, InjectProcessor, OAuthProcessor, RequestProcessor};
-
 }
 
 #[cfg(test)]
