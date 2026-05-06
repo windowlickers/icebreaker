@@ -31,10 +31,10 @@ Output:
 Generated keypair for key ID: primary
 
 Secret key (keep private):
-  +6jGIXPbD9LKz6WKPVgIEyyCpdkeVZjraRBvS1XKutQ=
+  <base64-encoded-secret-key>
 
 Public key (safe to share):
-  ti6uxpbfiSOZaCqLgtcX7aUrp2Ff3TlBONFW+I9lkCk=
+  <base64-encoded-public-key>
 ```
 
 ### 2. Seal a Token
@@ -43,7 +43,7 @@ Create an encrypted token for a specific API:
 
 ```bash
 icebreaker seal \
-  --public-key "ti6uxpbfiSOZaCqLgtcX7aUrp2Ff3TlBONFW+I9lkCk=" \
+  --public-key "<base64-encoded-public-key>" \
   --allowed-hosts "api.openai.com" \
   --secret "sk-your-api-key" \
   --prefix "Bearer "
@@ -61,7 +61,7 @@ Use this in the X-Tokenizer-Token header.
 ### 3. Start the Proxy
 
 ```bash
-export ICEBREAKER_SECRET_KEY="+6jGIXPbD9LKz6WKPVgIEyyCpdkeVZjraRBvS1XKutQ="
+export ICEBREAKER_SECRET_KEY="<base64-encoded-secret-key>"
 icebreaker serve
 ```
 
