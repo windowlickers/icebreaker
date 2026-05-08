@@ -4,6 +4,8 @@ on:
   push:
     branches:
       - main
+    tags:
+      - 'v*'
   pull_request:
 
 env:
@@ -59,6 +61,38 @@ jobs:
       - name: Push to attic
         run: attic push ci ./result
 
+  audit:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci "$ATTIC_URL" "$ATTIC_TOKEN"
+          attic use ci
+      - name: cargo audit
+        run: nix build .#checks.x86_64-linux.audit --print-build-logs
+      - name: Push to attic
+        run: attic push ci ./result
+
+  deny:
+    runs-on: nix-latest
+    container:
+      options: --user root
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Setup attic
+        run: |
+          attic login ci "$ATTIC_URL" "$ATTIC_TOKEN"
+          attic use ci
+      - name: cargo deny
+        run: nix build .#checks.x86_64-linux.deny --print-build-logs
+      - name: Push to attic
+        run: attic push ci ./result
+
   build:
     runs-on: nix-latest
     container:
@@ -100,3 +134,20 @@ jobs:
         run: attic push ci ./result
       - name: Verify image archive
         run: test -f result
+      - name: Push image to registry
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          DOCKER_REGISTRY: ${{ vars.DOCKER_REGISTRY }}
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          nix shell nixpkgs#skopeo --command skopeo --insecure-policy copy \
+            --dest-creds "$DOCKER_USERNAME:$DOCKER_PASSWORD" \
+            "docker-archive:$(readlink -f result)" \
+            "docker://$DOCKER_REGISTRY/icebreaker:$version"
+          nix shell nixpkgs#skopeo --command skopeo --insecure-policy copy \
+            --dest-creds "$DOCKER_USERNAME:$DOCKER_PASSWORD" \
+            "docker-archive:$(readlink -f result)" \
+            "docker://$DOCKER_REGISTRY/icebreaker:latest"
