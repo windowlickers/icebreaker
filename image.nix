@@ -1,4 +1,4 @@
-{ pkgs, icebreaker-cli, version }:
+{ pkgs, icebreaker-cli, version, revision }:
 
 pkgs.dockerTools.buildLayeredImage {
   name = "icebreaker";
@@ -34,6 +34,7 @@ pkgs.dockerTools.buildLayeredImage {
       "org.opencontainers.image.title" = "Icebreaker";
       "org.opencontainers.image.description" = "Stateless tokenizer proxy for secure API credential injection";
       "org.opencontainers.image.version" = version;
+      "org.opencontainers.image.revision" = revision;
       "org.opencontainers.image.source" = "https://git.windowlicke.rs/windowlickers/icebreaker";
       "org.opencontainers.image.licenses" = "Apache-2.0";
     };

@@ -27,6 +27,11 @@
         workspaceCargoToml = builtins.fromTOML (builtins.readFile ./Cargo.toml);
         version = workspaceCargoToml.workspace.package.version;
 
+        # Git revision of the flake input. `self.rev` is set for clean git
+        # trees; `self.dirtyRev` is set when uncommitted changes are present.
+        # Falls back to "unknown" for non-git sources (e.g. tarball builds).
+        revision = self.rev or self.dirtyRev or "unknown";
+
         # Use Rust version from rust-toolchain.toml
         rustToolchain = pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         craneLib = (crane.mkLib pkgs).overrideToolchain rustToolchain;
@@ -102,7 +107,7 @@
 
         # Container image
         icebreakerImage = import ./image.nix {
-          inherit pkgs icebreaker-cli version;
+          inherit pkgs icebreaker-cli version revision;
         };
 
         # Load image into Docker
@@ -113,19 +118,22 @@
           echo "Loaded icebreaker:${version}"
         '';
 
-        # Push image to Harbor
-        registry = "harbor.windowlicke.rs/windowlickers";
+        # Push image to a registry. Accepts the registry as the first
+        # positional argument, falling back to the REGISTRY env var, then
+        # to defaultRegistry.
+        defaultRegistry = "ghcr.io/windowlickers";
         pushImage = pkgs.writeShellScriptBin "push" ''
           set -euo pipefail
-          echo "Pushing to ${registry}/icebreaker:${version}..."
+          registry="''${1:-''${REGISTRY:-${defaultRegistry}}}"
+          echo "Pushing to $registry/icebreaker:${version}..."
           ${pkgs.skopeo}/bin/skopeo --insecure-policy copy \
             docker-archive:${icebreakerImage} \
-            docker://${registry}/icebreaker:${version}
-          echo "Pushing to ${registry}/icebreaker:latest..."
+            "docker://$registry/icebreaker:${version}"
+          echo "Pushing to $registry/icebreaker:latest..."
           ${pkgs.skopeo}/bin/skopeo --insecure-policy copy \
             docker-archive:${icebreakerImage} \
-            docker://${registry}/icebreaker:latest
-          echo "Pushed ${version}"
+            "docker://$registry/icebreaker:latest"
+          echo "Pushed icebreaker:${version}"
         '';
 
       in
