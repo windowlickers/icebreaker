@@ -19,7 +19,21 @@ version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/windowlickers/icebreaker"
+homepage = "https://github.com/windowlickers/icebreaker"
+authors = ["Evan Dobry <ecdobry@windowlicke.rs>"]
 rust-version = "1.94"
+publish = false
+
+[workspace.metadata.release]
+publish = false
+shared-version = true
+consolidate-commits = true
+tag-name = "v{{version}}"
+pre-release-commit-message = "chore(release): v{{version}}"
+tag-message = "Release v{{version}}"
+allow-branch = ["main"]
+sign-tag = false
+sign-commit = false
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
