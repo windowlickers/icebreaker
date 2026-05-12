@@ -272,7 +272,7 @@ impl RefreshResponse {
             status: error.status_code(),
             token: None,
             cache_control: "no-store".to_string(),
-            error: Some(error.to_string()),
+            error: Some(error.client_message().to_string()),
         }
     }
 
@@ -314,13 +314,30 @@ mod tests {
     #[test]
     fn test_refresh_response_error() {
         let error = SsoError::TokenRefreshFailed {
-            reason: "test error".to_string(),
+            reason: "test error with sensitive=detail".to_string(),
         };
         let response = RefreshResponse::error(&error);
 
         assert_eq!(response.status, StatusCode::BAD_GATEWAY);
-        assert!(response.error.is_some());
+        assert_eq!(response.error.as_deref(), Some("token refresh failed"));
         assert!(response.token.is_none());
+
+        let http_body = response.into_response().into_body();
+        assert!(!http_body.contains("sensitive=detail"));
+        assert!(!http_body.contains("test error"));
+        assert!(http_body.contains("token refresh failed"));
+    }
+
+    #[test]
+    fn test_refresh_response_error_does_not_leak_upstream_body() {
+        let error = SsoError::TokenRefreshFailed {
+            reason: "status 401: {\"refresh_token\":\"rt-leaked\"}".to_string(),
+        };
+        let response = RefreshResponse::error(&error);
+
+        let http_body = response.into_response().into_body();
+        assert!(!http_body.contains("rt-leaked"));
+        assert!(!http_body.contains("status 401"));
     }
 
     #[test]

@@ -1412,8 +1412,13 @@ fn error_response(
     error: &icebreaker_sso::SsoError,
 ) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
     let status = error.status_code();
+    if status.is_server_error() {
+        tracing::error!(error = %error, status = %status, "sso request failed");
+    } else {
+        tracing::warn!(error = %error, status = %status, "sso request rejected");
+    }
     let body = serde_json::json!({
-        "error": error.to_string()
+        "error": error.client_message()
     });
 
     Ok(Response::builder()

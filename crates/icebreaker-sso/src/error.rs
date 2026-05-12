@@ -128,6 +128,34 @@ impl SsoError {
         }
     }
 
+    /// Returns a client-safe error message that does not expose internal details.
+    ///
+    /// Use this for HTTP response bodies returned to clients. The full error
+    /// (including hostnames, redirect URIs, and raw upstream OAuth response
+    /// bodies) is preserved by the `Display` impl for internal logging.
+    #[must_use]
+    pub fn client_message(&self) -> &'static str {
+        match self {
+            Self::ProviderNotFound { .. } => "provider not found",
+            Self::InvalidState { .. } => "invalid oauth state",
+            Self::TransactionExpired => "transaction expired or missing",
+            Self::TransactionTampered => "transaction cookie invalid",
+            Self::OAuthProviderError { .. } => "oauth provider error",
+            Self::TokenExchangeFailed { .. } => "token exchange failed",
+            Self::TokenRefreshFailed { .. } => "token refresh failed",
+            Self::ConfigError(_) => "configuration error",
+            Self::HttpError(_) => "upstream request failed",
+            Self::SerializationError(_) => "serialization error",
+            Self::CryptoError(_) => "cryptographic operation failed",
+            Self::InvalidRedirectUri { .. } => "invalid redirect uri",
+            Self::MissingParameter { .. } => "missing required parameter",
+            Self::HostNotAllowed { .. } => "destination not allowed",
+            Self::SealingError(_) => "token sealing failed",
+            Self::UnsealingError(_) => "token unsealing failed",
+            Self::InternalError(_) => "internal error",
+        }
+    }
+
     /// Returns `true` if this error is a client error.
     #[must_use]
     pub fn is_client_error(&self) -> bool {
@@ -219,5 +247,52 @@ mod tests {
         .is_client_error());
 
         assert!(SsoError::InternalError("test".into()).is_server_error());
+    }
+
+    #[test]
+    fn test_client_message_does_not_leak_host() {
+        let e = SsoError::HostNotAllowed {
+            host: "internal.corp.example".into(),
+        };
+        assert!(!e.client_message().contains("internal.corp.example"));
+    }
+
+    #[test]
+    fn test_client_message_does_not_leak_redirect_uri() {
+        let e = SsoError::InvalidRedirectUri {
+            uri: "https://app.example.com/cb?secret=hunter2".into(),
+        };
+        let msg = e.client_message();
+        assert!(!msg.contains("hunter2"));
+        assert!(!msg.contains("app.example.com"));
+    }
+
+    #[test]
+    fn test_client_message_does_not_leak_upstream_body() {
+        let e = SsoError::TokenExchangeFailed {
+            reason: "status 400: {\"error\":\"invalid_grant\",\"token\":\"leaked-rt\"}".into(),
+        };
+        let msg = e.client_message();
+        assert!(!msg.contains("leaked-rt"));
+        assert!(!msg.contains("invalid_grant"));
+    }
+
+    #[test]
+    fn test_client_message_does_not_leak_provider_id() {
+        let e = SsoError::ProviderNotFound {
+            provider_id: "secret-tenant-id".into(),
+        };
+        assert!(!e.client_message().contains("secret-tenant-id"));
+    }
+
+    #[test]
+    fn test_client_message_does_not_leak_oauth_description() {
+        let e = SsoError::OAuthProviderError {
+            error: "invalid_grant".into(),
+            description: "refresh_token=leaked-rt has been revoked".into(),
+        };
+        let msg = e.client_message();
+        assert!(!msg.contains("leaked-rt"));
+        assert!(!msg.contains("invalid_grant"));
     }
 }

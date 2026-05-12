@@ -309,7 +309,7 @@ impl CallbackResponse {
             status: error.status_code(),
             location: None,
             set_cookie: clear_cookie.to_string(),
-            body: Some(error.to_string()),
+            body: Some(error.client_message().to_string()),
         }
     }
 
@@ -382,6 +382,36 @@ mod tests {
         let response = CallbackResponse::error(&error, "cookie=; Max-Age=0");
 
         assert_eq!(response.status, StatusCode::BAD_REQUEST);
-        assert!(response.body.is_some());
+        assert_eq!(
+            response.body.as_deref(),
+            Some("transaction expired or missing")
+        );
+    }
+
+    #[test]
+    fn test_callback_response_error_does_not_leak_redirect_uri() {
+        let error = SsoError::InvalidRedirectUri {
+            uri: "https://evil.example.com/cb?leak=secret".into(),
+        };
+        let response = CallbackResponse::error(&error, "cookie=; Max-Age=0");
+
+        let body = response.body.as_deref().unwrap_or_default();
+        assert!(!body.contains("evil.example.com"));
+        assert!(!body.contains("leak=secret"));
+        assert_eq!(body, "invalid redirect uri");
+    }
+
+    #[test]
+    fn test_callback_response_error_does_not_leak_upstream_body() {
+        let error = SsoError::TokenExchangeFailed {
+            reason: "status 400: {\"error\":\"invalid_grant\",\"id\":\"tenant-abc\"}".into(),
+        };
+        let response = CallbackResponse::error(&error, "cookie=; Max-Age=0");
+
+        let body = response.body.as_deref().unwrap_or_default();
+        assert!(!body.contains("tenant-abc"));
+        assert!(!body.contains("invalid_grant"));
+        assert!(!body.contains("status 400"));
+        assert_eq!(body, "token exchange failed");
     }
 }
