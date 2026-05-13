@@ -202,9 +202,11 @@ icebreaker seal --secret <SECRET> --allowed-hosts api.example.com --public-key <
 
 | Option | Description |
 |--------|-------------|
+| `--allowed-hosts` | Comma-separated `host` or `host:port` entries. A bare host matches any port; an entry with a port matches only that port. |
 | `--allowed-methods` | Comma-separated HTTP methods (empty = all allowed) |
 | `--allowed-paths` | Comma-separated exact paths (empty = skip exact check) |
 | `--allowed-path-pattern` | Regex pattern for paths (auto-anchored, 10KB size limit) |
+| `--upstream-scheme` | `http` or `https`. Scheme used when the inbound request URI lacks one (origin-form). Defaults to `https`. Set to `http` for plaintext upstreams. |
 | `--single-use` | Make token single-use (enables replay protection) |
 | `--max-uses` | Max number of uses for the token |
 | `--nonce` / `--nonce-ttl` | Custom nonce and TTL for replay protection |

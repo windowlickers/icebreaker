@@ -132,8 +132,10 @@ impl ConnectHandler {
         let host = authority.host().to_string();
         let port = authority.port_u16().unwrap_or(443);
 
-        // Validate host against token
-        payload.validate_host(&host)?;
+        // Validate the full authority (host[:port]) against the token. The
+        // allowlist matcher accepts bare-host entries (any port) and exact
+        // `host:port` entries.
+        payload.validate_host(authority.as_str())?;
 
         tracing::debug!(
             host = %host,

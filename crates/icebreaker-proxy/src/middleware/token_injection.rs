@@ -26,6 +26,7 @@ use base64::Engine;
 use http::Request;
 use tower::{Layer, Service};
 
+use icebreaker_common::token::UpstreamScheme;
 use icebreaker_common::{ClockSkewConfig, SealedToken, TokenizerError};
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 use icebreaker_nonce::{CheckResult, NonceStore};
@@ -265,17 +266,20 @@ where
                 return Err(e);
             }
 
-            // Extract the target host from URI or Host header.
-            // This prevents bypass when requests use relative URIs (e.g., GET /path HTTP/1.1)
-            // which would otherwise skip host validation entirely.
-            let host = request.uri().host().map(str::to_string).or_else(|| {
-                request
-                    .headers()
-                    .get(http::header::HOST)
-                    .and_then(|h| h.to_str().ok())
-                    // Host header may include port (e.g., "example.com:8080"), extract just the host
-                    .map(|h| h.split(':').next().unwrap_or(h).to_string())
-            });
+            // Extract the target authority (host[:port]) from URI or Host header.
+            // The port is preserved so token allowlists can pin a specific port;
+            // `validate_host` handles the port-aware match.
+            let host = request
+                .uri()
+                .authority()
+                .map(|a| a.as_str().to_string())
+                .or_else(|| {
+                    request
+                        .headers()
+                        .get(http::header::HOST)
+                        .and_then(|h| h.to_str().ok())
+                        .map(str::to_string)
+                });
 
             // Reject requests without a determinable host - credentials cannot be safely injected
             // if we don't know where the request is going
@@ -396,6 +400,12 @@ where
 
             // Remove the token header before forwarding
             request.headers_mut().remove(TOKEN_HEADER);
+
+            // Propagate the token's upstream scheme to downstream services
+            // (e.g., ProxyService) so origin-form requests can be reconstructed
+            // as `http://` when the token opts in. Defaults to HTTPS.
+            let upstream_scheme = payload.upstream_scheme.unwrap_or(UpstreamScheme::Https);
+            request.extensions_mut().insert(upstream_scheme);
 
             // Validate processor config (rejects invalid Multi configs)
             validate_processor_config(&payload.processor)?;
@@ -781,6 +791,156 @@ mod tests {
 
         let result = service.oneshot(request).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_port_pinned_allowlist_matches_exact_port() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("forge.example.com:3000")
+        .build();
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        let request = Request::builder()
+            .uri("/api/foo")
+            .header(
+                TOKEN_HEADER,
+                sealed_token.to_header().expect("token serialization"),
+            )
+            .header(http::header::HOST, "forge.example.com:3000")
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_port_pinned_allowlist_rejects_wrong_port() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("forge.example.com:3000")
+        .build();
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let layer = TokenInjectionLayer::new(crypto);
+        let service = layer.layer(MockService);
+
+        let request = Request::builder()
+            .uri("/api/foo")
+            .header(
+                TOKEN_HEADER,
+                sealed_token.to_header().expect("token serialization"),
+            )
+            .header(http::header::HOST, "forge.example.com:8080")
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(matches!(result, Err(TokenizerError::HostNotAllowed { .. })));
+    }
+
+    /// Mock service that records the `UpstreamScheme` extension on every call.
+    #[derive(Clone, Default)]
+    struct SchemeCapturingService {
+        captured: Arc<std::sync::Mutex<Option<UpstreamScheme>>>,
+    }
+
+    impl Service<Request<()>> for SchemeCapturingService {
+        type Response = http::Response<String>;
+        type Error = Infallible;
+        type Future =
+            Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+        fn poll_ready(
+            &mut self,
+            _cx: &mut Context<'_>,
+        ) -> Poll<std::result::Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<()>) -> Self::Future {
+            let scheme = request.extensions().get::<UpstreamScheme>().copied();
+            if let Ok(mut slot) = self.captured.lock() {
+                *slot = scheme;
+            }
+            Box::pin(async move {
+                Ok(http::Response::builder()
+                    .status(200)
+                    .body(String::new())
+                    .unwrap_or_else(|_| http::Response::new(String::new())))
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn test_upstream_scheme_extension_propagates_http() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("forge.example.com")
+        .upstream_scheme(UpstreamScheme::Http)
+        .build();
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let downstream = SchemeCapturingService::default();
+        let captured = downstream.captured.clone();
+        let service = TokenInjectionLayer::new(crypto).layer(downstream);
+
+        let request = Request::builder()
+            .uri("/api/foo")
+            .header(
+                TOKEN_HEADER,
+                sealed_token.to_header().expect("token serialization"),
+            )
+            .header(http::header::HOST, "forge.example.com")
+            .body(())
+            .expect("request should build");
+
+        service.oneshot(request).await.expect("should succeed");
+
+        assert_eq!(*captured.lock().unwrap(), Some(UpstreamScheme::Http));
+    }
+
+    #[tokio::test]
+    async fn test_upstream_scheme_extension_defaults_to_https() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        let downstream = SchemeCapturingService::default();
+        let captured = downstream.captured.clone();
+        let service = TokenInjectionLayer::new(crypto).layer(downstream);
+
+        let request = Request::builder()
+            .uri("/api/foo")
+            .header(
+                TOKEN_HEADER,
+                sealed_token.to_header().expect("token serialization"),
+            )
+            .header(http::header::HOST, "api.example.com")
+            .body(())
+            .expect("request should build");
+
+        service.oneshot(request).await.expect("should succeed");
+
+        assert_eq!(*captured.lock().unwrap(), Some(UpstreamScheme::Https));
     }
 
     #[tokio::test]

@@ -52,6 +52,45 @@ impl ExpirationStatus {
     }
 }
 
+/// Upstream URL scheme used by the proxy when reconstructing the outbound URI
+/// from an origin-form request (`GET /path HTTP/1.1` + `Host:` header).
+///
+/// When the inbound request carries an absolute-form URI (with scheme), the
+/// scheme there wins. This field only controls the fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum UpstreamScheme {
+    /// Plain HTTP (`http://`). Required for plaintext upstreams.
+    Http,
+    /// HTTPS (`https://`). The default if unset.
+    Https,
+}
+
+impl UpstreamScheme {
+    /// Returns the URL scheme string (`"http"` or `"https"`).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UpstreamScheme::Http => "http",
+            UpstreamScheme::Https => "https",
+        }
+    }
+}
+
+impl std::str::FromStr for UpstreamScheme {
+    type Err = crate::error::TokenizerError;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "http" => Ok(UpstreamScheme::Http),
+            "https" => Ok(UpstreamScheme::Https),
+            other => Err(crate::error::TokenizerError::ConfigError(format!(
+                "invalid upstream scheme {other:?}: expected \"http\" or \"https\""
+            ))),
+        }
+    }
+}
+
 /// Custom serialization module for SecretString.
 mod secret_string_serde {
     use super::*;
@@ -193,6 +232,16 @@ pub struct TokenPayload {
     #[zeroize(skip)]
     pub allowed_host_pattern: Option<String>,
 
+    /// Upstream URL scheme to use when the inbound request lacks one.
+    ///
+    /// When the proxy reconstructs an outbound URI from an origin-form
+    /// request (no scheme in the request line, only a Host header), this
+    /// controls whether the upstream is dialed over `http://` or `https://`.
+    /// Absolute-form requests are not affected. `None` defaults to HTTPS.
+    #[zeroize(skip)]
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub upstream_scheme: Option<UpstreamScheme>,
+
     /// Token expiration timestamp (Unix epoch seconds).
     #[zeroize(skip)]
     pub expires_at: Option<u64>,
@@ -248,6 +297,7 @@ impl std::fmt::Debug for TokenPayload {
             .field("auth", &self.auth)
             .field("allowed_hosts", &self.allowed_hosts)
             .field("allowed_host_pattern", &self.allowed_host_pattern)
+            .field("upstream_scheme", &self.upstream_scheme)
             .field("allowed_methods", &self.allowed_methods)
             .field("allowed_paths", &self.allowed_paths)
             .field("allowed_path_pattern", &self.allowed_path_pattern)
@@ -257,6 +307,33 @@ impl std::fmt::Debug for TokenPayload {
             .field("replay_protection", &self.replay_protection)
             .finish()
     }
+}
+
+/// Splits an authority string into `(host, port)`.
+///
+/// Returns the input as a bare host (no port) if parsing fails. Handles IPv6
+/// bracketed forms like `[::1]:8080`. The returned host slice for IPv6 still
+/// includes the brackets so that comparisons against a configured allowlist
+/// entry remain consistent (entries are expected to be in the same form).
+fn split_host_port(authority: &str) -> (&str, Option<u16>) {
+    if let Some(rest) = authority.strip_prefix('[') {
+        if let Some(end) = rest.find(']') {
+            let host_with_brackets = &authority[..=end + 1];
+            let after = &authority[end + 2..];
+            let port = after.strip_prefix(':').and_then(|p| p.parse::<u16>().ok());
+            return (host_with_brackets, port);
+        }
+        return (authority, None);
+    }
+
+    if let Some(idx) = authority.rfind(':') {
+        if !authority[..idx].contains(':') {
+            if let Ok(port) = authority[idx + 1..].parse::<u16>() {
+                return (&authority[..idx], Some(port));
+            }
+        }
+    }
+    (authority, None)
 }
 
 /// Wraps a pattern in `^(?:...)$`, preserving existing anchors.
@@ -295,6 +372,7 @@ impl TokenPayload {
             auth: AuthConfig::default(),
             allowed_hosts: Vec::new(),
             allowed_host_pattern: None,
+            upstream_scheme: None,
             allowed_methods: Vec::new(),
             allowed_paths: Vec::new(),
             allowed_path_pattern: None,
@@ -365,14 +443,28 @@ impl TokenPayload {
         ExpirationStatus::Valid
     }
 
-    /// Validates that the given host is allowed.
+    /// Validates that the given host (optionally including a port) is allowed.
+    ///
+    /// Allowlist semantics:
+    /// - A bare-host entry (`forge.example.com`) matches that host on any port.
+    /// - A `host:port` entry (`forge.example.com:3000`) matches only that exact port.
+    /// - The optional regex pattern is matched against the bare host, with the
+    ///   port stripped if present.
     pub fn validate_host(&self, host: &str) -> Result<()> {
-        // Check explicit allowlist
-        if self.allowed_hosts.iter().any(|h| h == host) {
-            return Ok(());
+        let (req_host, req_port) = split_host_port(host);
+
+        for entry in &self.allowed_hosts {
+            let (entry_host, entry_port) = split_host_port(entry);
+            if entry_host != req_host {
+                continue;
+            }
+            match entry_port {
+                None => return Ok(()),
+                Some(p) if Some(p) == req_port => return Ok(()),
+                _ => continue,
+            }
         }
 
-        // Check pattern if provided
         if let Some(ref pattern) = self.allowed_host_pattern {
             let compiled = self
                 .cached_host_regex
@@ -380,7 +472,7 @@ impl TokenPayload {
             let re = compiled.as_ref().map_err(|e| {
                 crate::error::TokenizerError::ConfigError(format!("invalid host pattern: {e}"))
             })?;
-            if re.is_match(host) {
+            if re.is_match(req_host) {
                 return Ok(());
             }
         }
@@ -455,6 +547,7 @@ pub struct TokenPayloadBuilder {
     auth: AuthConfig,
     allowed_hosts: Vec<String>,
     allowed_host_pattern: Option<String>,
+    upstream_scheme: Option<UpstreamScheme>,
     allowed_methods: Vec<String>,
     allowed_paths: Vec<String>,
     allowed_path_pattern: Option<String>,
@@ -490,6 +583,13 @@ impl TokenPayloadBuilder {
     #[must_use]
     pub fn allowed_host_pattern(mut self, pattern: impl Into<String>) -> Self {
         self.allowed_host_pattern = Some(pattern.into());
+        self
+    }
+
+    /// Sets the upstream URL scheme used for origin-form requests.
+    #[must_use]
+    pub fn upstream_scheme(mut self, scheme: UpstreamScheme) -> Self {
+        self.upstream_scheme = Some(scheme);
         self
     }
 
@@ -565,6 +665,7 @@ impl TokenPayloadBuilder {
             auth: self.auth,
             allowed_hosts: self.allowed_hosts,
             allowed_host_pattern: self.allowed_host_pattern,
+            upstream_scheme: self.upstream_scheme,
             allowed_methods: self.allowed_methods,
             allowed_paths: self.allowed_paths,
             allowed_path_pattern: self.allowed_path_pattern,
@@ -885,6 +986,93 @@ mod tests {
         assert!(payload.validate_host("api.example.com").is_ok());
         assert!(payload.validate_host("api.test.com").is_ok());
         assert!(payload.validate_host("evil.com").is_err());
+    }
+
+    #[test]
+    fn test_bare_host_allowlist_matches_any_port() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("forge.example.com")
+        .build();
+
+        assert!(payload.validate_host("forge.example.com").is_ok());
+        assert!(payload.validate_host("forge.example.com:443").is_ok());
+        assert!(payload.validate_host("forge.example.com:3000").is_ok());
+        assert!(payload.validate_host("other.example.com:3000").is_err());
+    }
+
+    #[test]
+    fn test_host_with_port_allowlist_exact_match() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("forge.example.com:3000")
+        .build();
+
+        assert!(payload.validate_host("forge.example.com:3000").is_ok());
+        assert!(payload.validate_host("forge.example.com:8080").is_err());
+        assert!(payload.validate_host("forge.example.com").is_err());
+    }
+
+    #[test]
+    fn test_host_pattern_strips_port_before_matching() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host_pattern(r".*\.example\.com$")
+        .build();
+
+        assert!(payload.validate_host("api.example.com:8080").is_ok());
+        assert!(payload.validate_host("api.example.com").is_ok());
+        assert!(payload.validate_host("evil.com:443").is_err());
+    }
+
+    #[test]
+    fn test_split_host_port_ipv6() {
+        assert_eq!(split_host_port("[::1]:8080"), ("[::1]", Some(8080)));
+        assert_eq!(split_host_port("[::1]"), ("[::1]", None));
+        assert_eq!(
+            split_host_port("api.example.com:443"),
+            ("api.example.com", Some(443))
+        );
+        assert_eq!(
+            split_host_port("api.example.com"),
+            ("api.example.com", None)
+        );
+    }
+
+    #[test]
+    fn test_upstream_scheme_serde_round_trip() {
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("forge.example.com")
+        .upstream_scheme(UpstreamScheme::Http)
+        .build();
+
+        let json = serde_json::to_string(&payload).expect("serialize payload");
+        assert!(json.contains("\"upstream_scheme\":\"http\""));
+
+        let decoded: TokenPayload = serde_json::from_str(&json).expect("deserialize payload");
+        assert_eq!(decoded.upstream_scheme, Some(UpstreamScheme::Http));
+    }
+
+    #[test]
+    fn test_upstream_scheme_absent_deserializes_to_none() {
+        // Existing tokens have no upstream_scheme field; ensure they still parse.
+        let json = r#"{
+            "secret": "s",
+            "processor": {"type":"inject","header_name":"Authorization"},
+            "auth": {"type":"none"},
+            "allowed_hosts": ["api.example.com"]
+        }"#;
+        let payload: TokenPayload = serde_json::from_str(json).expect("deserialize legacy payload");
+        assert_eq!(payload.upstream_scheme, None);
     }
 
     #[test]

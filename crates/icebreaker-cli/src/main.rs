@@ -24,6 +24,7 @@ use tokio::sync::watch;
 use tower::{Service, ServiceBuilder, ServiceExt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use icebreaker_common::token::UpstreamScheme;
 use icebreaker_common::{
     ClientAuthMode, ClockSkewConfig, HealthConfig, InjectConfig, NetworkProtectionConfig,
     ProcessorConfig, ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, TlsConfig,
@@ -262,6 +263,13 @@ struct SealArgs {
     /// Example: '{"type":"multi","processors":[{"type":"inject","header_name":"Authorization","prefix":"Bearer "},{"type":"inject","header_name":"X-Api-Key"}]}'
     #[arg(long)]
     processor_json: Option<String>,
+
+    /// Upstream URL scheme to use when the inbound request URI lacks one
+    /// (origin-form `GET /path HTTP/1.1` + Host header). Defaults to https.
+    /// Set to `http` to target plaintext upstreams (e.g., a self-hosted
+    /// Forgejo at `http://forge.example.com:3000`).
+    #[arg(long, value_parser = ["http", "https"])]
+    upstream_scheme: Option<String>,
 }
 
 #[derive(Parser)]
@@ -592,8 +600,14 @@ impl Service<Request<Incoming>> for ProxyService {
                         )
                     })?;
 
-                // Build the full URI
-                let scheme = "https"; // Default to HTTPS for security
+                // Build the full URI. Scheme comes from the token (via the
+                // TokenInjectionLayer); HTTPS is the default if unset.
+                let scheme = req
+                    .extensions()
+                    .get::<UpstreamScheme>()
+                    .copied()
+                    .unwrap_or(UpstreamScheme::Https)
+                    .as_str();
                 let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 
                 Uri::builder()
@@ -1543,6 +1557,27 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
         return Err("at least one allowed host is required".into());
     }
 
+    for entry in &allowed_hosts {
+        if entry.parse::<http::uri::Authority>().is_err() {
+            return Err(format!(
+                "invalid allowed-host entry {entry:?}: expected `host` or `host:port`"
+            )
+            .into());
+        }
+    }
+
+    // Parse upstream scheme
+    let upstream_scheme = match args.upstream_scheme.as_deref() {
+        Some(s) => Some(
+            s.parse::<UpstreamScheme>()
+                .map_err(|e| format!("invalid --upstream-scheme: {e}"))?,
+        ),
+        None => None,
+    };
+    if let Some(scheme) = upstream_scheme {
+        println!("Upstream scheme: {}", scheme.as_str());
+    }
+
     // Parse allowed methods
     let method_list: Vec<String> = args
         .allowed_methods
@@ -1595,6 +1630,10 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(pattern) = args.allowed_path_pattern {
         builder = builder.allowed_path_pattern(pattern);
+    }
+
+    if let Some(scheme) = upstream_scheme {
+        builder = builder.upstream_scheme(scheme);
     }
 
     if let Some(expires_in) = args.expires_in {
