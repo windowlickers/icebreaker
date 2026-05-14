@@ -1575,7 +1575,7 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
     if let Some(scheme) = upstream_scheme {
-        println!("Upstream scheme: {}", scheme.as_str());
+        println!("Upstream scheme: {scheme}");
     }
 
     // Parse allowed methods

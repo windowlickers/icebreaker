@@ -77,6 +77,12 @@ impl UpstreamScheme {
     }
 }
 
+impl std::fmt::Display for UpstreamScheme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 impl std::str::FromStr for UpstreamScheme {
     type Err = crate::error::TokenizerError;
 
