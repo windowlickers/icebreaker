@@ -310,7 +310,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Serve(args) => run_server(args),
         Commands::Sso(args) => run_sso(&args),
         Commands::Keygen(args) => keygen(&args),
-        Commands::Seal(args) => seal(args),
+        Commands::Seal(args) => seal(&args),
         Commands::Inspect(args) => inspect(&args),
     }
 }
@@ -1498,12 +1498,142 @@ fn keygen(args: &KeygenArgs) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
-    use base64::Engine;
+fn parse_processor_config(args: &SealArgs) -> std::result::Result<ProcessorConfig, String> {
+    if let Some(ref json) = args.processor_json {
+        let config: ProcessorConfig =
+            serde_json::from_str(json).map_err(|e| format!("invalid processor JSON: {e}"))?;
+
+        if let ProcessorConfig::Multi(ref multi) = config {
+            multi
+                .validate()
+                .map_err(|e| format!("invalid multi-processor config: {e}"))?;
+        }
+
+        return Ok(config);
+    }
+
+    let inject_config = if let Some(ref prefix) = args.prefix {
+        InjectConfig {
+            header_name: args.header.clone(),
+            prefix: Some(prefix.clone()),
+            suffix: None,
+        }
+    } else if args.header.eq_ignore_ascii_case("authorization") {
+        InjectConfig::bearer(&args.header)
+    } else {
+        InjectConfig::raw(&args.header)
+    };
+
+    Ok(ProcessorConfig::Inject(inject_config))
+}
+
+fn parse_allowed_hosts(spec: &str) -> std::result::Result<Vec<String>, String> {
+    let hosts: Vec<String> = spec
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    if hosts.is_empty() {
+        return Err("at least one allowed host is required".to_string());
+    }
+
+    for entry in &hosts {
+        entry
+            .parse::<http::uri::Authority>()
+            .map_err(|e| format!("invalid allowed-host entry {entry:?}: {e}"))?;
+    }
+
+    Ok(hosts)
+}
+
+fn parse_csv<F>(spec: Option<&str>, transform: F) -> Vec<String>
+where
+    F: Fn(&str) -> String,
+{
+    spec.map(|raw| {
+        raw.split(',')
+            .map(|s| transform(s.trim()))
+            .filter(|s| !s.is_empty())
+            .collect()
+    })
+    .unwrap_or_default()
+}
+
+fn build_replay_protection(args: &SealArgs) -> ReplayProtection {
+    let nonce = args.nonce.clone().unwrap_or_else(|| {
+        let bytes: [u8; 16] = rand::random();
+        hex::encode(bytes)
+    });
+
+    let max_uses = if args.single_use {
+        Some(1)
+    } else {
+        args.max_uses
+    };
+
+    let mut replay = ReplayProtection {
+        nonce,
+        max_uses,
+        nonce_ttl_seconds: args.nonce_ttl,
+    };
+
+    if let Some(ttl) = args.nonce_ttl {
+        replay = replay.with_ttl(ttl);
+    }
+
+    replay
+}
+
+fn build_seal_payload(
+    args: &SealArgs,
+) -> std::result::Result<icebreaker_common::TokenPayload, String> {
     use icebreaker_common::TokenPayload;
     use secrecy::SecretString;
 
-    // Parse public key
+    let processor_config = parse_processor_config(args)?;
+    let allowed_hosts = parse_allowed_hosts(&args.allowed_hosts)?;
+    let method_list = parse_csv(args.allowed_methods.as_deref(), |s| s.to_uppercase());
+    let path_list = parse_csv(args.allowed_paths.as_deref(), str::to_string);
+
+    let mut builder =
+        TokenPayload::builder(SecretString::from(args.secret.clone()), processor_config)
+            .allowed_hosts(allowed_hosts);
+
+    if !method_list.is_empty() {
+        builder = builder.allowed_methods(method_list);
+    }
+
+    if !path_list.is_empty() {
+        builder = builder.allowed_paths(path_list);
+    }
+
+    if let Some(ref pattern) = args.allowed_path_pattern {
+        builder = builder.allowed_path_pattern(pattern.clone());
+    }
+
+    if let Some(scheme) = args.upstream_scheme {
+        builder = builder.upstream_scheme(scheme);
+    }
+
+    if let Some(expires_in) = args.expires_in {
+        let expires_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() + expires_in)
+            .unwrap_or(0);
+        builder = builder.expires_at(expires_at);
+    }
+
+    if args.single_use || args.max_uses.is_some() {
+        builder = builder.replay_protection(build_replay_protection(args));
+    }
+
+    Ok(builder.build())
+}
+
+fn seal(args: &SealArgs) -> Result<(), Box<dyn std::error::Error>> {
+    use base64::Engine;
+
     let public_key_bytes = base64::engine::general_purpose::STANDARD
         .decode(&args.public_key)
         .map_err(|e| format!("invalid public key: {e}"))?;
@@ -1520,167 +1650,34 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     pk_array.copy_from_slice(&public_key_bytes);
     let public_key = crypto_box::PublicKey::from(pk_array);
 
-    // Build processor config
-    let processor_config: ProcessorConfig = if let Some(ref json) = args.processor_json {
-        let config: ProcessorConfig =
-            serde_json::from_str(json).map_err(|e| format!("invalid processor JSON: {e}"))?;
+    let payload = build_seal_payload(args)?;
 
-        // Validate multi-processor configs
-        if let ProcessorConfig::Multi(ref multi) = config {
-            multi
-                .validate()
-                .map_err(|e| format!("invalid multi-processor config: {e}"))?;
-        }
-
-        config
-    } else {
-        let inject_config = if let Some(prefix) = args.prefix {
-            InjectConfig {
-                header_name: args.header,
-                prefix: Some(prefix),
-                suffix: None,
-            }
-        } else if args.header.to_lowercase() == "authorization" {
-            InjectConfig::bearer(&args.header)
-        } else {
-            InjectConfig::raw(&args.header)
-        };
-
-        ProcessorConfig::Inject(inject_config)
-    };
-
-    // Parse allowed hosts
-    let allowed_hosts: Vec<String> = args
-        .allowed_hosts
-        .split(',')
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .collect();
-
-    if allowed_hosts.is_empty() {
-        return Err("at least one allowed host is required".into());
-    }
-
-    for entry in &allowed_hosts {
-        entry
-            .parse::<http::uri::Authority>()
-            .map_err(|e| format!("invalid allowed-host entry {entry:?}: {e}"))?;
-    }
-
-    if let Some(scheme) = args.upstream_scheme {
+    if let Some(scheme) = payload.upstream_scheme {
         println!("Upstream scheme: {scheme}");
     }
-
-    // Parse allowed methods
-    let method_list: Vec<String> = args
-        .allowed_methods
-        .as_deref()
-        .map(|methods| {
-            methods
-                .split(',')
-                .map(|s| s.trim().to_uppercase())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if !method_list.is_empty() {
-        println!("Allowed methods: {}", method_list.join(", "));
+    if !payload.allowed_methods.is_empty() {
+        println!("Allowed methods: {}", payload.allowed_methods.join(", "));
     }
-
-    // Parse allowed paths
-    let path_list: Vec<String> = args
-        .allowed_paths
-        .as_deref()
-        .map(|paths| {
-            paths
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-
-    if !path_list.is_empty() {
-        println!("Allowed paths: {}", path_list.join(", "));
+    if !payload.allowed_paths.is_empty() {
+        println!("Allowed paths: {}", payload.allowed_paths.join(", "));
     }
-
-    if let Some(ref pattern) = args.allowed_path_pattern {
+    if let Some(ref pattern) = payload.allowed_path_pattern {
         println!("Allowed path pattern: {}", pattern);
     }
-
-    // Build payload
-    let mut builder = TokenPayload::builder(SecretString::from(args.secret), processor_config)
-        .allowed_hosts(allowed_hosts);
-
-    if !method_list.is_empty() {
-        builder = builder.allowed_methods(method_list);
-    }
-
-    if !path_list.is_empty() {
-        builder = builder.allowed_paths(path_list);
-    }
-
-    if let Some(pattern) = args.allowed_path_pattern {
-        builder = builder.allowed_path_pattern(pattern);
-    }
-
-    if let Some(scheme) = args.upstream_scheme {
-        builder = builder.upstream_scheme(scheme);
-    }
-
-    if let Some(expires_in) = args.expires_in {
-        let expires_at = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() + expires_in)
-            .unwrap_or(0);
-        builder = builder.expires_at(expires_at);
-    }
-
-    // Build replay protection if requested
-    if args.single_use || args.max_uses.is_some() {
-        // Generate nonce if not provided
-        let nonce = args.nonce.unwrap_or_else(|| {
-            use rand::Rng;
-            let mut rng = rand::thread_rng();
-            let bytes: [u8; 16] = rng.gen();
-            hex::encode(bytes)
-        });
-
-        let max_uses = if args.single_use {
-            Some(1)
-        } else {
-            args.max_uses
-        };
-
-        let mut replay = ReplayProtection {
-            nonce: nonce.clone(),
-            max_uses,
-            nonce_ttl_seconds: args.nonce_ttl,
-        };
-
-        if let Some(ttl) = args.nonce_ttl {
-            replay = replay.with_ttl(ttl);
-        }
-
-        builder = builder.replay_protection(replay);
-
+    if let Some(ref replay) = payload.replay_protection {
         println!("Replay protection enabled:");
-        println!("  Nonce: {}", nonce);
-        if let Some(max) = max_uses {
+        println!("  Nonce: {}", replay.nonce);
+        if let Some(max) = replay.max_uses {
             println!("  Max uses: {}", max);
         } else {
             println!("  Max uses: unlimited (audit only)");
         }
-        if let Some(ttl) = args.nonce_ttl {
+        if let Some(ttl) = replay.nonce_ttl_seconds {
             println!("  Nonce TTL: {} seconds", ttl);
         }
         println!();
     }
 
-    let payload = builder.build();
-
-    // Seal the token
     let sealed_bytes = icebreaker_crypto::seal(&payload, &public_key)
         .map_err(|e| format!("failed to seal: {e}"))?;
 
@@ -1710,4 +1707,109 @@ fn inspect(args: &InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
     println!("Note: The payload cannot be inspected without the secret key.");
 
     Ok(())
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod build_seal_payload_tests {
+    use super::*;
+
+    fn minimal_args(allowed_hosts: &str) -> SealArgs {
+        SealArgs {
+            secret: "shh".to_string(),
+            allowed_hosts: allowed_hosts.to_string(),
+            header: "Authorization".to_string(),
+            prefix: None,
+            public_key: String::new(),
+            key_id: "primary".to_string(),
+            expires_in: None,
+            single_use: false,
+            max_uses: None,
+            nonce: None,
+            nonce_ttl: None,
+            allowed_methods: None,
+            allowed_paths: None,
+            allowed_path_pattern: None,
+            processor_json: None,
+            upstream_scheme: None,
+        }
+    }
+
+    #[test]
+    fn test_rejects_empty_allowed_hosts() {
+        let args = minimal_args("");
+        let err = build_seal_payload(&args).expect_err("empty should fail");
+        assert!(err.contains("at least one allowed host"), "got: {err}");
+    }
+
+    #[test]
+    fn test_rejects_only_whitespace_allowed_hosts() {
+        let args = minimal_args(" , , ");
+        let err = build_seal_payload(&args).expect_err("only whitespace should fail");
+        assert!(err.contains("at least one allowed host"), "got: {err}");
+    }
+
+    #[test]
+    fn test_rejects_invalid_authority() {
+        let args = minimal_args("not a valid authority");
+        let err = build_seal_payload(&args).expect_err("invalid authority should fail");
+        assert!(err.contains("invalid allowed-host entry"), "got: {err}");
+    }
+
+    #[test]
+    fn test_accepts_bare_and_port_pinned_entries() {
+        let args = minimal_args("api.example.com, api.example.com:8443");
+        let payload = build_seal_payload(&args).expect("valid hosts should build");
+        assert_eq!(
+            payload.allowed_hosts,
+            vec![
+                "api.example.com".to_string(),
+                "api.example.com:8443".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn test_parses_methods_and_paths() {
+        let mut args = minimal_args("api.example.com");
+        args.allowed_methods = Some(" get , Post , ".to_string());
+        args.allowed_paths = Some("/a, /b ,".to_string());
+
+        let payload = build_seal_payload(&args).expect("should build");
+        assert_eq!(payload.allowed_methods, vec!["GET", "POST"]);
+        assert_eq!(payload.allowed_paths, vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn test_propagates_upstream_scheme() {
+        let mut args = minimal_args("api.example.com");
+        args.upstream_scheme = Some(UpstreamScheme::Http);
+
+        let payload = build_seal_payload(&args).expect("should build");
+        assert_eq!(payload.upstream_scheme, Some(UpstreamScheme::Http));
+    }
+
+    #[test]
+    fn test_single_use_sets_replay_protection_with_max_one() {
+        let mut args = minimal_args("api.example.com");
+        args.single_use = true;
+        args.nonce = Some("fixed-nonce".to_string());
+
+        let payload = build_seal_payload(&args).expect("should build");
+        let replay = payload
+            .replay_protection
+            .as_ref()
+            .expect("single_use should set replay_protection");
+        assert_eq!(replay.nonce, "fixed-nonce");
+        assert_eq!(replay.max_uses, Some(1));
+    }
+
+    #[test]
+    fn test_rejects_invalid_processor_json() {
+        let mut args = minimal_args("api.example.com");
+        args.processor_json = Some("{not json".to_string());
+
+        let err = build_seal_payload(&args).expect_err("invalid JSON should fail");
+        assert!(err.contains("invalid processor JSON"), "got: {err}");
+    }
 }
