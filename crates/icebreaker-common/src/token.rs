@@ -91,7 +91,7 @@ impl std::str::FromStr for UpstreamScheme {
         match s.to_ascii_lowercase().as_str() {
             "http" => Ok(UpstreamScheme::Http),
             "https" => Ok(UpstreamScheme::Https),
-            other => Err(crate::error::TokenizerError::ConfigError(format!(
+            other => Err(crate::error::TokenizerError::InvalidPayload(format!(
                 "invalid upstream scheme {other:?}: expected \"http\" or \"https\""
             ))),
         }
@@ -1122,8 +1122,8 @@ mod tests {
         for bad in ["ftp", "", "http2", "tcp", " http"] {
             let err = UpstreamScheme::from_str(bad).expect_err("should reject");
             assert!(
-                matches!(err, crate::error::TokenizerError::ConfigError(_)),
-                "expected ConfigError for {bad:?}, got {err:?}"
+                matches!(err, crate::error::TokenizerError::InvalidPayload(_)),
+                "expected InvalidPayload for {bad:?}, got {err:?}"
             );
         }
     }
