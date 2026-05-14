@@ -275,9 +275,43 @@ pub fn is_connect_request<B>(request: &Request<B>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use icebreaker_common::{InjectConfig, NetworkProtectionConfig, ProcessorConfig, TokenPayload};
+    use secrecy::SecretString;
 
     fn create_mock_crypto() -> Arc<TokenCrypto> {
         Arc::new(TokenCrypto::generate())
+    }
+
+    fn create_mock_handler() -> ConnectHandler {
+        ConnectHandler::new(
+            create_mock_crypto(),
+            Arc::new(IpFilter::new(&NetworkProtectionConfig::default()).expect("valid config")),
+        )
+    }
+
+    fn connect_request_with_token(
+        handler: &ConnectHandler,
+        target_authority: &str,
+        allowed_hosts: &[&str],
+    ) -> Request<()> {
+        let mut builder = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        );
+        for host in allowed_hosts {
+            builder = builder.allowed_host(*host);
+        }
+        let payload = builder.build();
+
+        let sealed = handler.crypto.seal(&payload).expect("seal token");
+        let header = sealed.to_header().expect("serialize token");
+
+        Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(target_authority)
+            .header(TOKEN_HEADER, header)
+            .body(())
+            .expect("request should build")
     }
 
     #[test]
@@ -394,6 +428,53 @@ mod tests {
             // This should succeed as Google's DNS IPs are public
             assert!(result.is_ok(), "Should resolve public hostname");
         }
+    }
+
+    #[test]
+    fn test_validate_connect_port_pinned_matches_exact_port() {
+        let handler = create_mock_handler();
+        let request =
+            connect_request_with_token(&handler, "api.example.com:443", &["api.example.com:443"]);
+
+        let (_, host, port) = handler.validate_connect(&request).expect("should validate");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
+    }
+
+    #[test]
+    fn test_validate_connect_port_pinned_rejects_wrong_port() {
+        let handler = create_mock_handler();
+        let request =
+            connect_request_with_token(&handler, "api.example.com:8080", &["api.example.com:443"]);
+
+        let err = handler
+            .validate_connect(&request)
+            .expect_err("should reject");
+        assert!(
+            matches!(err, TokenizerError::HostNotAllowed { .. }),
+            "expected HostNotAllowed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_validate_connect_bare_host_allows_any_port() {
+        let handler = create_mock_handler();
+
+        let request_443 =
+            connect_request_with_token(&handler, "api.example.com:443", &["api.example.com"]);
+        let (_, host, port) = handler
+            .validate_connect(&request_443)
+            .expect("443 should validate");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
+
+        let request_9999 =
+            connect_request_with_token(&handler, "api.example.com:9999", &["api.example.com"]);
+        let (_, host, port) = handler
+            .validate_connect(&request_9999)
+            .expect("9999 should validate");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 9999);
     }
 
     #[tokio::test]
