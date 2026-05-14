@@ -57,12 +57,13 @@ impl ExpirationStatus {
 ///
 /// When the inbound request carries an absolute-form URI (with scheme), the
 /// scheme there wins. This field only controls the fallback.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum UpstreamScheme {
     /// Plain HTTP (`http://`). Required for plaintext upstreams.
     Http,
     /// HTTPS (`https://`). The default if unset.
+    #[default]
     Https,
 }
 

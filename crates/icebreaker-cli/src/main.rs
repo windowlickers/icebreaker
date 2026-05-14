@@ -606,7 +606,7 @@ impl Service<Request<Incoming>> for ProxyService {
                     .extensions()
                     .get::<UpstreamScheme>()
                     .copied()
-                    .unwrap_or(UpstreamScheme::Https)
+                    .unwrap_or_default()
                     .as_str();
                 let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
 

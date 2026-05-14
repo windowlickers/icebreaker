@@ -26,7 +26,6 @@ use base64::Engine;
 use http::Request;
 use tower::{Layer, Service};
 
-use icebreaker_common::token::UpstreamScheme;
 use icebreaker_common::{ClockSkewConfig, SealedToken, TokenizerError};
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 use icebreaker_nonce::{CheckResult, NonceStore};
@@ -404,7 +403,7 @@ where
             // Propagate the token's upstream scheme to downstream services
             // (e.g., ProxyService) so origin-form requests can be reconstructed
             // as `http://` when the token opts in. Defaults to HTTPS.
-            let upstream_scheme = payload.upstream_scheme.unwrap_or(UpstreamScheme::Https);
+            let upstream_scheme = payload.upstream_scheme.unwrap_or_default();
             request.extensions_mut().insert(upstream_scheme);
 
             // Validate processor config (rejects invalid Multi configs)
@@ -450,6 +449,7 @@ where
 mod tests {
     use super::*;
     use icebreaker_common::auth::AuthConfig;
+    use icebreaker_common::token::UpstreamScheme;
     use icebreaker_common::{InjectConfig, ProcessorConfig};
     use icebreaker_crypto::{
         create_api_key_config, derive_api_key_hmac_key, Keypair, PROXY_AUTHORIZATION_HEADER,
