@@ -1046,6 +1046,41 @@ mod tests {
     }
 
     #[test]
+    fn test_split_host_port_unclosed_bracket_falls_back_to_bare() {
+        // Malformed IPv6-style input with no closing bracket: the parser cannot
+        // recover a port, so the whole input is treated as a bare host.
+        assert_eq!(split_host_port("[::1"), ("[::1", None));
+        assert_eq!(split_host_port("[::1:8080"), ("[::1:8080", None));
+    }
+
+    #[test]
+    fn test_split_host_port_bracket_with_non_numeric_port() {
+        // Closed bracket but the port suffix is not a u16: host parses but
+        // port is dropped.
+        assert_eq!(split_host_port("[::1]:foo"), ("[::1]", None));
+        assert_eq!(split_host_port("[::1]:"), ("[::1]", None));
+    }
+
+    #[test]
+    fn test_split_host_port_u16_overflow_falls_back_to_bare() {
+        // A port that does not fit in u16 cannot round-trip, so the full
+        // authority is kept as a bare host. Documents the silent fallback:
+        // a token allowing `host:65536` is effectively unreachable because
+        // no real request will ever produce a matching authority.
+        assert_eq!(split_host_port("host:65536"), ("host:65536", None));
+        assert_eq!(split_host_port("host:99999"), ("host:99999", None));
+    }
+
+    #[test]
+    fn test_split_host_port_multi_colon_non_ipv6_falls_back_to_bare() {
+        // A non-bracketed authority with more than one colon is ambiguous and
+        // is not parsed as host:port — the whole string is treated as a bare
+        // host rather than guessing.
+        assert_eq!(split_host_port("host::99"), ("host::99", None));
+        assert_eq!(split_host_port("a:b:80"), ("a:b:80", None));
+    }
+
+    #[test]
     fn test_upstream_scheme_from_str_accepts_canonical_values() {
         use std::str::FromStr;
 
