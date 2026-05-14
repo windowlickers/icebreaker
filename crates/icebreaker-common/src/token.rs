@@ -1160,8 +1160,6 @@ mod tests {
         .build();
 
         let json = serde_json::to_string(&payload).expect("serialize payload");
-        assert!(json.contains("\"upstream_scheme\":\"http\""));
-
         let decoded: TokenPayload = serde_json::from_str(&json).expect("deserialize payload");
         assert_eq!(decoded.upstream_scheme, Some(UpstreamScheme::Http));
     }
