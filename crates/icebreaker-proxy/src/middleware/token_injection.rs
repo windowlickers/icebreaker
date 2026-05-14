@@ -268,28 +268,25 @@ where
             // Extract the target authority (host[:port]) from URI or Host header.
             // The port is preserved so token allowlists can pin a specific port;
             // `validate_host` handles the port-aware match.
-            let host = request
-                .uri()
-                .authority()
-                .map(|a| a.as_str().to_string())
-                .or_else(|| {
-                    request
-                        .headers()
-                        .get(http::header::HOST)
-                        .and_then(|h| h.to_str().ok())
-                        .map(str::to_string)
-                });
-
-            // Reject requests without a determinable host - credentials cannot be safely injected
-            // if we don't know where the request is going
-            let host = match host {
-                Some(h) => h,
-                None => {
-                    record_token_validation(TokenValidationResult::Invalid);
-                    return Err(TokenizerError::InvalidPayload(
-                        "request has no host in URI or Host header".to_string(),
-                    ));
+            // Credentials cannot be safely injected if we don't know where the request
+            // is going, so a non-UTF-8 Host header is reported distinctly from "missing".
+            let host = if let Some(authority) = request.uri().authority() {
+                authority.as_str().to_string()
+            } else if let Some(header) = request.headers().get(http::header::HOST) {
+                match header.to_str() {
+                    Ok(s) => s.to_string(),
+                    Err(e) => {
+                        record_token_validation(TokenValidationResult::Invalid);
+                        return Err(TokenizerError::InvalidPayload(format!(
+                            "Host header is not valid ASCII: {e}"
+                        )));
+                    }
                 }
+            } else {
+                record_token_validation(TokenValidationResult::Invalid);
+                return Err(TokenizerError::InvalidPayload(
+                    "request has no host in URI or Host header".to_string(),
+                ));
             };
 
             // Validate the target host against the token's allowed hosts

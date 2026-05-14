@@ -1562,12 +1562,9 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
     }
 
     for entry in &allowed_hosts {
-        if entry.parse::<http::uri::Authority>().is_err() {
-            return Err(format!(
-                "invalid allowed-host entry {entry:?}: expected `host` or `host:port`"
-            )
-            .into());
-        }
+        entry
+            .parse::<http::uri::Authority>()
+            .map_err(|e| format!("invalid allowed-host entry {entry:?}: {e}"))?;
     }
 
     if let Some(scheme) = args.upstream_scheme {
