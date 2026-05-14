@@ -446,8 +446,7 @@ where
 mod tests {
     use super::*;
     use icebreaker_common::auth::AuthConfig;
-    use icebreaker_common::token::UpstreamScheme;
-    use icebreaker_common::{InjectConfig, ProcessorConfig};
+    use icebreaker_common::{InjectConfig, ProcessorConfig, UpstreamScheme};
     use icebreaker_crypto::{
         create_api_key_config, derive_api_key_hmac_key, Keypair, PROXY_AUTHORIZATION_HEADER,
     };

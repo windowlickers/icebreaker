@@ -30,4 +30,5 @@ pub use processor::{
 };
 pub use token::{
     ExpirationStatus, OAuthMetadata, ReplayProtection, SealedToken, TokenMetadata, TokenPayload,
+    UpstreamScheme,
 };

@@ -24,7 +24,7 @@ use tokio::sync::watch;
 use tower::{Service, ServiceBuilder, ServiceExt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use icebreaker_common::token::UpstreamScheme;
+use icebreaker_common::UpstreamScheme;
 use icebreaker_common::{
     ClientAuthMode, ClockSkewConfig, HealthConfig, InjectConfig, NetworkProtectionConfig,
     ProcessorConfig, ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, TlsConfig,
