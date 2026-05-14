@@ -1025,6 +1025,27 @@ mod tests {
     }
 
     #[test]
+    fn test_mixed_bare_and_port_pinned_entries_for_same_host() {
+        // A port-pinned entry listed before a bare entry for the same host must
+        // not short-circuit the loop on a port mismatch — the bare entry should
+        // still match any port. Covers the `_ => continue` branch.
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_hosts(vec![
+            "forge.example.com:3000".to_string(),
+            "forge.example.com".to_string(),
+        ])
+        .build();
+
+        assert!(payload.validate_host("forge.example.com:3000").is_ok());
+        assert!(payload.validate_host("forge.example.com:8080").is_ok());
+        assert!(payload.validate_host("forge.example.com").is_ok());
+        assert!(payload.validate_host("other.example.com").is_err());
+    }
+
+    #[test]
     fn test_host_pattern_strips_port_before_matching() {
         let payload = TokenPayload::builder(
             SecretString::from("secret"),
