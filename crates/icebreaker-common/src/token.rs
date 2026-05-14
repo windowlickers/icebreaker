@@ -1046,6 +1046,47 @@ mod tests {
     }
 
     #[test]
+    fn test_upstream_scheme_from_str_accepts_canonical_values() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            UpstreamScheme::from_str("http").expect("parse"),
+            UpstreamScheme::Http
+        );
+        assert_eq!(
+            UpstreamScheme::from_str("https").expect("parse"),
+            UpstreamScheme::Https
+        );
+    }
+
+    #[test]
+    fn test_upstream_scheme_from_str_is_case_insensitive() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            UpstreamScheme::from_str("HTTP").expect("parse"),
+            UpstreamScheme::Http
+        );
+        assert_eq!(
+            UpstreamScheme::from_str("Https").expect("parse"),
+            UpstreamScheme::Https
+        );
+    }
+
+    #[test]
+    fn test_upstream_scheme_from_str_rejects_invalid_inputs() {
+        use std::str::FromStr;
+
+        for bad in ["ftp", "", "http2", "tcp", " http"] {
+            let err = UpstreamScheme::from_str(bad).expect_err("should reject");
+            assert!(
+                matches!(err, crate::error::TokenizerError::ConfigError(_)),
+                "expected ConfigError for {bad:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_upstream_scheme_serde_round_trip() {
         let payload = TokenPayload::builder(
             SecretString::from("secret"),
