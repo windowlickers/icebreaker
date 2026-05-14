@@ -1108,6 +1108,106 @@ mod tests {
         assert_eq!(split_host_port("a:b:80"), ("a:b:80", None));
     }
 
+    mod proptests {
+        use super::*;
+        use proptest::prelude::*;
+
+        // Hostnames built from chars that never appear in IPv6 literals or
+        // bracketed forms, so they round-trip unambiguously through
+        // split_host_port.
+        fn simple_host() -> impl Strategy<Value = String> {
+            "[a-zA-Z][a-zA-Z0-9.-]{0,30}"
+        }
+
+        proptest! {
+            #[test]
+            fn split_host_port_never_panics(s in ".{0,128}") {
+                let _ = split_host_port(&s);
+            }
+
+            #[test]
+            fn split_host_port_round_trips_simple_authority(
+                host in simple_host(),
+                port in any::<u16>(),
+            ) {
+                let authority = format!("{host}:{port}");
+                let (parsed_host, parsed_port) = split_host_port(&authority);
+                prop_assert_eq!(parsed_host, host.as_str());
+                prop_assert_eq!(parsed_port, Some(port));
+            }
+
+            #[test]
+            fn split_host_port_bare_host_has_no_port(host in simple_host()) {
+                let (parsed_host, parsed_port) = split_host_port(&host);
+                prop_assert_eq!(parsed_host, host.as_str());
+                prop_assert_eq!(parsed_port, None);
+            }
+
+            #[test]
+            fn split_host_port_rejects_oversize_port(
+                host in simple_host(),
+                port in (u16::MAX as u32 + 1)..=u32::MAX,
+            ) {
+                let authority = format!("{host}:{port}");
+                let (_, parsed_port) = split_host_port(&authority);
+                prop_assert_eq!(parsed_port, None);
+            }
+
+            #[test]
+            fn validate_host_never_panics(
+                allowlist in proptest::collection::vec(".{0,32}", 0..4),
+                input in ".{0,64}",
+            ) {
+                let payload = TokenPayload::builder(
+                    SecretString::from("secret"),
+                    ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+                )
+                .allowed_hosts(allowlist)
+                .build();
+                let _ = payload.validate_host(&input);
+            }
+
+            #[test]
+            fn validate_host_bare_entry_admits_any_valid_port(
+                host in simple_host(),
+                port in any::<u16>(),
+            ) {
+                let payload = TokenPayload::builder(
+                    SecretString::from("secret"),
+                    ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+                )
+                .allowed_host(host.clone())
+                .build();
+
+                let with_port = format!("{host}:{port}");
+                prop_assert!(payload.validate_host(&host).is_ok());
+                prop_assert!(payload.validate_host(&with_port).is_ok());
+            }
+
+            #[test]
+            fn validate_host_port_pinned_rejects_other_ports(
+                host in simple_host(),
+                allowed_port in any::<u16>(),
+                other_port in any::<u16>(),
+            ) {
+                prop_assume!(allowed_port != other_port);
+
+                let allowed_entry = format!("{host}:{allowed_port}");
+                let other_entry = format!("{host}:{other_port}");
+                let payload = TokenPayload::builder(
+                    SecretString::from("secret"),
+                    ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+                )
+                .allowed_host(allowed_entry.clone())
+                .build();
+
+                prop_assert!(payload.validate_host(&allowed_entry).is_ok());
+                prop_assert!(payload.validate_host(&other_entry).is_err());
+                prop_assert!(payload.validate_host(&host).is_err());
+            }
+        }
+    }
+
     #[test]
     fn test_upstream_scheme_from_str_accepts_canonical_values() {
         use std::str::FromStr;
