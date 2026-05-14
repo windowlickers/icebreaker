@@ -81,7 +81,7 @@ crypto_box = "0.9"
 hkdf = "0.12"
 hmac = "0.12"
 sha2 = "0.10"
-rand = "0.8"
+rand = "0.10.1"
 subtle = "2.6"
 
 # AWS signing
