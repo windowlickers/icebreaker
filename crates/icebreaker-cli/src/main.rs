@@ -268,8 +268,12 @@ struct SealArgs {
     /// (origin-form `GET /path HTTP/1.1` + Host header). Defaults to https.
     /// Set to `http` to target plaintext upstreams (e.g., a self-hosted
     /// Forgejo at `http://forge.example.com:3000`).
-    #[arg(long, value_parser = ["http", "https"])]
-    upstream_scheme: Option<String>,
+    #[arg(long, value_parser = parse_upstream_scheme_arg)]
+    upstream_scheme: Option<UpstreamScheme>,
+}
+
+fn parse_upstream_scheme_arg(s: &str) -> std::result::Result<UpstreamScheme, String> {
+    s.parse::<UpstreamScheme>().map_err(|e| e.to_string())
 }
 
 #[derive(Parser)]
@@ -1566,15 +1570,7 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Parse upstream scheme
-    let upstream_scheme = match args.upstream_scheme.as_deref() {
-        Some(s) => Some(
-            s.parse::<UpstreamScheme>()
-                .map_err(|e| format!("invalid --upstream-scheme: {e}"))?,
-        ),
-        None => None,
-    };
-    if let Some(scheme) = upstream_scheme {
+    if let Some(scheme) = args.upstream_scheme {
         println!("Upstream scheme: {scheme}");
     }
 
@@ -1632,7 +1628,7 @@ fn seal(args: SealArgs) -> Result<(), Box<dyn std::error::Error>> {
         builder = builder.allowed_path_pattern(pattern);
     }
 
-    if let Some(scheme) = upstream_scheme {
+    if let Some(scheme) = args.upstream_scheme {
         builder = builder.upstream_scheme(scheme);
     }
 
