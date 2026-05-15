@@ -102,7 +102,7 @@ impl TransactionState {
     pub fn generate_nonce() -> String {
         use base64::Engine;
         let mut bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+        rand::fill(&mut bytes);
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
     }
 
@@ -118,7 +118,7 @@ impl TransactionState {
 
         // Generate 32 random bytes for the verifier
         let mut bytes = [0u8; 32];
-        rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut bytes);
+        rand::fill(&mut bytes);
         let verifier = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
 
         // Compute S256 challenge

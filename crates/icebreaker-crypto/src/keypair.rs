@@ -1,7 +1,6 @@
 //! Curve25519 keypair management with secure memory handling.
 
-use crypto_box::{PublicKey, SecretKey};
-use rand::rngs::OsRng;
+use crypto_box::{aead::OsRng, PublicKey, SecretKey};
 
 use icebreaker_common::{Result, TokenizerError};
 
@@ -137,9 +136,9 @@ impl VersionedKeypair {
     /// Generates a new versioned keypair with a random key ID.
     #[must_use]
     pub fn generate(version: u32) -> Self {
-        use rand::Rng;
-        let key_id: String = rand::thread_rng()
-            .sample_iter(&rand::distributions::Alphanumeric)
+        use rand::RngExt;
+        let key_id: String = rand::rng()
+            .sample_iter(&rand::distr::Alphanumeric)
             .take(16)
             .map(char::from)
             .collect();

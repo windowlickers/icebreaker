@@ -99,9 +99,8 @@ impl MasterKeyManager {
 
     /// Generates a new master key manager with a random 32-byte key.
     pub fn generate(key_id: impl Into<String>) -> Self {
-        use rand::RngCore;
         let mut key = vec![0u8; 32];
-        rand::thread_rng().fill_bytes(&mut key);
+        rand::fill(key.as_mut_slice());
         Self::new(key_id, key)
     }
 
