@@ -184,6 +184,7 @@ impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for TokenInjectionService<S>
 where
     S: Service<Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
+    S::Error: std::fmt::Display,
     ReqBody: Send + 'static,
 {
     type Response = S::Response;
@@ -437,7 +438,7 @@ where
             inner
                 .call(processed_request)
                 .await
-                .map_err(|_| TokenizerError::HttpError("upstream request failed".to_string()))
+                .map_err(|e| TokenizerError::HttpError(format!("upstream request failed: {e}")))
         })
     }
 }

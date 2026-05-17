@@ -584,47 +584,51 @@ impl Service<Request<Incoming>> for ProxyService {
         let client = self.client.clone();
 
         Box::pin(async move {
-            // Extract the target URI from the request
+            // Extract the target URI from the request.
+            //
+            // Authority (host:port) comes from the request URI when the
+            // client sent an absolute-form URI (RFC 7230 §5.3.2, as
+            // forward proxies receive), otherwise from the Host header.
+            //
+            // Scheme always comes from the token's `UpstreamScheme` so the
+            // token owner controls the upstream protocol. A client may have
+            // had to coerce its request URL to `http://` to route through a
+            // plaintext forward proxy (e.g. reqwest's `Proxy::http`), but
+            // that says nothing about the upstream — the token does.
             let uri = req.uri();
 
-            // For a proxy, we need to reconstruct the full URI
-            // The client should send requests like: GET https://api.example.com/path
-            // Or we can extract from Host header
-            let target_uri = if uri.scheme().is_some() {
-                uri.clone()
+            let authority = if let Some(auth) = uri.authority() {
+                auth.as_str().to_string()
             } else {
-                // Try to get the host from headers
-                let host = req
-                    .headers()
+                req.headers()
                     .get(http::header::HOST)
                     .and_then(|h| h.to_str().ok())
                     .ok_or_else(|| {
                         Box::<dyn std::error::Error + Send + Sync>::from(
                             "missing Host header and no absolute URI",
                         )
-                    })?;
-
-                // Build the full URI. Scheme comes from the token (via the
-                // TokenInjectionLayer); HTTPS is the default if unset.
-                let scheme = req
-                    .extensions()
-                    .get::<UpstreamScheme>()
-                    .copied()
-                    .unwrap_or_default()
-                    .as_str();
-                let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-                Uri::builder()
-                    .scheme(scheme)
-                    .authority(host)
-                    .path_and_query(path)
-                    .build()
-                    .map_err(|e| {
-                        Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                            "failed to build URI: {e}"
-                        ))
                     })?
+                    .to_string()
             };
+
+            let scheme = req
+                .extensions()
+                .get::<UpstreamScheme>()
+                .copied()
+                .unwrap_or_default()
+                .as_str();
+            let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+
+            let target_uri = Uri::builder()
+                .scheme(scheme)
+                .authority(authority)
+                .path_and_query(path)
+                .build()
+                .map_err(|e| {
+                    Box::<dyn std::error::Error + Send + Sync>::from(format!(
+                        "failed to build URI: {e}"
+                    ))
+                })?;
 
             tracing::debug!(
                 target = %target_uri,
