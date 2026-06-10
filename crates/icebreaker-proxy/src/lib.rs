@@ -32,7 +32,10 @@ pub use processor::{
     create_processor, validate_processor_config, HmacProcessor, InjectBodyProcessor,
     InjectProcessor, OAuthProcessor, Processor, ProcessorFactory, RequestProcessor, Sigv4Processor,
 };
-pub use tls::{create_tls_acceptor, extract_client_cert_info, TlsAcceptorError};
+pub use tls::{
+    create_bump_acceptor, create_tls_acceptor, extract_client_cert_info, DynamicCertResolver,
+    InterceptError, TlsAcceptorError,
+};
 pub use tunnel::{is_connect_request, ConnectHandler, TunnelConfig};
 
 // Metrics re-exports

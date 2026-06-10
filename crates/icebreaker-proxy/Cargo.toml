@@ -71,6 +71,8 @@ rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
 x509-parser = { workspace = true }
 sha2 = { workspace = true }
+# Dynamic leaf-certificate minting for TLS interception.
+rcgen = { version = "0.13", features = ["x509-parser"] }
 
 # Error handling
 thiserror = { workspace = true }
@@ -80,4 +82,3 @@ hex = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 wiremock = { workspace = true }
 flate2 = "1.0"
-rcgen = "0.13"

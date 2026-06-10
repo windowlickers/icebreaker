@@ -34,6 +34,7 @@ use crate::metrics::{
     record_host_rejection, record_method_rejection, record_path_rejection, record_processor_used,
     record_replay_attempt, record_token_validation, TokenValidationResult,
 };
+use crate::middleware::host_validation::HostValidationConfig;
 use crate::middleware::response_scan::ScanPatterns;
 use crate::processor::{create_processor, validate_processor_config};
 
@@ -112,6 +113,23 @@ pub fn generate_scan_patterns(secret: &str) -> Vec<Vec<u8>> {
     patterns
 }
 
+/// Extracts the destination host (without port) from a request's absolute-form
+/// URI or its `Host` header, for static host-policy checks in token-optional mode.
+fn request_bare_host<B>(request: &Request<B>) -> Option<String> {
+    if let Some(host) = request.uri().host() {
+        return Some(host.to_string());
+    }
+    let host_header = request.headers().get(http::header::HOST)?.to_str().ok()?;
+    // Strip an optional port. Mirrors HostValidationService's host extraction.
+    Some(
+        host_header
+            .rsplit_once(':')
+            .map(|(host, _)| host)
+            .unwrap_or(host_header)
+            .to_string(),
+    )
+}
+
 /// Layer that injects tokens into requests.
 #[derive(Clone)]
 pub struct TokenInjectionLayer {
@@ -119,18 +137,22 @@ pub struct TokenInjectionLayer {
     response_scan_enabled: bool,
     nonce_store: Option<Arc<dyn NonceStore>>,
     clock_skew: ClockSkewConfig,
+    token_optional: bool,
+    host_policy: Arc<HostValidationConfig>,
 }
 
 impl TokenInjectionLayer {
     /// Creates a new token injection layer with default options: response scanning
-    /// enabled, no nonce store, and default clock skew tolerance. Use the `with_*`
-    /// methods to override.
+    /// enabled, no nonce store, default clock skew tolerance, and token-optional
+    /// mode disabled. Use the `with_*` methods to override.
     pub fn new(crypto: Arc<TokenCrypto>) -> Self {
         Self {
             crypto,
             response_scan_enabled: true,
             nonce_store: None,
             clock_skew: ClockSkewConfig::default(),
+            token_optional: false,
+            host_policy: Arc::new(HostValidationConfig::new()),
         }
     }
 
@@ -154,6 +176,24 @@ impl TokenInjectionLayer {
         self.clock_skew = clock_skew;
         self
     }
+
+    /// Enables token-optional mode and sets the static host policy that governs
+    /// token-less requests.
+    ///
+    /// In token-optional mode a request without an `X-Tokenizer-Token` header is
+    /// forwarded without secret injection, provided its target host passes
+    /// `host_policy`. Requests carrying a token are unaffected. When disabled
+    /// (the default), a missing token is rejected.
+    #[must_use]
+    pub fn with_token_optional(
+        mut self,
+        token_optional: bool,
+        host_policy: Arc<HostValidationConfig>,
+    ) -> Self {
+        self.token_optional = token_optional;
+        self.host_policy = host_policy;
+        self
+    }
 }
 
 impl<S> Layer<S> for TokenInjectionLayer {
@@ -166,6 +206,8 @@ impl<S> Layer<S> for TokenInjectionLayer {
             response_scan_enabled: self.response_scan_enabled,
             nonce_store: self.nonce_store.clone(),
             clock_skew: self.clock_skew.clone(),
+            token_optional: self.token_optional,
+            host_policy: self.host_policy.clone(),
         }
     }
 }
@@ -178,6 +220,8 @@ pub struct TokenInjectionService<S> {
     response_scan_enabled: bool,
     nonce_store: Option<Arc<dyn NonceStore>>,
     clock_skew: ClockSkewConfig,
+    token_optional: bool,
+    host_policy: Arc<HostValidationConfig>,
 }
 
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for TokenInjectionService<S>
@@ -204,6 +248,8 @@ where
         let response_scan_enabled = self.response_scan_enabled;
         let nonce_store = self.nonce_store.clone();
         let clock_skew = self.clock_skew.clone();
+        let token_optional = self.token_optional;
+        let host_policy = self.host_policy.clone();
 
         Box::pin(async move {
             // Extract the token header
@@ -218,10 +264,28 @@ where
                     }
                 },
                 None => {
-                    record_token_validation(TokenValidationResult::Missing);
-                    return Err(TokenizerError::InvalidPayload(
-                        "missing token header".to_string(),
-                    ));
+                    if !token_optional {
+                        record_token_validation(TokenValidationResult::Missing);
+                        return Err(TokenizerError::InvalidPayload(
+                            "missing token header".to_string(),
+                        ));
+                    }
+                    // Token-optional mode: forward without injection, gated only
+                    // by the static host policy. The destination comes from the
+                    // request, and no secret is injected or scanned for.
+                    record_token_validation(TokenValidationResult::Skipped);
+                    let host = request_bare_host(&request).ok_or_else(|| {
+                        TokenizerError::InvalidPayload(
+                            "request has no host in URI or Host header".to_string(),
+                        )
+                    })?;
+                    if let Err(e) = host_policy.validate(&host) {
+                        record_host_rejection(&host);
+                        return Err(e);
+                    }
+                    return inner.call(request).await.map_err(|e| {
+                        TokenizerError::HttpError(format!("upstream request failed: {e}"))
+                    });
                 }
             };
 
@@ -539,6 +603,69 @@ mod tests {
 
         let result = service.oneshot(request).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_token_optional_forwards_without_injection() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let policy = Arc::new(HostValidationConfig::new().allow_host("api.example.com"));
+        let layer = TokenInjectionLayer::new(crypto).with_token_optional(true, policy);
+        let service = layer.layer(MockService);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        let response = service.oneshot(request).await.expect("should forward");
+        assert_eq!(response.status(), 200);
+        // No token was present, so no Authorization header is injected.
+        assert_eq!(response.into_body(), "");
+    }
+
+    #[tokio::test]
+    async fn test_token_optional_rejects_disallowed_host() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let policy = Arc::new(HostValidationConfig::new().allow_host("allowed.example.com"));
+        let layer = TokenInjectionLayer::new(crypto).with_token_optional(true, policy);
+        let service = layer.layer(MockService);
+
+        let request = Request::builder()
+            .uri("https://evil.example.com/data")
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(matches!(result, Err(TokenizerError::HostNotAllowed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_token_optional_still_injects_with_token() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let payload = icebreaker_common::TokenPayload::builder(
+            SecretString::from("my-secret-api-key"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+        let sealed_token = crypto.seal(&payload).expect("should seal");
+
+        // Token-optional mode must not change behaviour for tokened requests.
+        let policy = Arc::new(HostValidationConfig::new());
+        let layer = TokenInjectionLayer::new(crypto).with_token_optional(true, policy);
+        let service = layer.layer(MockService);
+
+        let request = Request::builder()
+            .uri("https://api.example.com/data")
+            .header(
+                TOKEN_HEADER,
+                sealed_token.to_header().expect("token serialization"),
+            )
+            .body(())
+            .expect("request should build");
+
+        let response = service.oneshot(request).await.expect("should succeed");
+        assert_eq!(response.into_body(), "Bearer my-secret-api-key");
     }
 
     #[tokio::test]

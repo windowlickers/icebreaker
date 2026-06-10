@@ -80,6 +80,8 @@ pub enum TokenValidationResult {
     PathValidationFailed,
     /// Token requested replay protection but no nonce store is configured.
     ReplayProtectionUnavailable,
+    /// No token was present and token-optional mode forwarded the request without injection.
+    Skipped,
 }
 
 impl TokenValidationResult {
@@ -96,6 +98,7 @@ impl TokenValidationResult {
             Self::MethodValidationFailed => "method_validation_failed",
             Self::PathValidationFailed => "path_validation_failed",
             Self::ReplayProtectionUnavailable => "replay_protection_unavailable",
+            Self::Skipped => "skipped",
         }
     }
 }

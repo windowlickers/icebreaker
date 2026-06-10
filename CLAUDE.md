@@ -241,6 +241,33 @@ icebreaker seal --secret <SECRET> --allowed-hosts api.example.com --public-key <
 | `ICEBREAKER_CLOCK_SKEW_TOLERANCE` | `30` | Clock skew tolerance (seconds) for token expiration |
 | `ICEBREAKER_MAX_FUTURE_TOKEN` | `300` | Max seconds token expiration can be in future |
 | `ICEBREAKER_REQUIRE_EXPIRATION` | `false` | Require tokens to have expiration time |
+| `ICEBREAKER_TOKEN_OPTIONAL` | `false` | Allow requests without a token (forwarded without injection, gated by the static host policy). Token-carrying requests are unaffected. |
+| `ICEBREAKER_TOKEN_OPTIONAL_ALLOW_HOSTS` | - | Comma-separated hosts token-less requests may reach (exact host match) |
+| `ICEBREAKER_TOKEN_OPTIONAL_DENY_HOSTS` | - | Comma-separated hosts token-less requests may never reach (takes precedence) |
+| `ICEBREAKER_TOKEN_OPTIONAL_ALLOW_ANY` | `false` | Allow token-less requests to any host (opt-in to an open egress proxy). Required when `ICEBREAKER_TOKEN_OPTIONAL` is set with no allow-list. |
+| `ICEBREAKER_INTERCEPT_CA_CERT` | - | Path to interception CA certificate (PEM). With the key, enables TLS interception of CONNECT. |
+| `ICEBREAKER_INTERCEPT_CA_KEY` | - | Path to interception CA private key (PEM) |
+| `ICEBREAKER_NO_BUMP_HOSTS` | - | Comma-separated hosts tunneled transparently, never intercepted (for cert-pinning / HTTP-2-only hosts) |
+
+## Forward Proxy and TLS Interception
+
+When pointed at via `HTTPS_PROXY`, the proxy handles `CONNECT`:
+
+- **Tunnel** (default): the connection is tunneled transparently end-to-end. Tokens
+  are validated but credentials cannot be injected (the tunnel is opaque).
+- **Intercept ("bump")**: when `--intercept-ca-cert`/`--intercept-ca-key` are set, the
+  proxy mints a per-host leaf certificate signed by the interception CA, terminates TLS,
+  runs the normal middleware stack (injection + response scanning) on the decrypted
+  request, then re-originates a fresh TLS connection to the real upstream. Clients must
+  trust the interception CA. ALPN is restricted to HTTP/1.1.
+- **No-bump passthrough**: hosts in `--no-bump-hosts` are always tunneled, never
+  intercepted — use for hosts that pin certificates or require HTTP/2.
+
+The interception CA private key can impersonate any host clients trust; it is loaded
+once at startup, kept in memory, and never logged.
+
+In **token-optional mode**, a token-less `CONNECT` is permitted only when its target
+host passes the static policy (`--token-optional-allow-hosts` / `--token-optional-allow-any`).
 
 ## Container Images
 
