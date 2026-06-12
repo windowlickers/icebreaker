@@ -33,8 +33,8 @@ pub use processor::{
     InjectProcessor, OAuthProcessor, Processor, ProcessorFactory, RequestProcessor, Sigv4Processor,
 };
 pub use tls::{
-    create_bump_acceptor, create_tls_acceptor, extract_client_cert_info, DynamicCertResolver,
-    InterceptError, TlsAcceptorError,
+    create_tls_acceptor, extract_client_cert_info, DynamicCertResolver, InterceptError,
+    TlsAcceptorError,
 };
 pub use tunnel::{is_connect_request, ConnectHandler, TunnelConfig};
 

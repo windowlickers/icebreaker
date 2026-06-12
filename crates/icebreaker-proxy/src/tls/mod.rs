@@ -10,4 +10,4 @@ mod intercept;
 
 pub use acceptor::{create_tls_acceptor, TlsAcceptorError};
 pub use cert_extract::extract_client_cert_info;
-pub use intercept::{create_bump_acceptor, DynamicCertResolver, InterceptError};
+pub use intercept::{DynamicCertResolver, InterceptError};

@@ -256,10 +256,13 @@ When pointed at via `HTTPS_PROXY`, the proxy handles `CONNECT`:
 - **Tunnel** (default): the connection is tunneled transparently end-to-end. Tokens
   are validated but credentials cannot be injected (the tunnel is opaque).
 - **Intercept ("bump")**: when `--intercept-ca-cert`/`--intercept-ca-key` are set, the
-  proxy mints a per-host leaf certificate signed by the interception CA, terminates TLS,
-  runs the normal middleware stack (injection + response scanning) on the decrypted
-  request, then re-originates a fresh TLS connection to the real upstream. Clients must
-  trust the interception CA. ALPN is restricted to HTTP/1.1.
+  proxy mints a leaf certificate for the policy-vetted CONNECT host (not the client's
+  SNI), signed by the interception CA, terminates TLS, runs the normal middleware stack
+  (injection + response scanning) on the decrypted request, then re-originates a fresh
+  TLS connection to the real upstream. The leaf is served regardless of SNI, so a
+  mismatched-SNI client fails its own certificate check rather than driving a mint.
+  Leaves are cached in a bounded LRU keyed by host. Clients must trust the interception
+  CA. ALPN is restricted to HTTP/1.1.
 - **No-bump passthrough**: hosts in `--no-bump-hosts` are always tunneled, never
   intercepted — use for hosts that pin certificates or require HTTP/2.
 

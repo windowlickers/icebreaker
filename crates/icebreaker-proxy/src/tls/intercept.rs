@@ -8,9 +8,10 @@
 //! anyone holding it can impersonate any host the clients trust. It is loaded
 //! once at startup, kept only in memory, and never logged.
 
-use std::collections::HashMap;
+use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 
+use lru::LruCache;
 use rcgen::{
     CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
@@ -27,6 +28,12 @@ const LEAF_VALIDITY_DAYS: i64 = 30;
 
 /// Re-mint a cached leaf once it is within this many days of expiring.
 const LEAF_RENEW_MARGIN_DAYS: i64 = 1;
+
+/// Upper bound on cached leaves. Minting is keyed by the policy-vetted CONNECT
+/// host, so this only bites under `--token-optional-allow-any`, where the CONNECT
+/// host itself is attacker-controlled; the LRU then evicts the least-recently-used
+/// host instead of growing without bound.
+const MAX_CACHED_LEAVES: usize = 1024;
 
 /// Placeholder host used to mint a throwaway leaf when validating the CA at load.
 const CA_SELF_CHECK_HOST: &str = "ca-self-check.invalid";
@@ -208,11 +215,16 @@ struct CachedLeaf {
     not_after: OffsetDateTime,
 }
 
-/// Resolves server certificates by minting (and caching) a leaf per SNI host.
+/// Mints (and caches) leaf certificates for intercepted CONNECT hosts.
+///
+/// Leaves are keyed by the policy-vetted CONNECT host, not the client-supplied
+/// SNI: [`Self::acceptor_for`] builds a per-connection acceptor that serves the
+/// CONNECT host's leaf regardless of SNI. The cache is a bounded LRU so a flood
+/// of distinct hosts cannot grow it without limit.
 #[derive(Clone)]
 pub struct DynamicCertResolver {
     ca: Arc<InterceptCa>,
-    cache: Arc<Mutex<HashMap<String, CachedLeaf>>>,
+    cache: Arc<Mutex<LruCache<String, CachedLeaf>>>,
 }
 
 impl DynamicCertResolver {
@@ -222,9 +234,10 @@ impl DynamicCertResolver {
     ///
     /// Returns [`InterceptError`] if the certificate or key cannot be parsed.
     pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, InterceptError> {
+        let capacity = NonZeroUsize::new(MAX_CACHED_LEAVES).unwrap_or(NonZeroUsize::MIN);
         Ok(Self {
             ca: Arc::new(InterceptCa::load(cert_pem, key_pem)?),
-            cache: Arc::new(Mutex::new(HashMap::new())),
+            cache: Arc::new(Mutex::new(LruCache::new(capacity))),
         })
     }
 
@@ -254,7 +267,7 @@ impl DynamicCertResolver {
         let now = OffsetDateTime::now_utc();
         let renew_margin = Duration::days(LEAF_RENEW_MARGIN_DAYS);
 
-        if let Ok(cache) = self.cache.lock() {
+        if let Ok(mut cache) = self.cache.lock() {
             if let Some(entry) = cache.get(host) {
                 if entry.not_after - now > renew_margin {
                     return Some(entry.key.clone());
@@ -272,7 +285,7 @@ impl DynamicCertResolver {
         let key = Arc::new(certified);
 
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(
+            cache.put(
                 host.to_string(),
                 CachedLeaf {
                     key: key.clone(),
@@ -282,6 +295,45 @@ impl DynamicCertResolver {
         }
         Some(key)
     }
+
+    /// Builds a per-connection TLS acceptor that serves `host`'s leaf certificate.
+    ///
+    /// `host` must be the CONNECT authority that has already passed host-policy
+    /// validation. The returned acceptor presents this leaf for every handshake
+    /// regardless of the client's SNI, so a client whose SNI differs simply fails
+    /// its own certificate check — the proxy never mints a leaf for untrusted SNI.
+    ///
+    /// Returns `None` if minting fails; the handshake then fails cleanly.
+    #[must_use]
+    pub fn acceptor_for(&self, host: &str) -> Option<TlsAcceptor> {
+        let key = self.leaf_for(host)?;
+        Some(build_acceptor(Arc::new(FixedCertResolver { key })))
+    }
+}
+
+/// Serves a single pre-minted leaf for every handshake, ignoring SNI.
+#[derive(Debug)]
+struct FixedCertResolver {
+    key: Arc<CertifiedKey>,
+}
+
+impl ResolvesServerCert for FixedCertResolver {
+    fn resolve(&self, _client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
+        Some(self.key.clone())
+    }
+}
+
+/// Builds a TLS acceptor from a server-certificate resolver.
+///
+/// ALPN is restricted to HTTP/1.1 because the decrypted inner stream is served
+/// over HTTP/1.1; advertising HTTP/2 would let clients negotiate a protocol the
+/// inner server cannot speak.
+fn build_acceptor(resolver: Arc<dyn ResolvesServerCert>) -> TlsAcceptor {
+    let mut config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_cert_resolver(resolver);
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    TlsAcceptor::from(Arc::new(config))
 }
 
 impl std::fmt::Debug for DynamicCertResolver {
@@ -289,29 +341,6 @@ impl std::fmt::Debug for DynamicCertResolver {
         f.debug_struct("DynamicCertResolver")
             .finish_non_exhaustive()
     }
-}
-
-impl ResolvesServerCert for DynamicCertResolver {
-    fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        // No SNI means there is no hostname to mint a certificate for, so the
-        // handshake fails (token-less clients must send SNI to be intercepted).
-        let host = client_hello.server_name()?;
-        self.leaf_for(host)
-    }
-}
-
-/// Builds a TLS acceptor that presents dynamically minted leaf certificates.
-///
-/// ALPN is restricted to HTTP/1.1 because the decrypted inner stream is served
-/// over HTTP/1.1; advertising HTTP/2 would let clients negotiate a protocol the
-/// inner server cannot speak.
-#[must_use]
-pub fn create_bump_acceptor(resolver: Arc<DynamicCertResolver>) -> TlsAcceptor {
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_cert_resolver(resolver);
-    config.alpn_protocols = vec![b"http/1.1".to_vec()];
-    TlsAcceptor::from(Arc::new(config))
 }
 
 #[cfg(test)]
@@ -367,7 +396,7 @@ mod tests {
         );
 
         let cache = resolver.cache.lock().expect("lock cache");
-        let entry = cache.get("api.example.com").expect("cached entry");
+        let entry = cache.peek("api.example.com").expect("cached entry");
         assert!(
             entry.not_after > OffsetDateTime::now_utc(),
             "re-minted leaf must have a future expiry"
@@ -384,7 +413,7 @@ mod tests {
         let after = OffsetDateTime::now_utc();
 
         let cache = resolver.cache.lock().expect("lock cache");
-        let entry = cache.get("api.example.com").expect("cached entry");
+        let entry = cache.peek("api.example.com").expect("cached entry");
         // not_after is roughly now + LEAF_VALIDITY_DAYS, bracketed by the mint window.
         let validity = Duration::days(LEAF_VALIDITY_DAYS);
         assert!(entry.not_after >= before + validity);
@@ -459,6 +488,64 @@ mod tests {
         assert!(
             matches!(result, Err(InterceptError::NotCa)),
             "expected NotCa, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_acceptor_for_reuses_cached_leaf() {
+        // Building a ServerConfig needs a process-level CryptoProvider, which the
+        // binary installs at startup; install it here too for the unit test.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (cert_pem, key_pem) = test_ca();
+        let resolver = DynamicCertResolver::from_pem(&cert_pem, &key_pem).expect("load CA");
+
+        resolver
+            .acceptor_for("api.example.com")
+            .expect("build acceptor");
+        resolver
+            .acceptor_for("api.example.com")
+            .expect("reuse acceptor");
+
+        let cache = resolver.cache.lock().expect("lock cache");
+        assert_eq!(
+            cache.len(),
+            1,
+            "repeated CONNECTs to one host must not mint additional leaves"
+        );
+    }
+
+    #[test]
+    fn test_cache_evicts_when_over_capacity() {
+        let (cert_pem, key_pem) = test_ca();
+        let resolver = DynamicCertResolver::from_pem(&cert_pem, &key_pem).expect("load CA");
+
+        // Mint one real leaf, then fill past capacity with synthetic entries that
+        // share its key — exercising eviction without thousands of keygens.
+        let key = resolver.leaf_for("seed.example.com").expect("mint seed");
+        let not_after = OffsetDateTime::now_utc() + Duration::days(LEAF_VALIDITY_DAYS);
+        {
+            let mut cache = resolver.cache.lock().expect("lock cache");
+            for i in 0..MAX_CACHED_LEAVES + 5 {
+                cache.put(
+                    format!("host-{i}.example.com"),
+                    CachedLeaf {
+                        key: key.clone(),
+                        not_after,
+                    },
+                );
+            }
+        }
+
+        let cache = resolver.cache.lock().expect("lock cache");
+        assert_eq!(
+            cache.len(),
+            MAX_CACHED_LEAVES,
+            "cache must never exceed its bound"
+        );
+        assert!(
+            cache.peek("seed.example.com").is_none(),
+            "the least-recently-used host must be evicted past capacity"
         );
     }
 }

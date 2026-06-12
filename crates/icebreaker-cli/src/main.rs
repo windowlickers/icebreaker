@@ -38,13 +38,12 @@ use icebreaker_crypto::{
     VersionedKeypair,
 };
 use icebreaker_proxy::{
-    create_bump_acceptor, create_tls_acceptor, extract_client_cert_info, is_connect_request,
-    record_connect_tunnel, record_token_validation, ConnectHandler, DynamicCertResolver,
-    DynamicResponseScanLayer, HostValidationConfig, InMemoryNonceStore, IpFilter, MetricsLayer,
-    NonceStore, RateLimitLayer, RateLimiter, TokenInjectionLayer, TokenValidationResult,
-    TunnelConfig, ValidatingConnector, TOKEN_HEADER,
+    create_tls_acceptor, extract_client_cert_info, is_connect_request, record_connect_tunnel,
+    record_token_validation, ConnectHandler, DynamicCertResolver, DynamicResponseScanLayer,
+    HostValidationConfig, InMemoryNonceStore, IpFilter, MetricsLayer, NonceStore, RateLimitLayer,
+    RateLimiter, TokenInjectionLayer, TokenValidationResult, TunnelConfig, ValidatingConnector,
+    TOKEN_HEADER,
 };
-use tokio_rustls::TlsAcceptor;
 
 /// Icebreaker - A stateless tokenizer proxy
 #[derive(Parser)]
@@ -763,7 +762,7 @@ struct ProxyContext {
     shutdown: Arc<ShutdownState>,
     token_optional: bool,
     host_policy: Arc<HostValidationConfig>,
-    bump_acceptor: Option<TlsAcceptor>,
+    bump_resolver: Option<Arc<DynamicCertResolver>>,
     no_bump_policy: Option<Arc<HostValidationConfig>>,
 }
 
@@ -856,8 +855,8 @@ struct ConnectDeps {
     handler: Arc<ConnectHandler>,
     /// Full proxy context, reused to serve the decrypted inner stream of a bump.
     ctx: ProxyContext,
-    /// TLS acceptor presenting minted leaf certs; `None` disables interception.
-    bump_acceptor: Option<TlsAcceptor>,
+    /// Resolver that mints per-CONNECT-host leaf certs; `None` disables interception.
+    bump_resolver: Option<Arc<DynamicCertResolver>>,
     /// Hosts that must be tunneled transparently rather than intercepted.
     no_bump_policy: Option<Arc<HostValidationConfig>>,
     /// Shared rate limiter; CONNECT is throttled with the same per-key state as
@@ -997,9 +996,9 @@ async fn handle_tunnel_or_bump(
         .as_ref()
         .is_some_and(|policy| policy.validate(&host).is_ok());
 
-    match deps.bump_acceptor.clone() {
-        Some(acceptor) if !in_no_bump => {
-            bump_and_serve(client_io, &host, port, remote_addr, acceptor, deps.ctx).await;
+    match deps.bump_resolver.clone() {
+        Some(resolver) if !in_no_bump => {
+            bump_and_serve(client_io, &host, port, remote_addr, resolver, deps.ctx).await;
         }
         _ => {
             let mut client_io = client_io;
@@ -1015,9 +1014,20 @@ async fn bump_and_serve(
     host: &str,
     port: u16,
     remote_addr: SocketAddr,
-    acceptor: TlsAcceptor,
+    resolver: Arc<DynamicCertResolver>,
     ctx: ProxyContext,
 ) {
+    // Mint (or reuse) a leaf for the policy-vetted CONNECT host; the acceptor
+    // presents it regardless of the client's SNI, so untrusted SNI never drives
+    // a mint.
+    let acceptor = match resolver.acceptor_for(host) {
+        Some(acceptor) => acceptor,
+        None => {
+            tracing::warn!(host, "failed to build interception acceptor for host");
+            return;
+        }
+    };
+
     let tls_stream = match acceptor.accept(client_io).await {
         Ok(stream) => stream,
         Err(e) => {
@@ -1189,7 +1199,7 @@ where
                 .with_nonce_store(ctx.nonce_store.clone()),
             ),
             ctx: ctx.clone(),
-            bump_acceptor: ctx.bump_acceptor.clone(),
+            bump_resolver: ctx.bump_resolver.clone(),
             no_bump_policy: ctx.no_bump_policy.clone(),
             rate_limiter: ctx.rate_limiter.clone(),
         })
@@ -1381,12 +1391,12 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
         let token_optional = args.token_optional;
         let host_policy = Arc::new(build_token_optional_policy(&args)?);
 
-        // Build the TLS interception acceptor and the no-bump passthrough policy.
-        let bump_acceptor = match (&args.intercept_ca_cert, &args.intercept_ca_key) {
+        // Build the TLS interception resolver and the no-bump passthrough policy.
+        let bump_resolver = match (&args.intercept_ca_cert, &args.intercept_ca_key) {
             (Some(cert), Some(key)) => {
                 let resolver = DynamicCertResolver::from_pem_files(cert, key)
                     .map_err(|e| format!("failed to load interception CA: {e}"))?;
-                Some(create_bump_acceptor(Arc::new(resolver)))
+                Some(Arc::new(resolver))
             }
             (None, None) => None,
             _ => {
@@ -1404,7 +1414,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
                 HostValidationConfig::new().allow_hosts(no_bump_hosts),
             ))
         };
-        if no_bump_policy.is_some() && bump_acceptor.is_none() {
+        if no_bump_policy.is_some() && bump_resolver.is_none() {
             tracing::warn!(
                 "--no-bump-hosts is set but TLS interception is disabled; the list has no effect"
             );
@@ -1529,7 +1539,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             shutdown: shutdown_state.clone(),
             token_optional,
             host_policy,
-            bump_acceptor,
+            bump_resolver,
             no_bump_policy,
         };
 
