@@ -69,7 +69,7 @@ aws-credential-types = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
-x509-parser = { workspace = true }
+x509-parser = { workspace = true, features = ["verify"] }
 sha2 = { workspace = true }
 # Dynamic leaf-certificate minting for TLS interception.
 rcgen = { version = "0.13", features = ["x509-parser"] }

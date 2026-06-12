@@ -9,8 +9,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use icebreaker_common::{ClockSkewConfig, ExpirationStatus, Result, TokenPayload, TokenizerError};
-use icebreaker_crypto::TokenCrypto;
+use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
+use icebreaker_nonce::{CheckResult, NonceStore};
 
+use crate::metrics::record_replay_attempt;
 use crate::middleware::TOKEN_HEADER;
 use crate::network::IpFilter;
 
@@ -44,6 +46,7 @@ pub struct ConnectHandler {
     ip_filter: Arc<IpFilter>,
     config: TunnelConfig,
     clock_skew: ClockSkewConfig,
+    nonce_store: Option<Arc<dyn NonceStore>>,
 }
 
 impl ConnectHandler {
@@ -54,6 +57,7 @@ impl ConnectHandler {
             ip_filter,
             config: TunnelConfig::default(),
             clock_skew: ClockSkewConfig::default(),
+            nonce_store: None,
         }
     }
 
@@ -68,6 +72,7 @@ impl ConnectHandler {
             ip_filter,
             config,
             clock_skew: ClockSkewConfig::default(),
+            nonce_store: None,
         }
     }
 
@@ -83,16 +88,35 @@ impl ConnectHandler {
             ip_filter,
             config,
             clock_skew,
+            nonce_store: None,
         }
+    }
+
+    /// Sets the nonce store used to enforce replay protection on CONNECT.
+    ///
+    /// Without a store, tokens that carry replay protection are rejected
+    /// (fail-closed) rather than silently allowed to replay.
+    #[must_use]
+    pub fn with_nonce_store(mut self, nonce_store: Option<Arc<dyn NonceStore>>) -> Self {
+        self.nonce_store = nonce_store;
+        self
     }
 
     /// Validates a CONNECT request and returns the parsed token payload.
     ///
     /// This performs:
     /// - Token extraction and decryption
-    /// - Host validation against token's allowed hosts
+    /// - Client authentication binding (API key / mTLS) via [`validate_auth`]
     /// - Token expiration check (with clock skew tolerance)
-    pub fn validate_connect<B>(&self, request: &Request<B>) -> Result<(TokenPayload, String, u16)> {
+    /// - Host validation against token's allowed hosts
+    ///
+    /// Replay protection is enforced separately via [`Self::enforce_replay`] because
+    /// the nonce store is async.
+    pub fn validate_connect<B>(
+        &self,
+        request: &Request<B>,
+        tls_info: Option<&TlsConnectionInfo>,
+    ) -> Result<(TokenPayload, String, u16)> {
         // Extract the token
         let token_header = request
             .headers()
@@ -106,6 +130,21 @@ impl ConnectHandler {
         // Parse and decrypt the token
         let sealed_token = icebreaker_common::SealedToken::from_header(token_header)?;
         let payload = self.crypto.unseal(&sealed_token)?;
+
+        // Validate client authentication (API key / mTLS) so a token bound to a
+        // client cannot be used by anyone else who merely holds it. The API key
+        // HMAC key is derived from the keypair that sealed the token.
+        let api_key_hmac_key = self
+            .crypto
+            .api_key_hmac_key(&sealed_token.key_id)
+            .ok()
+            .map(|k| k.to_vec());
+        validate_auth(
+            &payload.auth,
+            request,
+            tls_info,
+            api_key_hmac_key.as_deref(),
+        )?;
 
         // Check expiration with clock skew tolerance
         match payload.check_expiration(&self.clock_skew) {
@@ -144,6 +183,78 @@ impl ConnectHandler {
         );
 
         Ok((payload, host, port))
+    }
+
+    /// Enforces replay protection for a validated CONNECT token.
+    ///
+    /// When the token carries replay protection, the nonce is checked and recorded
+    /// against the store. When no store is configured, the token is rejected
+    /// (fail-closed) so a single-use token cannot be replayed through CONNECT.
+    pub async fn enforce_replay(&self, payload: &TokenPayload) -> Result<()> {
+        let Some(replay) = payload.replay_protection.as_ref() else {
+            return Ok(());
+        };
+
+        let Some(store) = self.nonce_store.as_ref() else {
+            tracing::warn!(
+                nonce = %replay.nonce,
+                max_uses = ?replay.max_uses,
+                "rejecting CONNECT token with replay protection: nonce store is not configured"
+            );
+            return Err(TokenizerError::ReplayProtectionUnavailable);
+        };
+
+        // TTL: explicit nonce_ttl_seconds, else derive from the token expiry (plus
+        // clock-skew tolerance so the nonce outlives the token), else 24 hours.
+        let ttl = replay
+            .nonce_ttl_seconds
+            .map(Duration::from_secs)
+            .or_else(|| {
+                payload.expires_at.and_then(|expires_at| {
+                    let now = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let effective_expiry = expires_at + self.clock_skew.tolerance_seconds;
+                    (effective_expiry > now).then(|| Duration::from_secs(effective_expiry - now))
+                })
+            })
+            .unwrap_or(Duration::from_secs(86400));
+
+        match store
+            .check_and_record(&replay.nonce, replay.max_uses, ttl)
+            .await
+        {
+            Ok(CheckResult::Denied {
+                current_uses,
+                max_uses,
+            }) => {
+                record_replay_attempt();
+                tracing::warn!(
+                    nonce = %replay.nonce,
+                    current_uses,
+                    max_uses,
+                    "CONNECT token replay detected"
+                );
+                Err(TokenizerError::TokenReplayDetected {
+                    uses_count: current_uses,
+                    max_uses,
+                })
+            }
+            Ok(CheckResult::Allowed { current_uses, .. }) => {
+                tracing::debug!(
+                    nonce = %replay.nonce,
+                    current_uses,
+                    max_uses = ?replay.max_uses,
+                    "CONNECT nonce check passed"
+                );
+                Ok(())
+            }
+            Err(e) => {
+                tracing::error!(nonce = %replay.nonce, error = %e, "nonce store error");
+                Err(TokenizerError::NonceStoreError(e.to_string()))
+            }
+        }
     }
 
     /// Resolves a hostname to an IP address and validates it against the IP filter.
@@ -302,8 +413,16 @@ mod tests {
             builder = builder.allowed_host(*host);
         }
         let payload = builder.build();
+        connect_request_for(handler, &payload, target_authority)
+    }
 
-        let sealed = handler.crypto.seal(&payload).expect("seal token");
+    /// Seals `payload` and builds a CONNECT request carrying it.
+    fn connect_request_for(
+        handler: &ConnectHandler,
+        payload: &TokenPayload,
+        target_authority: &str,
+    ) -> Request<()> {
+        let sealed = handler.crypto.seal(payload).expect("seal token");
         let header = sealed.to_header().expect("serialize token");
 
         Request::builder()
@@ -312,6 +431,21 @@ mod tests {
             .header(TOKEN_HEADER, header)
             .body(())
             .expect("request should build")
+    }
+
+    fn handler_with_nonce_store() -> ConnectHandler {
+        create_mock_handler()
+            .with_nonce_store(Some(Arc::new(icebreaker_nonce::InMemoryNonceStore::new())))
+    }
+
+    fn replay_payload(nonce: &str, host: &str) -> TokenPayload {
+        TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host(host)
+        .replay_protection(icebreaker_common::ReplayProtection::single_use(nonce))
+        .build()
     }
 
     #[test]
@@ -436,7 +570,9 @@ mod tests {
         let request =
             connect_request_with_token(&handler, "api.example.com:443", &["api.example.com:443"]);
 
-        let (_, host, port) = handler.validate_connect(&request).expect("should validate");
+        let (_, host, port) = handler
+            .validate_connect(&request, None)
+            .expect("should validate");
         assert_eq!(host, "api.example.com");
         assert_eq!(port, 443);
     }
@@ -448,12 +584,111 @@ mod tests {
             connect_request_with_token(&handler, "api.example.com:8080", &["api.example.com:443"]);
 
         let err = handler
-            .validate_connect(&request)
+            .validate_connect(&request, None)
             .expect_err("should reject");
         assert!(
             matches!(err, TokenizerError::HostNotAllowed { .. }),
             "expected HostNotAllowed, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn test_enforce_replay_single_use_rejected_on_reuse() {
+        let handler = handler_with_nonce_store();
+        let payload = replay_payload("nonce-reuse", "api.example.com");
+        let request = connect_request_for(&handler, &payload, "api.example.com:443");
+
+        let (first, _, _) = handler
+            .validate_connect(&request, None)
+            .expect("first validate");
+        handler
+            .enforce_replay(&first)
+            .await
+            .expect("first use allowed");
+
+        let (second, _, _) = handler
+            .validate_connect(&request, None)
+            .expect("second validate");
+        let err = handler
+            .enforce_replay(&second)
+            .await
+            .expect_err("replay must be rejected");
+        assert!(
+            matches!(err, TokenizerError::TokenReplayDetected { .. }),
+            "expected TokenReplayDetected, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enforce_replay_fails_closed_without_store() {
+        // No nonce store configured: a token carrying replay protection is rejected
+        // rather than silently allowed to replay.
+        let handler = create_mock_handler();
+        let payload = replay_payload("nonce-nostore", "api.example.com");
+        let err = handler
+            .enforce_replay(&payload)
+            .await
+            .expect_err("must fail closed");
+        assert!(
+            matches!(err, TokenizerError::ReplayProtectionUnavailable),
+            "expected ReplayProtectionUnavailable, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_enforce_replay_noop_without_protection() {
+        // A token with no replay protection is unaffected, with or without a store.
+        let handler = handler_with_nonce_store();
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .build();
+        handler
+            .enforce_replay(&payload)
+            .await
+            .expect("no replay protection is a no-op");
+    }
+
+    #[test]
+    fn test_validate_connect_mtls_auth_binding() {
+        use icebreaker_common::auth::{AuthConfig, MutualTlsConfig};
+        use icebreaker_crypto::TlsConnectionInfo;
+
+        let handler = create_mock_handler();
+        let payload = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .auth(AuthConfig::MutualTls(MutualTlsConfig::new("fp-trusted")))
+        .build();
+        let request = connect_request_for(&handler, &payload, "api.example.com:443");
+
+        // No client certificate: rejected.
+        let err = handler
+            .validate_connect(&request, None)
+            .expect_err("missing client cert must be rejected");
+        assert!(
+            matches!(err, TokenizerError::ProxyAuthRequired { .. }),
+            "expected ProxyAuthRequired, got {err:?}"
+        );
+
+        // Wrong fingerprint: rejected.
+        let wrong = TlsConnectionInfo::with_fingerprint("fp-attacker");
+        assert!(
+            handler.validate_connect(&request, Some(&wrong)).is_err(),
+            "mismatched fingerprint must be rejected"
+        );
+
+        // Matching fingerprint: accepted.
+        let trusted = TlsConnectionInfo::with_fingerprint("fp-trusted");
+        let (_, host, port) = handler
+            .validate_connect(&request, Some(&trusted))
+            .expect("matching cert should validate");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
     }
 
     #[test]
@@ -463,7 +698,7 @@ mod tests {
         let request_443 =
             connect_request_with_token(&handler, "api.example.com:443", &["api.example.com"]);
         let (_, host, port) = handler
-            .validate_connect(&request_443)
+            .validate_connect(&request_443, None)
             .expect("443 should validate");
         assert_eq!(host, "api.example.com");
         assert_eq!(port, 443);
@@ -471,7 +706,7 @@ mod tests {
         let request_9999 =
             connect_request_with_token(&handler, "api.example.com:9999", &["api.example.com"]);
         let (_, host, port) = handler
-            .validate_connect(&request_9999)
+            .validate_connect(&request_9999, None)
             .expect("9999 should validate");
         assert_eq!(host, "api.example.com");
         assert_eq!(port, 9999);

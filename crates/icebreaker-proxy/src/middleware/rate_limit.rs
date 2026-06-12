@@ -20,11 +20,21 @@ pub struct RateLimitLayer {
 }
 
 impl RateLimitLayer {
-    /// Creates a new rate limit layer.
+    /// Creates a new rate limit layer with its own limiter state.
     pub fn new(config: RateLimitConfig) -> Self {
         Self {
             limiter: Arc::new(RateLimiter::new(config)),
         }
+    }
+
+    /// Creates a rate limit layer backed by a shared limiter.
+    ///
+    /// Sharing one [`RateLimiter`] across connections (and with the CONNECT path)
+    /// keeps GCRA state process-wide, so per-key throttling spans connections
+    /// rather than resetting on each one.
+    #[must_use]
+    pub fn from_limiter(limiter: Arc<RateLimiter>) -> Self {
+        Self { limiter }
     }
 }
 
@@ -209,6 +219,30 @@ mod tests {
         for _ in 0..10 {
             assert!(limiter.check("test-key").await);
         }
+    }
+
+    #[tokio::test]
+    async fn test_from_limiter_shares_state_across_layers() {
+        // A shared limiter must enforce one budget across every layer built from it,
+        // so throttling spans connections instead of resetting per layer.
+        let config = RateLimitConfig {
+            max_requests: 5,
+            period: Duration::from_secs(1),
+            burst: 2,
+        };
+        let limiter = Arc::new(RateLimiter::new(config));
+        let layer_a = RateLimitLayer::from_limiter(limiter.clone());
+        let layer_b = RateLimitLayer::from_limiter(limiter.clone());
+
+        // Exhaust the budget through the shared limiter directly.
+        for _ in 0..7 {
+            limiter.check("shared-key").await;
+        }
+
+        // Both layers observe the exhausted state because they share one limiter.
+        assert!(Arc::ptr_eq(&layer_a.limiter, &layer_b.limiter));
+        assert!(!layer_a.limiter.check("shared-key").await);
+        assert!(!layer_b.limiter.check("shared-key").await);
     }
 
     #[tokio::test]

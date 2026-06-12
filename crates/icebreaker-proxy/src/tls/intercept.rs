@@ -25,6 +25,9 @@ use tokio_rustls::TlsAcceptor;
 /// Validity window, in days, for minted leaf certificates.
 const LEAF_VALIDITY_DAYS: i64 = 30;
 
+/// Placeholder host used to mint a throwaway leaf when validating the CA at load.
+const CA_SELF_CHECK_HOST: &str = "ca-self-check.invalid";
+
 /// Errors that can occur while loading the interception CA or minting a leaf.
 #[derive(Debug, thiserror::Error)]
 pub enum InterceptError {
@@ -50,6 +53,14 @@ pub enum InterceptError {
     /// The CA could not be prepared for signing leaves.
     #[error("failed to prepare interception CA for signing: {0}")]
     Issuer(String),
+
+    /// The certificate is not a CA (missing or false basicConstraints CA flag).
+    #[error("interception certificate is not a CA: basicConstraints CA:TRUE is required")]
+    NotCa,
+
+    /// The private key does not correspond to the certificate's public key.
+    #[error("interception CA key does not match the certificate")]
+    KeyMismatch,
 
     /// A leaf certificate could not be minted.
     #[error("failed to mint leaf certificate for {host}: {reason}")]
@@ -89,11 +100,55 @@ impl InterceptCa {
             .ok_or_else(|| {
                 InterceptError::ParseCert("no certificate found in CA PEM".to_string())
             })?;
-        Ok(Self {
+        let ca = Self {
             key,
             issuer,
             chain_der,
-        })
+        };
+        ca.validate()?;
+        Ok(ca)
+    }
+
+    /// Validates the loaded CA at startup, failing fast on a misconfigured pair.
+    ///
+    /// Checks that the certificate carries `basicConstraints CA:TRUE`, then mints a
+    /// throwaway leaf and verifies its signature against the *loaded* certificate's
+    /// public key. A key that does not match the certificate would otherwise load
+    /// cleanly and fail only at the first bumped handshake, with an opaque
+    /// client-side error.
+    fn validate(&self) -> Result<(), InterceptError> {
+        use x509_parser::prelude::FromDer;
+
+        let (_, ca_cert) = x509_parser::certificate::X509Certificate::from_der(
+            self.chain_der.as_ref(),
+        )
+        .map_err(|e| InterceptError::ParseCert(format!("failed to parse CA certificate: {e}")))?;
+
+        match ca_cert.basic_constraints() {
+            Ok(Some(bc)) if bc.value.ca => {}
+            Ok(_) => return Err(InterceptError::NotCa),
+            Err(e) => {
+                return Err(InterceptError::ParseCert(format!(
+                    "failed to read basicConstraints: {e}"
+                )))
+            }
+        }
+
+        // Mint a throwaway leaf and verify it is actually signed by the loaded
+        // certificate's key. This proves the private key matches the certificate.
+        let probe = self.mint_leaf(CA_SELF_CHECK_HOST)?;
+        let leaf_der = probe.cert.first().ok_or_else(|| {
+            InterceptError::Issuer("minted probe leaf has an empty chain".to_string())
+        })?;
+        let (_, leaf_cert) = x509_parser::certificate::X509Certificate::from_der(leaf_der.as_ref())
+            .map_err(|e| {
+                InterceptError::Issuer(format!("failed to parse probe leaf certificate: {e}"))
+            })?;
+        leaf_cert
+            .verify_signature(Some(ca_cert.public_key()))
+            .map_err(|_| InterceptError::KeyMismatch)?;
+
+        Ok(())
     }
 
     /// Mints a leaf certificate for `host`, signed by this CA.
@@ -297,5 +352,40 @@ mod tests {
     #[test]
     fn test_load_rejects_invalid_pem() {
         assert!(DynamicCertResolver::from_pem("not a cert", "not a key").is_err());
+    }
+
+    #[test]
+    fn test_load_accepts_valid_ca() {
+        let (cert_pem, key_pem) = test_ca();
+        assert!(DynamicCertResolver::from_pem(&cert_pem, &key_pem).is_ok());
+    }
+
+    #[test]
+    fn test_load_rejects_mismatched_key() {
+        let (cert_pem, _) = test_ca();
+        // A key from an unrelated keypair: parses fine but does not match the cert.
+        let other_key = KeyPair::generate().expect("generate other key");
+        let result = DynamicCertResolver::from_pem(&cert_pem, &other_key.serialize_pem());
+        assert!(
+            matches!(result, Err(InterceptError::KeyMismatch)),
+            "expected KeyMismatch, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_load_rejects_non_ca_certificate() {
+        // A self-signed leaf (basicConstraints CA:FALSE) must be rejected.
+        let mut params = CertificateParams::default();
+        params.is_ca = IsCa::NoCa;
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Not A CA");
+        let key = KeyPair::generate().expect("generate key");
+        let cert = params.self_signed(&key).expect("self-sign leaf");
+        let result = DynamicCertResolver::from_pem(&cert.pem(), &key.serialize_pem());
+        assert!(
+            matches!(result, Err(InterceptError::NotCa)),
+            "expected NotCa, got {result:?}"
+        );
     }
 }

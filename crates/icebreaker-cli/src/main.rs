@@ -39,9 +39,10 @@ use icebreaker_crypto::{
 };
 use icebreaker_proxy::{
     create_bump_acceptor, create_tls_acceptor, extract_client_cert_info, is_connect_request,
-    ConnectHandler, DynamicCertResolver, DynamicResponseScanLayer, HostValidationConfig,
-    InMemoryNonceStore, IpFilter, MetricsLayer, NonceStore, RateLimitLayer, TokenInjectionLayer,
-    TunnelConfig, ValidatingConnector,
+    record_connect_tunnel, record_token_validation, ConnectHandler, DynamicCertResolver,
+    DynamicResponseScanLayer, HostValidationConfig, InMemoryNonceStore, IpFilter, MetricsLayer,
+    NonceStore, RateLimitLayer, RateLimiter, TokenInjectionLayer, TokenValidationResult,
+    TunnelConfig, ValidatingConnector, TOKEN_HEADER,
 };
 use tokio_rustls::TlsAcceptor;
 
@@ -756,7 +757,7 @@ struct ProxyContext {
     ip_filter: Arc<IpFilter>,
     nonce_store: Option<Arc<dyn NonceStore>>,
     clock_skew: ClockSkewConfig,
-    rate_limit_config: Option<RateLimitConfig>,
+    rate_limiter: Option<Arc<RateLimiter>>,
     response_scan_enabled: bool,
     request_timeout: Duration,
     shutdown: Arc<ShutdownState>,
@@ -859,6 +860,9 @@ struct ConnectDeps {
     bump_acceptor: Option<TlsAcceptor>,
     /// Hosts that must be tunneled transparently rather than intercepted.
     no_bump_policy: Option<Arc<HostValidationConfig>>,
+    /// Shared rate limiter; CONNECT is throttled with the same per-key state as
+    /// the HTTP path so it cannot be used to brute-force token decryption.
+    rate_limiter: Option<Arc<RateLimiter>>,
 }
 
 /// Resolves a token-less CONNECT target, gating it against the static host policy.
@@ -896,45 +900,82 @@ fn to_unified(resp: Response<String>) -> Response<UnifiedBody> {
 /// Returns the control response to send to the client: a 200 that triggers the
 /// HTTP upgrade, or an error response. The tunnel runs in a detached task that
 /// holds a [`ConnectionGuard`] so it is accounted for during shutdown draining.
-fn handle_connect(
-    req: &mut Request<Incoming>,
-    deps: &ConnectDeps,
+// Returns a boxed future rather than `async fn` to break a recursive-`Send`
+// inference cycle: the spawned bump path re-serves the decrypted stream through
+// `serve_http`, whose service awaits `handle_connect` again. Boxing the future as
+// `dyn Future + Send` asserts the bound at this boundary so the auto-trait check
+// terminates instead of recursing through itself.
+fn handle_connect<'a>(
+    req: &'a mut Request<Incoming>,
+    deps: &'a ConnectDeps,
     remote_addr: SocketAddr,
-) -> Response<UnifiedBody> {
-    // A tokened CONNECT is validated against the token's allowlist. A token-less
-    // CONNECT is permitted only in token-optional mode, gated by the static policy.
-    let target = match deps.handler.validate_connect(req) {
-        Ok((_payload, host, port)) => Ok((host, port)),
-        Err(icebreaker_common::TokenizerError::ProxyAuthRequired { .. })
-            if deps.ctx.token_optional =>
-        {
-            connect_target_with_policy(req, &deps.ctx.host_policy)
+    tls_info: Option<&'a TlsConnectionInfo>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<UnifiedBody>> + Send + 'a>> {
+    Box::pin(async move {
+        // Throttle CONNECT with the same shared limiter as the HTTP path. Without
+        // this, CONNECT can be used to brute-force token decryption unthrottled.
+        if let Some(limiter) = deps.rate_limiter.as_ref() {
+            let conn_info = match tls_info {
+                Some(info) => ConnectionInfo::new(remote_addr).with_tls(info.clone()),
+                None => ConnectionInfo::new(remote_addr),
+            };
+            if !limiter.check(&conn_info.rate_limit_key()).await {
+                tracing::warn!(remote_addr = %remote_addr, "CONNECT rate limit exceeded");
+                return to_unified(ConnectHandler::error_response(
+                    &icebreaker_common::TokenizerError::RateLimitExceeded,
+                ));
+            }
         }
-        Err(e) => Err(e),
-    };
 
-    match target {
-        Ok((host, port)) => {
-            let on_upgrade = hyper::upgrade::on(req);
-            let deps = deps.clone();
-            let guard = ConnectionGuard::new(deps.ctx.shutdown.clone());
-            tokio::spawn(async move {
-                let _guard = guard;
-                match on_upgrade.await {
-                    Ok(upgraded) => {
-                        let client_io = TokioIo::new(upgraded);
-                        handle_tunnel_or_bump(client_io, host, port, remote_addr, deps).await;
+        // A tokened CONNECT is validated against the token's allowlist (auth
+        // binding, expiration, host) and replay protection. A token-less CONNECT is
+        // permitted only in token-optional mode, gated by the static policy. The
+        // fallback is keyed on token *absence* so a present-but-rejected token
+        // (e.g. failed auth binding, which also yields ProxyAuthRequired) is not
+        // silently downgraded to token-less treatment.
+        let has_token = req.headers().contains_key(TOKEN_HEADER)
+            || req
+                .headers()
+                .contains_key(http::header::PROXY_AUTHORIZATION);
+        let target = match deps.handler.validate_connect(req, tls_info) {
+            Ok((payload, host, port)) => deps
+                .handler
+                .enforce_replay(&payload)
+                .await
+                .map(|()| (host, port)),
+            Err(icebreaker_common::TokenizerError::ProxyAuthRequired { .. })
+                if deps.ctx.token_optional && !has_token =>
+            {
+                connect_target_with_policy(req, &deps.ctx.host_policy)
+            }
+            Err(e) => Err(e),
+        };
+
+        match target {
+            Ok((host, port)) => {
+                record_connect_tunnel();
+                let on_upgrade = hyper::upgrade::on(req);
+                let deps = deps.clone();
+                let guard = ConnectionGuard::new(deps.ctx.shutdown.clone());
+                tokio::spawn(async move {
+                    let _guard = guard;
+                    match on_upgrade.await {
+                        Ok(upgraded) => {
+                            let client_io = TokioIo::new(upgraded);
+                            handle_tunnel_or_bump(client_io, host, port, remote_addr, deps).await;
+                        }
+                        Err(e) => tracing::warn!(error = %e, "CONNECT upgrade failed"),
                     }
-                    Err(e) => tracing::warn!(error = %e, "CONNECT upgrade failed"),
-                }
-            });
-            connect_success_response()
+                });
+                connect_success_response()
+            }
+            Err(e) => {
+                record_token_validation(TokenValidationResult::Invalid);
+                tracing::warn!(error = %e, "CONNECT request rejected");
+                to_unified(ConnectHandler::error_response(&e))
+            }
         }
-        Err(e) => {
-            tracing::warn!(error = %e, "CONNECT request rejected");
-            to_unified(ConnectHandler::error_response(&e))
-        }
-    }
+    })
 }
 
 /// Routes an upgraded CONNECT stream to TLS interception or a transparent tunnel.
@@ -1061,7 +1102,13 @@ async fn serve_connection_with<I, S>(
             // establish a tunnel rather than being forwarded as HTTP.
             if let Some(deps) = connect {
                 if is_connect_request(&req) {
-                    return Ok(handle_connect(&mut req, &deps, conn.remote_addr));
+                    return Ok(handle_connect(
+                        &mut req,
+                        &deps,
+                        conn.remote_addr,
+                        conn.tls_info.as_ref(),
+                    )
+                    .await);
                 }
             }
 
@@ -1129,15 +1176,19 @@ where
     // context so the bump path can re-serve the decrypted stream.
     let connect = if conn.injected_authority.is_none() {
         Some(ConnectDeps {
-            handler: Arc::new(ConnectHandler::with_all_options(
-                ctx.crypto.clone(),
-                ctx.ip_filter.clone(),
-                TunnelConfig::default(),
-                ctx.clock_skew.clone(),
-            )),
+            handler: Arc::new(
+                ConnectHandler::with_all_options(
+                    ctx.crypto.clone(),
+                    ctx.ip_filter.clone(),
+                    TunnelConfig::default(),
+                    ctx.clock_skew.clone(),
+                )
+                .with_nonce_store(ctx.nonce_store.clone()),
+            ),
             ctx: ctx.clone(),
             bump_acceptor: ctx.bump_acceptor.clone(),
             no_bump_policy: ctx.no_bump_policy.clone(),
+            rate_limiter: ctx.rate_limiter.clone(),
         })
     } else {
         None
@@ -1148,7 +1199,7 @@ where
         ip_filter,
         nonce_store,
         clock_skew,
-        rate_limit_config,
+        rate_limiter,
         response_scan_enabled,
         request_timeout,
         token_optional,
@@ -1161,9 +1212,9 @@ where
 
     // Handle the two cases (with/without rate limiting) separately to avoid
     // complex type erasure while keeping concrete types for efficiency.
-    if let Some(rate_config) = rate_limit_config {
+    if let Some(limiter) = rate_limiter {
         let service = ServiceBuilder::new()
-            .layer(RateLimitLayer::new(rate_config))
+            .layer(RateLimitLayer::from_limiter(limiter))
             .layer(MetricsLayer::new())
             .layer({
                 let mut layer = TokenInjectionLayer::new(crypto)
@@ -1356,13 +1407,15 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
-        // Build rate limit config if enabled
-        let rate_limit_config = if args.rate_limit_enabled {
-            Some(RateLimitConfig {
+        // Build a process-wide rate limiter if enabled. One shared limiter keeps GCRA
+        // state across connections (and is reused by the CONNECT path), so per-key
+        // throttling spans connections instead of resetting on each one.
+        let rate_limiter = if args.rate_limit_enabled {
+            Some(Arc::new(RateLimiter::new(RateLimitConfig {
                 max_requests: args.rate_limit_max_requests,
                 period: Duration::from_secs(1),
                 burst: args.rate_limit_burst,
-            })
+            })))
         } else {
             None
         };
@@ -1467,7 +1520,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             ip_filter,
             nonce_store,
             clock_skew,
-            rate_limit_config,
+            rate_limiter,
             response_scan_enabled,
             request_timeout,
             shutdown: shutdown_state.clone(),
