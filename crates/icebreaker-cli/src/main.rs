@@ -862,6 +862,9 @@ struct ConnectDeps {
     /// Shared rate limiter; CONNECT is throttled with the same per-key state as
     /// the HTTP path so it cannot be used to brute-force token decryption.
     rate_limiter: Option<Arc<RateLimiter>>,
+    /// Outer connection's mTLS identity, propagated onto the decrypted inner
+    /// stream of a bump so cert-bound tokens still validate after interception.
+    tls_info: Option<TlsConnectionInfo>,
 }
 
 /// Resolves a token-less CONNECT target, gating it against the static host policy.
@@ -998,7 +1001,16 @@ async fn handle_tunnel_or_bump(
 
     match deps.bump_resolver.clone() {
         Some(resolver) if !in_no_bump => {
-            bump_and_serve(client_io, &host, port, remote_addr, resolver, deps.ctx).await;
+            bump_and_serve(
+                client_io,
+                &host,
+                port,
+                remote_addr,
+                resolver,
+                deps.ctx,
+                deps.tls_info,
+            )
+            .await;
         }
         _ => {
             let mut client_io = client_io;
@@ -1016,6 +1028,7 @@ async fn bump_and_serve(
     remote_addr: SocketAddr,
     resolver: Arc<DynamicCertResolver>,
     ctx: ProxyContext,
+    tls_info: Option<TlsConnectionInfo>,
 ) {
     // Mint (or reuse) a leaf for the policy-vetted CONNECT host; the acceptor
     // presents it regardless of the client's SNI, so untrusted SNI never drives
@@ -1048,7 +1061,7 @@ async fn bump_and_serve(
     // target authority so token injection and forwarding resolve the destination.
     let conn = ConnContext {
         remote_addr,
-        tls_info: None,
+        tls_info,
         forced_upstream_scheme: Some(UpstreamScheme::Https),
         injected_authority: Some(authority),
     };
@@ -1202,6 +1215,7 @@ where
             bump_resolver: ctx.bump_resolver.clone(),
             no_bump_policy: ctx.no_bump_policy.clone(),
             rate_limiter: ctx.rate_limiter.clone(),
+            tls_info: conn.tls_info.clone(),
         })
     } else {
         None
