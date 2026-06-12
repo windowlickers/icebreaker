@@ -25,6 +25,9 @@ use tokio_rustls::TlsAcceptor;
 /// Validity window, in days, for minted leaf certificates.
 const LEAF_VALIDITY_DAYS: i64 = 30;
 
+/// Re-mint a cached leaf once it is within this many days of expiring.
+const LEAF_RENEW_MARGIN_DAYS: i64 = 1;
+
 /// Placeholder host used to mint a throwaway leaf when validating the CA at load.
 const CA_SELF_CHECK_HOST: &str = "ca-self-check.invalid";
 
@@ -136,7 +139,7 @@ impl InterceptCa {
 
         // Mint a throwaway leaf and verify it is actually signed by the loaded
         // certificate's key. This proves the private key matches the certificate.
-        let probe = self.mint_leaf(CA_SELF_CHECK_HOST)?;
+        let (probe, _) = self.mint_leaf(CA_SELF_CHECK_HOST)?;
         let leaf_der = probe.cert.first().ok_or_else(|| {
             InterceptError::Issuer("minted probe leaf has an empty chain".to_string())
         })?;
@@ -152,7 +155,10 @@ impl InterceptCa {
     }
 
     /// Mints a leaf certificate for `host`, signed by this CA.
-    fn mint_leaf(&self, host: &str) -> Result<CertifiedKey, InterceptError> {
+    ///
+    /// Returns the certificate alongside its `not_after` instant so callers can
+    /// cache the expiry without re-parsing the DER.
+    fn mint_leaf(&self, host: &str) -> Result<(CertifiedKey, OffsetDateTime), InterceptError> {
         let leaf_err = |reason: String| InterceptError::Leaf {
             host: host.to_string(),
             reason,
@@ -171,8 +177,10 @@ impl InterceptCa {
             KeyUsagePurpose::KeyEncipherment,
         ];
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
-        params.not_before = OffsetDateTime::now_utc();
-        params.not_after = OffsetDateTime::now_utc() + Duration::days(LEAF_VALIDITY_DAYS);
+        let now = OffsetDateTime::now_utc();
+        let not_after = now + Duration::days(LEAF_VALIDITY_DAYS);
+        params.not_before = now;
+        params.not_after = not_after;
 
         let leaf_key = KeyPair::generate().map_err(|e| leaf_err(e.to_string()))?;
         let leaf = params
@@ -185,18 +193,26 @@ impl InterceptCa {
         let signing_key = rustls::crypto::ring::sign::any_supported_type(&key_der)
             .map_err(|e| leaf_err(format!("unsupported leaf key: {e}")))?;
 
-        Ok(CertifiedKey::new(
-            vec![leaf_der, self.chain_der.clone()],
-            signing_key,
+        Ok((
+            CertifiedKey::new(vec![leaf_der, self.chain_der.clone()], signing_key),
+            not_after,
         ))
     }
+}
+
+/// A cached leaf and the `not_after` instant it was minted with.
+struct CachedLeaf {
+    /// The minted leaf certificate and signing key.
+    key: Arc<CertifiedKey>,
+    /// When the leaf expires; used to re-mint before it does.
+    not_after: OffsetDateTime,
 }
 
 /// Resolves server certificates by minting (and caching) a leaf per SNI host.
 #[derive(Clone)]
 pub struct DynamicCertResolver {
     ca: Arc<InterceptCa>,
-    cache: Arc<Mutex<HashMap<String, Arc<CertifiedKey>>>>,
+    cache: Arc<Mutex<HashMap<String, CachedLeaf>>>,
 }
 
 impl DynamicCertResolver {
@@ -235,24 +251,36 @@ impl DynamicCertResolver {
     ///
     /// Returns `None` if minting fails (the TLS handshake then fails cleanly).
     fn leaf_for(&self, host: &str) -> Option<Arc<CertifiedKey>> {
+        let now = OffsetDateTime::now_utc();
+        let renew_margin = Duration::days(LEAF_RENEW_MARGIN_DAYS);
+
         if let Ok(cache) = self.cache.lock() {
-            if let Some(key) = cache.get(host) {
-                return Some(key.clone());
+            if let Some(entry) = cache.get(host) {
+                if entry.not_after - now > renew_margin {
+                    return Some(entry.key.clone());
+                }
             }
         }
 
-        let minted = match self.ca.mint_leaf(host) {
-            Ok(certified) => Arc::new(certified),
+        let (certified, not_after) = match self.ca.mint_leaf(host) {
+            Ok(minted) => minted,
             Err(e) => {
                 tracing::error!(host, error = %e, "failed to mint interception leaf certificate");
                 return None;
             }
         };
+        let key = Arc::new(certified);
 
         if let Ok(mut cache) = self.cache.lock() {
-            cache.insert(host.to_string(), minted.clone());
+            cache.insert(
+                host.to_string(),
+                CachedLeaf {
+                    key: key.clone(),
+                    not_after,
+                },
+            );
         }
-        Some(minted)
+        Some(key)
     }
 }
 
@@ -316,6 +344,51 @@ mod tests {
             Arc::ptr_eq(&first, &second),
             "second lookup must hit the cache"
         );
+    }
+
+    #[test]
+    fn test_resolver_remints_near_expiry_leaf() {
+        let (cert_pem, key_pem) = test_ca();
+        let resolver = DynamicCertResolver::from_pem(&cert_pem, &key_pem).expect("load CA");
+
+        let first = resolver.leaf_for("api.example.com").expect("mint leaf");
+
+        // Force the cached entry to look near-expired (within the renew margin).
+        {
+            let mut cache = resolver.cache.lock().expect("lock cache");
+            let entry = cache.get_mut("api.example.com").expect("cached entry");
+            entry.not_after = OffsetDateTime::now_utc() - Duration::days(1);
+        }
+
+        let second = resolver.leaf_for("api.example.com").expect("re-mint leaf");
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "a near-expiry leaf must be re-minted, not served from cache"
+        );
+
+        let cache = resolver.cache.lock().expect("lock cache");
+        let entry = cache.get("api.example.com").expect("cached entry");
+        assert!(
+            entry.not_after > OffsetDateTime::now_utc(),
+            "re-minted leaf must have a future expiry"
+        );
+    }
+
+    #[test]
+    fn test_cached_leaf_not_after_matches_validity_window() {
+        let (cert_pem, key_pem) = test_ca();
+        let resolver = DynamicCertResolver::from_pem(&cert_pem, &key_pem).expect("load CA");
+
+        let before = OffsetDateTime::now_utc();
+        resolver.leaf_for("api.example.com").expect("mint leaf");
+        let after = OffsetDateTime::now_utc();
+
+        let cache = resolver.cache.lock().expect("lock cache");
+        let entry = cache.get("api.example.com").expect("cached entry");
+        // not_after is roughly now + LEAF_VALIDITY_DAYS, bracketed by the mint window.
+        let validity = Duration::days(LEAF_VALIDITY_DAYS);
+        assert!(entry.not_after >= before + validity);
+        assert!(entry.not_after <= after + validity);
     }
 
     #[test]
