@@ -29,6 +29,10 @@ const LEAF_VALIDITY_DAYS: i64 = 30;
 /// Re-mint a cached leaf once it is within this many days of expiring.
 const LEAF_RENEW_MARGIN_DAYS: i64 = 1;
 
+/// Backdate the leaf's `not_before` by this margin so a client whose clock
+/// trails the proxy's does not reject a freshly minted leaf as "not yet valid".
+const LEAF_BACKDATE: Duration = Duration::hours(1);
+
 /// Upper bound on cached leaves. Minting is keyed by the policy-vetted CONNECT
 /// host, so this only bites under `--token-optional-allow-any`, where the CONNECT
 /// host itself is attacker-controlled; the LRU then evicts the least-recently-used
@@ -186,7 +190,7 @@ impl InterceptCa {
         params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
         let now = OffsetDateTime::now_utc();
         let not_after = now + Duration::days(LEAF_VALIDITY_DAYS);
-        params.not_before = now;
+        params.not_before = now - LEAF_BACKDATE;
         params.not_after = not_after;
 
         let leaf_key = KeyPair::generate().map_err(|e| leaf_err(e.to_string()))?;
@@ -449,6 +453,28 @@ mod tests {
             )
         });
         assert!(has_host, "leaf must advertise the host as a DNS SAN");
+    }
+
+    #[test]
+    fn test_minted_leaf_not_before_is_backdated() {
+        let (cert_pem, key_pem) = test_ca();
+        let resolver = DynamicCertResolver::from_pem(&cert_pem, &key_pem).expect("load CA");
+
+        let mint_time = OffsetDateTime::now_utc();
+        let leaf = resolver.leaf_for("api.example.com").expect("mint leaf");
+
+        let (_, parsed) = x509_parser::parse_x509_certificate(leaf.cert[0].as_ref())
+            .expect("parse leaf certificate");
+        let not_before = parsed.validity().not_before.timestamp();
+
+        // not_before is backdated by ~1h so clients whose clock trails the proxy's
+        // still accept a freshly minted leaf. Require at least 50 minutes of backdate
+        // to leave slack for the margin and test execution time.
+        let backdate = mint_time.unix_timestamp() - not_before;
+        assert!(
+            backdate >= 50 * 60,
+            "leaf not_before must be backdated; got {backdate}s of backdate"
+        );
     }
 
     #[test]
