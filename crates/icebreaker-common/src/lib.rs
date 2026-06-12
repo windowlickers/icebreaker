@@ -29,6 +29,6 @@ pub use processor::{
     MultiProcessorConfig, OAuthConfig, OAuthGrantType, ProcessorConfig, Sigv4Config,
 };
 pub use token::{
-    ExpirationStatus, OAuthMetadata, ReplayProtection, SealedToken, TokenMetadata, TokenPayload,
-    UpstreamScheme,
+    split_host_port, ExpirationStatus, OAuthMetadata, ReplayProtection, SealedToken, TokenMetadata,
+    TokenPayload, UpstreamScheme,
 };

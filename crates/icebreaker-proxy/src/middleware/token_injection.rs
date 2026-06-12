@@ -113,21 +113,16 @@ pub fn generate_scan_patterns(secret: &str) -> Vec<Vec<u8>> {
     patterns
 }
 
-/// Extracts the destination host (without port) from a request's absolute-form
-/// URI or its `Host` header, for static host-policy checks in token-optional mode.
-fn request_bare_host<B>(request: &Request<B>) -> Option<String> {
-    if let Some(host) = request.uri().host() {
-        return Some(host.to_string());
+/// Extracts the destination authority (`host[:port]`) from a request's
+/// absolute-form URI or its `Host` header, for static host-policy checks in
+/// token-optional mode. The port is preserved so the policy can enforce
+/// port-pinned entries.
+fn request_authority<B>(request: &Request<B>) -> Option<String> {
+    if let Some(authority) = request.uri().authority() {
+        return Some(authority.to_string());
     }
     let host_header = request.headers().get(http::header::HOST)?.to_str().ok()?;
-    // Strip an optional port. Mirrors HostValidationService's host extraction.
-    Some(
-        host_header
-            .rsplit_once(':')
-            .map(|(host, _)| host)
-            .unwrap_or(host_header)
-            .to_string(),
-    )
+    Some(host_header.to_string())
 }
 
 /// Layer that injects tokens into requests.
@@ -274,13 +269,13 @@ where
                     // by the static host policy. The destination comes from the
                     // request, and no secret is injected or scanned for.
                     record_token_validation(TokenValidationResult::Skipped);
-                    let host = request_bare_host(&request).ok_or_else(|| {
+                    let authority = request_authority(&request).ok_or_else(|| {
                         TokenizerError::InvalidPayload(
                             "request has no host in URI or Host header".to_string(),
                         )
                     })?;
-                    if let Err(e) = host_policy.validate(&host) {
-                        record_host_rejection(&host);
+                    if let Err(e) = host_policy.validate(&authority) {
+                        record_host_rejection(&authority);
                         return Err(e);
                     }
                     return inner.call(request).await.map_err(|e| {
@@ -637,6 +632,38 @@ mod tests {
 
         let result = service.oneshot(request).await;
         assert!(matches!(result, Err(TokenizerError::HostNotAllowed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_token_optional_rejects_disallowed_port() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let policy = Arc::new(HostValidationConfig::new().allow_host("api.example.com:443"));
+        let layer = TokenInjectionLayer::new(crypto).with_token_optional(true, policy);
+        let service = layer.layer(MockService);
+
+        let request = Request::builder()
+            .uri("https://api.example.com:22/data")
+            .body(())
+            .expect("request should build");
+
+        let result = service.oneshot(request).await;
+        assert!(matches!(result, Err(TokenizerError::HostNotAllowed { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_token_optional_bare_entry_allows_any_port() {
+        let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+        let policy = Arc::new(HostValidationConfig::new().allow_host("api.example.com"));
+        let layer = TokenInjectionLayer::new(crypto).with_token_optional(true, policy);
+        let service = layer.layer(MockService);
+
+        let request = Request::builder()
+            .uri("https://api.example.com:8080/data")
+            .body(())
+            .expect("request should build");
+
+        let response = service.oneshot(request).await.expect("should forward");
+        assert_eq!(response.status(), 200);
     }
 
     #[tokio::test]

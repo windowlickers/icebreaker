@@ -10,7 +10,7 @@ use http::Request;
 use regex::Regex;
 use tower::{Layer, Service};
 
-use icebreaker_common::TokenizerError;
+use icebreaker_common::{split_host_port, TokenizerError};
 
 /// Maximum compiled size for host pattern regex (10KB).
 const HOST_PATTERN_REGEX_SIZE_LIMIT: usize = 10 * 1024;
@@ -81,23 +81,25 @@ where
         let mut inner = self.inner.clone();
 
         Box::pin(async move {
-            // Extract host from request
-            let host = request
+            // Extract the target authority (`host[:port]`) from the request so the
+            // policy can enforce port-pinned entries.
+            let authority = request
                 .uri()
-                .host()
+                .authority()
+                .map(http::uri::Authority::to_string)
                 .or_else(|| {
                     request
                         .headers()
                         .get(http::header::HOST)
                         .and_then(|v| v.to_str().ok())
-                        .map(|h| h.split(':').next().unwrap_or(h))
+                        .map(str::to_string)
                 })
                 .ok_or_else(|| TokenizerError::HostNotAllowed {
                     host: "<unknown>".to_string(),
                 })?;
 
-            // Validate the host
-            config.validate(host)?;
+            // Validate the authority
+            config.validate(&authority)?;
 
             // Forward to inner service
             inner
@@ -201,44 +203,52 @@ impl HostValidationConfig {
         self
     }
 
-    /// Validates a host against the configuration.
-    pub fn validate(&self, host: &str) -> Result<(), TokenizerError> {
-        // Check blocklist first
-        if self.blocked_hosts.contains(host) {
+    /// Validates an authority (`host` or `host:port`) against the configuration.
+    ///
+    /// Host-set entries use the same port semantics as the token allowlist: a
+    /// bare entry (`api.example.com`) matches any port, while a `host:port`
+    /// entry matches only that exact port. Patterns are matched against the
+    /// bare host, with any port stripped first.
+    pub fn validate(&self, authority: &str) -> Result<(), TokenizerError> {
+        let (req_host, req_port) = split_host_port(authority);
+
+        // Check blocklist first (takes precedence over the allowlist).
+        if host_set_matches(&self.blocked_hosts, req_host, req_port)
+            || self.blocked_patterns.iter().any(|p| p.is_match(req_host))
+        {
             return Err(TokenizerError::HostNotAllowed {
-                host: host.to_string(),
+                host: authority.to_string(),
             });
         }
 
-        for pattern in &self.blocked_patterns {
-            if pattern.is_match(host) {
-                return Err(TokenizerError::HostNotAllowed {
-                    host: host.to_string(),
-                });
-            }
-        }
-
-        // Check allowlist
-        if self.allowed_hosts.contains(host) {
+        // Check allowlist.
+        if host_set_matches(&self.allowed_hosts, req_host, req_port)
+            || self.allowed_patterns.iter().any(|p| p.is_match(req_host))
+        {
             return Ok(());
         }
 
-        for pattern in &self.allowed_patterns {
-            if pattern.is_match(host) {
-                return Ok(());
-            }
-        }
-
-        // If there's an allowlist and the host isn't in it, reject
+        // If there's an allowlist and the host isn't in it, reject.
         if !self.allowed_hosts.is_empty() || !self.allowed_patterns.is_empty() {
             return Err(TokenizerError::HostNotAllowed {
-                host: host.to_string(),
+                host: authority.to_string(),
             });
         }
 
-        // No allowlist configured, allow by default
+        // No allowlist configured, allow by default.
         Ok(())
     }
+}
+
+/// Returns true if `req_host`/`req_port` matches any entry in `entries`.
+///
+/// A bare entry matches the host on any port; a `host:port` entry matches only
+/// that exact port.
+fn host_set_matches(entries: &HashSet<String>, req_host: &str, req_port: Option<u16>) -> bool {
+    entries.iter().any(|entry| {
+        let (entry_host, entry_port) = split_host_port(entry);
+        entry_host == req_host && (entry_port.is_none() || entry_port == req_port)
+    })
 }
 
 #[cfg(test)]
@@ -300,6 +310,56 @@ mod tests {
 
         assert!(config.validate("any-host.com").is_ok());
         assert!(config.validate("another.host.org").is_ok());
+    }
+
+    #[test]
+    fn test_bare_allow_entry_matches_any_port() {
+        let config = HostValidationConfig::new().allow_host("api.example.com");
+
+        assert!(config.validate("api.example.com").is_ok());
+        assert!(config.validate("api.example.com:443").is_ok());
+        assert!(config.validate("api.example.com:8080").is_ok());
+        assert!(config.validate("evil.com:443").is_err());
+    }
+
+    #[test]
+    fn test_port_pinned_allow_entry_matches_exact_port() {
+        let config = HostValidationConfig::new().allow_host("api.example.com:443");
+
+        assert!(config.validate("api.example.com:443").is_ok());
+        assert!(config.validate("api.example.com:22").is_err());
+        assert!(config.validate("api.example.com").is_err());
+    }
+
+    #[test]
+    fn test_bare_block_entry_blocks_any_port() {
+        let config = HostValidationConfig::new()
+            .allow_pattern(r".*")
+            .block_host("internal.example.com");
+
+        assert!(config.validate("internal.example.com").is_err());
+        assert!(config.validate("internal.example.com:8080").is_err());
+        assert!(config.validate("api.example.com:8080").is_ok());
+    }
+
+    #[test]
+    fn test_port_pinned_block_entry_blocks_exact_port() {
+        let config = HostValidationConfig::new()
+            .allow_pattern(r".*")
+            .block_host("api.example.com:22");
+
+        assert!(config.validate("api.example.com:22").is_err());
+        assert!(config.validate("api.example.com:443").is_ok());
+        assert!(config.validate("api.example.com").is_ok());
+    }
+
+    #[test]
+    fn test_pattern_matches_with_port_stripped() {
+        let config = HostValidationConfig::new().allow_pattern(r".*\.example\.com$");
+
+        assert!(config.validate("api.example.com:8080").is_ok());
+        assert!(config.validate("api.example.com").is_ok());
+        assert!(config.validate("evil.com:8080").is_err());
     }
 
     #[test]

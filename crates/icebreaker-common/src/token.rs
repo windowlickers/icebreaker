@@ -322,7 +322,12 @@ impl std::fmt::Debug for TokenPayload {
 /// bracketed forms like `[::1]:8080`. The returned host slice for IPv6 still
 /// includes the brackets so that comparisons against a configured allowlist
 /// entry remain consistent (entries are expected to be in the same form).
-fn split_host_port(authority: &str) -> (&str, Option<u16>) {
+///
+/// This is the shared authority parser used by both token allowlist matching
+/// (`TokenPayload::validate_host`) and the static host policy used in
+/// token-optional mode, so the two paths agree on port semantics.
+#[must_use]
+pub fn split_host_port(authority: &str) -> (&str, Option<u16>) {
     if let Some(rest) = authority.strip_prefix('[') {
         if let Some(end) = rest.find(']') {
             let host_with_brackets = &authority[..=end + 1];

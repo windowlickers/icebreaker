@@ -866,8 +866,8 @@ struct ConnectDeps {
 }
 
 /// Resolves a token-less CONNECT target, gating it against the static host policy.
-fn connect_target_with_policy(
-    req: &Request<Incoming>,
+fn connect_target_with_policy<B>(
+    req: &Request<B>,
     policy: &HostValidationConfig,
 ) -> Result<(String, u16), icebreaker_common::TokenizerError> {
     let authority = req.uri().authority().ok_or_else(|| {
@@ -877,7 +877,10 @@ fn connect_target_with_policy(
     })?;
     let host = authority.host().to_string();
     let port = authority.port_u16().unwrap_or(443);
-    policy.validate(&host)?;
+    // Validate the full authority (`host[:port]`) so a bare allow-entry matches
+    // any port while a `host:port` entry pins the port — the IP filter blocks
+    // private ranges, not ports, so the policy is the only port gate here.
+    policy.validate(authority.as_str())?;
     Ok((host, port))
 }
 
@@ -2293,5 +2296,40 @@ mod build_seal_payload_tests {
 
         let err = build_seal_payload(&args).expect_err("invalid JSON should fail");
         assert!(err.contains("invalid processor JSON"), "got: {err}");
+    }
+
+    fn connect_request(authority: &str) -> Request<()> {
+        Request::builder()
+            .method(http::Method::CONNECT)
+            .uri(authority)
+            .body(())
+            .expect("connect request should build")
+    }
+
+    #[test]
+    fn test_connect_policy_port_pinned_rejects_wrong_port() {
+        let policy = HostValidationConfig::new().allow_host("api.example.com:443");
+
+        let allowed = connect_target_with_policy(&connect_request("api.example.com:443"), &policy)
+            .expect("matching port should be allowed");
+        assert_eq!(allowed, ("api.example.com".to_string(), 443));
+
+        let err = connect_target_with_policy(&connect_request("api.example.com:22"), &policy)
+            .expect_err("non-matching port should be rejected");
+        assert!(matches!(
+            err,
+            icebreaker_common::TokenizerError::HostNotAllowed { .. }
+        ));
+    }
+
+    #[test]
+    fn test_connect_policy_bare_entry_allows_any_port() {
+        let policy = HostValidationConfig::new().allow_host("api.example.com");
+
+        let (host, port) =
+            connect_target_with_policy(&connect_request("api.example.com:22"), &policy)
+                .expect("bare entry should match any port");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 22);
     }
 }
