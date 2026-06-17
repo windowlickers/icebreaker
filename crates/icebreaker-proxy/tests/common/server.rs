@@ -1,4 +1,7 @@
 //! Test server infrastructure for mTLS integration tests.
+//!
+//! Shared across test binaries; not every helper is used by every binary.
+#![allow(dead_code)]
 
 use std::net::SocketAddr;
 use std::sync::Arc;

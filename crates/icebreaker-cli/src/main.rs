@@ -5,27 +5,19 @@
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
 use clap::{Parser, Subcommand};
-use http::{Request, Response, StatusCode, Uri};
-use http_body_util::{
-    combinators::{BoxBody, UnsyncBoxBody},
-    BodyExt, Empty, Full,
-};
+use http::{Request, Response, StatusCode};
+use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
-use hyper::upgrade::Upgraded;
-use hyper_rustls::HttpsConnectorBuilder;
-use hyper_util::client::legacy::Client;
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use metrics_exporter_prometheus::PrometheusBuilder;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
-use tower::{Service, ServiceBuilder, ServiceExt};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use icebreaker_common::UpstreamScheme;
@@ -33,16 +25,13 @@ use icebreaker_common::{
     ClientAuthMode, ClockSkewConfig, HealthConfig, InjectConfig, NetworkProtectionConfig,
     ProcessorConfig, ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, TlsConfig,
 };
-use icebreaker_crypto::{
-    ConnectionInfo, DecryptConfig, KeyStore, Keypair, TlsConnectionInfo, TokenCrypto,
-    VersionedKeypair,
+use icebreaker_crypto::{DecryptConfig, KeyStore, Keypair, TokenCrypto, VersionedKeypair};
+use icebreaker_proxy::serve::{
+    build_upstream_root_store, serve_http, ConnContext, ProxyContext, ShutdownState,
 };
 use icebreaker_proxy::{
-    create_tls_acceptor, extract_client_cert_info, is_connect_request, record_connect_tunnel,
-    record_token_validation, ConnectHandler, DynamicCertResolver, DynamicResponseScanLayer,
-    HostValidationConfig, InMemoryNonceStore, IpFilter, MetricsLayer, NonceStore, RateLimitLayer,
-    RateLimiter, TokenInjectionLayer, TokenValidationResult, TunnelConfig, ValidatingConnector,
-    TOKEN_HEADER,
+    create_tls_acceptor, extract_client_cert_info, DynamicCertResolver, HostValidationConfig,
+    InMemoryNonceStore, IpFilter, NonceStore, RateLimiter,
 };
 
 /// Icebreaker - A stateless tokenizer proxy
@@ -184,6 +173,13 @@ struct ServeArgs {
     /// interception. Only meaningful when interception is enabled.
     #[arg(long, env = "ICEBREAKER_NO_BUMP_HOSTS")]
     no_bump_hosts: Option<String>,
+
+    /// Path to a PEM CA bundle to trust for upstream HTTPS re-origination.
+    ///
+    /// Added on top of the bundled webpki roots. Use to reach a private or test
+    /// upstream signed by a non-public CA.
+    #[arg(long, env = "ICEBREAKER_UPSTREAM_CA")]
+    upstream_ca: Option<String>,
 
     /// Enable response body scanning for secret leaks
     #[arg(long, default_value = "true", env = "ICEBREAKER_RESPONSE_SCAN_ENABLED")]
@@ -365,110 +361,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Type alias for the HTTPS connector with SSRF protection.
-type HttpsConnector = hyper_rustls::HttpsConnector<ValidatingConnector>;
-
-/// Body error type for proxied requests/responses.
-/// Using hyper::Error since that's what Incoming bodies produce.
-type BodyError = hyper::Error;
-
-/// Type alias for the HTTP client with TLS support and SSRF protection.
-type HttpClient = Client<HttpsConnector, BoxBody<Bytes, BodyError>>;
-
-/// Unified response body served to clients.
-///
-/// Both proxied responses and CONNECT control responses are normalised to this
-/// type so a single hyper service can serve a connection. `UnsyncBoxBody` is used
-/// because the inner proxied body (a `BoxBody`) is `Send` but not `Sync`.
-type UnifiedBody = UnsyncBoxBody<Bytes, Box<dyn std::error::Error + Send + Sync>>;
-
-/// Wraps an empty body for control responses (e.g. a CONNECT 200).
-fn unified_empty() -> UnifiedBody {
-    Empty::<Bytes>::new().map_err(|e| match e {}).boxed_unsync()
-}
-
-/// Wraps a string body (e.g. a CONNECT error message) as a [`UnifiedBody`].
-fn unified_string(body: String) -> UnifiedBody {
-    Full::new(Bytes::from(body))
-        .map_err(|e| match e {})
-        .boxed_unsync()
-}
-
-/// Keeps a connection counted in [`ShutdownState`] for its full lifetime.
-///
-/// Used to keep CONNECT tunnels (which outlive the HTTP service that accepted
-/// them) accounted for during graceful-shutdown draining.
-struct ConnectionGuard {
-    state: Arc<ShutdownState>,
-}
-
-impl ConnectionGuard {
-    fn new(state: Arc<ShutdownState>) -> Self {
-        state.connection_started();
-        Self { state }
-    }
-}
-
-impl Drop for ConnectionGuard {
-    fn drop(&mut self) {
-        self.state.connection_ended();
-    }
-}
-
-/// Shared state for graceful shutdown coordination.
-#[derive(Debug)]
-struct ShutdownState {
-    /// Whether shutdown has been initiated.
-    is_shutting_down: AtomicBool,
-    /// Number of active connections.
-    active_connections: AtomicU64,
-}
-
-impl ShutdownState {
-    /// Creates a new shutdown state.
-    fn new() -> Self {
-        Self {
-            is_shutting_down: AtomicBool::new(false),
-            active_connections: AtomicU64::new(0),
-        }
-    }
-
-    /// Marks the server as shutting down.
-    fn initiate_shutdown(&self) {
-        self.is_shutting_down.store(true, Ordering::SeqCst);
-    }
-
-    /// Returns true if the server is shutting down.
-    fn is_shutting_down(&self) -> bool {
-        self.is_shutting_down.load(Ordering::SeqCst)
-    }
-
-    /// Increments the active connection count.
-    fn connection_started(&self) {
-        self.active_connections.fetch_add(1, Ordering::SeqCst);
-    }
-
-    /// Decrements the active connection count.
-    fn connection_ended(&self) {
-        self.active_connections.fetch_sub(1, Ordering::SeqCst);
-    }
-
-    /// Returns the number of active connections.
-    fn active_count(&self) -> u64 {
-        self.active_connections.load(Ordering::SeqCst)
-    }
-
-    /// Returns true if ready to accept traffic (not shutting down).
-    fn is_ready(&self) -> bool {
-        !self.is_shutting_down()
-    }
-
-    /// Returns true if the server is alive (always true once started).
-    fn is_alive(&self) -> bool {
-        true
-    }
-}
-
 /// Builds a plain-text response with the given status and body.
 fn plain_response(status: StatusCode, body: &'static str) -> Response<Full<Bytes>> {
     Response::builder()
@@ -632,657 +524,6 @@ async fn wait_for_shutdown_signal() {
     }
 }
 
-/// The proxy service that forwards requests to upstream servers.
-#[derive(Clone)]
-struct ProxyService {
-    client: HttpClient,
-}
-
-impl ProxyService {
-    /// Creates a new proxy service with HTTPS support and SSRF protection.
-    fn new(ip_filter: Arc<IpFilter>) -> Self {
-        // Build validating connector with SSRF protection
-        let validating = ValidatingConnector::new(ip_filter);
-
-        // Wrap with HTTPS support using native root certificates
-        let https = HttpsConnectorBuilder::new()
-            .with_webpki_roots()
-            .https_or_http()
-            .enable_http1()
-            .wrap_connector(validating);
-
-        let client: HttpClient = Client::builder(TokioExecutor::new()).build(https);
-        Self { client }
-    }
-}
-
-impl Service<Request<Incoming>> for ProxyService {
-    type Response = Response<BoxBody<Bytes, BodyError>>;
-    type Error = Box<dyn std::error::Error + Send + Sync>;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
-
-    fn poll_ready(
-        &mut self,
-        _cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Result<(), Self::Error>> {
-        std::task::Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
-        let client = self.client.clone();
-
-        Box::pin(async move {
-            // Extract the target URI from the request.
-            //
-            // Authority (host:port) comes from the request URI when the
-            // client sent an absolute-form URI (RFC 7230 §5.3.2, as
-            // forward proxies receive), otherwise from the Host header.
-            //
-            // Scheme always comes from the token's `UpstreamScheme` so the
-            // token owner controls the upstream protocol. A client may have
-            // had to coerce its request URL to `http://` to route through a
-            // plaintext forward proxy (e.g. reqwest's `Proxy::http`), but
-            // that says nothing about the upstream — the token does.
-            let uri = req.uri();
-
-            let authority = if let Some(auth) = uri.authority() {
-                auth.as_str().to_string()
-            } else {
-                req.headers()
-                    .get(http::header::HOST)
-                    .and_then(|h| h.to_str().ok())
-                    .ok_or_else(|| {
-                        Box::<dyn std::error::Error + Send + Sync>::from(
-                            "missing Host header and no absolute URI",
-                        )
-                    })?
-                    .to_string()
-            };
-
-            let scheme = req
-                .extensions()
-                .get::<UpstreamScheme>()
-                .copied()
-                .unwrap_or_default()
-                .as_str();
-            let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-
-            let target_uri = Uri::builder()
-                .scheme(scheme)
-                .authority(authority)
-                .path_and_query(path)
-                .build()
-                .map_err(|e| {
-                    Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                        "failed to build URI: {e}"
-                    ))
-                })?;
-
-            tracing::debug!(
-                target = %target_uri,
-                method = %req.method(),
-                "forwarding request"
-            );
-
-            // Build the outgoing request
-            let (parts, body) = req.into_parts();
-            let boxed_body: BoxBody<Bytes, BodyError> = body.boxed();
-
-            let mut outgoing = Request::from_parts(parts, boxed_body);
-            *outgoing.uri_mut() = target_uri;
-
-            // Forward the request
-            let response = client.request(outgoing).await.map_err(|e| {
-                Box::<dyn std::error::Error + Send + Sync>::from(format!(
-                    "upstream request failed: {e}"
-                ))
-            })?;
-
-            // Convert the response body
-            let (parts, body) = response.into_parts();
-            let boxed_body: BoxBody<Bytes, BodyError> = body.boxed();
-
-            Ok(Response::from_parts(parts, boxed_body))
-        })
-    }
-}
-
-/// Shared per-process state required to serve a proxy connection.
-#[derive(Clone)]
-struct ProxyContext {
-    crypto: Arc<TokenCrypto>,
-    ip_filter: Arc<IpFilter>,
-    nonce_store: Option<Arc<dyn NonceStore>>,
-    clock_skew: ClockSkewConfig,
-    rate_limiter: Option<Arc<RateLimiter>>,
-    response_scan_enabled: bool,
-    request_timeout: Duration,
-    shutdown: Arc<ShutdownState>,
-    token_optional: bool,
-    host_policy: Arc<HostValidationConfig>,
-    bump_resolver: Option<Arc<DynamicCertResolver>>,
-    no_bump_policy: Option<Arc<HostValidationConfig>>,
-}
-
-/// Per-connection context for serving HTTP over one (possibly intercepted) stream.
-///
-/// `forced_upstream_scheme` and `injected_authority` are `None` for ordinary
-/// connections. They are populated only for the decrypted inner stream of an
-/// intercepted ("bumped") CONNECT, where origin-form requests carry no scheme or
-/// authority of their own and the destination is known from the CONNECT line.
-#[derive(Clone)]
-struct ConnContext {
-    remote_addr: SocketAddr,
-    tls_info: Option<TlsConnectionInfo>,
-    forced_upstream_scheme: Option<UpstreamScheme>,
-    injected_authority: Option<http::uri::Authority>,
-}
-
-impl ConnContext {
-    /// Creates a context for an ordinary (non-intercepted) connection.
-    fn new(remote_addr: SocketAddr, tls_info: Option<TlsConnectionInfo>) -> Self {
-        Self {
-            remote_addr,
-            tls_info,
-            forced_upstream_scheme: None,
-            injected_authority: None,
-        }
-    }
-}
-
-/// Applies per-connection context to a request before the middleware stack runs.
-///
-/// Inserts the unforgeable connection identity, and for intercepted inner streams
-/// rewrites the request to absolute-form so token injection and the proxy service
-/// resolve the same destination and scheme.
-fn prepare_request(
-    mut req: Request<Incoming>,
-    conn: &ConnContext,
-) -> Result<Request<Incoming>, icebreaker_common::TokenizerError> {
-    // Inject connection info into request extensions (unforgeable identity).
-    let conn_info = ConnectionInfo::new(conn.remote_addr);
-    let conn_info = match conn.tls_info.clone() {
-        Some(info) => conn_info.with_tls(info),
-        None => conn_info,
-    };
-    req.extensions_mut().insert(conn_info);
-
-    // Also inject TLS info separately for backwards compatibility.
-    if let Some(info) = conn.tls_info.clone() {
-        req.extensions_mut().insert(info);
-    }
-
-    // Force the upstream scheme when this connection requires it (bumped inner
-    // requests reach an HTTPS upstream). A token, if present, overrides this
-    // downstream in TokenInjection.
-    if let Some(scheme) = conn.forced_upstream_scheme {
-        req.extensions_mut().insert(scheme);
-    }
-
-    // Supply the target authority for origin-form requests on a decrypted inner
-    // stream by rewriting the URI to absolute-form.
-    if let Some(authority) = &conn.injected_authority {
-        let path = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let scheme = conn.forced_upstream_scheme.unwrap_or_default().as_str();
-        let new_uri = Uri::builder()
-            .scheme(scheme)
-            .authority(authority.clone())
-            .path_and_query(path)
-            .build()
-            .map_err(|e| {
-                icebreaker_common::TokenizerError::InvalidPayload(format!(
-                    "failed to build target URI for {authority}: {e}"
-                ))
-            })?;
-        *req.uri_mut() = new_uri;
-        if let Ok(host_value) = http::HeaderValue::from_str(authority.as_str()) {
-            req.headers_mut().insert(http::header::HOST, host_value);
-        }
-    }
-
-    Ok(req)
-}
-
-/// Dependencies for handling CONNECT requests at the front of the service.
-#[derive(Clone)]
-struct ConnectDeps {
-    handler: Arc<ConnectHandler>,
-    /// Full proxy context, reused to serve the decrypted inner stream of a bump.
-    ctx: ProxyContext,
-    /// Resolver that mints per-CONNECT-host leaf certs; `None` disables interception.
-    bump_resolver: Option<Arc<DynamicCertResolver>>,
-    /// Hosts that must be tunneled transparently rather than intercepted.
-    no_bump_policy: Option<Arc<HostValidationConfig>>,
-    /// Shared rate limiter; CONNECT is throttled with the same per-key state as
-    /// the HTTP path so it cannot be used to brute-force token decryption.
-    rate_limiter: Option<Arc<RateLimiter>>,
-    /// Outer connection's mTLS identity, propagated onto the decrypted inner
-    /// stream of a bump so cert-bound tokens still validate after interception.
-    tls_info: Option<TlsConnectionInfo>,
-}
-
-/// Resolves a token-less CONNECT target, gating it against the static host policy.
-fn connect_target_with_policy<B>(
-    req: &Request<B>,
-    policy: &HostValidationConfig,
-) -> Result<(String, u16), icebreaker_common::TokenizerError> {
-    let authority = req.uri().authority().ok_or_else(|| {
-        icebreaker_common::TokenizerError::InvalidPayload(
-            "CONNECT request missing authority".to_string(),
-        )
-    })?;
-    let host = authority.host().to_string();
-    let port = authority.port_u16().unwrap_or(443);
-    // Validate the full authority (`host[:port]`) so a bare allow-entry matches
-    // any port while a `host:port` entry pins the port — the IP filter blocks
-    // private ranges, not ports, so the policy is the only port gate here.
-    policy.validate(authority.as_str())?;
-    Ok((host, port))
-}
-
-/// Builds the 200 response that completes a CONNECT, triggering the upgrade.
-fn connect_success_response() -> Response<UnifiedBody> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(unified_empty())
-        .unwrap_or_else(|_| Response::new(unified_empty()))
-}
-
-/// Normalises a CONNECT error response to the unified body type.
-fn to_unified(resp: Response<String>) -> Response<UnifiedBody> {
-    let (parts, body) = resp.into_parts();
-    Response::from_parts(parts, unified_string(body))
-}
-
-/// Validates a CONNECT request and, on success, spawns a transparent tunnel.
-///
-/// Returns the control response to send to the client: a 200 that triggers the
-/// HTTP upgrade, or an error response. The tunnel runs in a detached task that
-/// holds a [`ConnectionGuard`] so it is accounted for during shutdown draining.
-// Returns a boxed future rather than `async fn` to break a recursive-`Send`
-// inference cycle: the spawned bump path re-serves the decrypted stream through
-// `serve_http`, whose service awaits `handle_connect` again. Boxing the future as
-// `dyn Future + Send` asserts the bound at this boundary so the auto-trait check
-// terminates instead of recursing through itself.
-fn handle_connect<'a>(
-    req: &'a mut Request<Incoming>,
-    deps: &'a ConnectDeps,
-    remote_addr: SocketAddr,
-    tls_info: Option<&'a TlsConnectionInfo>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Response<UnifiedBody>> + Send + 'a>> {
-    Box::pin(async move {
-        // Throttle CONNECT with the same shared limiter as the HTTP path. Without
-        // this, CONNECT can be used to brute-force token decryption unthrottled.
-        if let Some(limiter) = deps.rate_limiter.as_ref() {
-            let conn_info = match tls_info {
-                Some(info) => ConnectionInfo::new(remote_addr).with_tls(info.clone()),
-                None => ConnectionInfo::new(remote_addr),
-            };
-            if !limiter.check(&conn_info.rate_limit_key()).await {
-                tracing::warn!(remote_addr = %remote_addr, "CONNECT rate limit exceeded");
-                return to_unified(ConnectHandler::error_response(
-                    &icebreaker_common::TokenizerError::RateLimitExceeded,
-                ));
-            }
-        }
-
-        // A tokened CONNECT is validated against the token's allowlist (auth
-        // binding, expiration, host) and replay protection. A token-less CONNECT is
-        // permitted only in token-optional mode, gated by the static policy. The
-        // fallback is keyed on token *absence* so a present-but-rejected token
-        // (e.g. failed auth binding, which also yields ProxyAuthRequired) is not
-        // silently downgraded to token-less treatment.
-        let has_token = req.headers().contains_key(TOKEN_HEADER)
-            || req
-                .headers()
-                .contains_key(http::header::PROXY_AUTHORIZATION);
-        let target = match deps.handler.validate_connect(req, tls_info) {
-            Ok((payload, host, port)) => deps
-                .handler
-                .enforce_replay(&payload)
-                .await
-                .map(|()| (host, port)),
-            Err(icebreaker_common::TokenizerError::ProxyAuthRequired { .. })
-                if deps.ctx.token_optional && !has_token =>
-            {
-                connect_target_with_policy(req, &deps.ctx.host_policy)
-            }
-            Err(e) => Err(e),
-        };
-
-        match target {
-            Ok((host, port)) => {
-                record_connect_tunnel();
-                let on_upgrade = hyper::upgrade::on(req);
-                let deps = deps.clone();
-                let guard = ConnectionGuard::new(deps.ctx.shutdown.clone());
-                tokio::spawn(async move {
-                    let _guard = guard;
-                    match on_upgrade.await {
-                        Ok(upgraded) => {
-                            let client_io = TokioIo::new(upgraded);
-                            handle_tunnel_or_bump(client_io, host, port, remote_addr, deps).await;
-                        }
-                        Err(e) => tracing::warn!(error = %e, "CONNECT upgrade failed"),
-                    }
-                });
-                connect_success_response()
-            }
-            Err(e) => {
-                record_token_validation(TokenValidationResult::Invalid);
-                tracing::warn!(error = %e, "CONNECT request rejected");
-                to_unified(ConnectHandler::error_response(&e))
-            }
-        }
-    })
-}
-
-/// Routes an upgraded CONNECT stream to TLS interception or a transparent tunnel.
-///
-/// Hosts on the no-bump list (or any host when interception is disabled) are
-/// tunneled transparently; all others are intercepted.
-async fn handle_tunnel_or_bump(
-    client_io: TokioIo<Upgraded>,
-    host: String,
-    port: u16,
-    remote_addr: SocketAddr,
-    deps: ConnectDeps,
-) {
-    let in_no_bump = deps
-        .no_bump_policy
-        .as_ref()
-        .is_some_and(|policy| policy.validate(&host).is_ok());
-
-    match deps.bump_resolver.clone() {
-        Some(resolver) if !in_no_bump => {
-            bump_and_serve(
-                client_io,
-                &host,
-                port,
-                remote_addr,
-                resolver,
-                deps.ctx,
-                deps.tls_info,
-            )
-            .await;
-        }
-        _ => {
-            let mut client_io = client_io;
-            run_tunnel(&deps.handler, &mut client_io, &host, port).await;
-        }
-    }
-}
-
-/// Terminates TLS for an intercepted CONNECT and serves the decrypted stream
-/// through the normal middleware stack.
-async fn bump_and_serve(
-    client_io: TokioIo<Upgraded>,
-    host: &str,
-    port: u16,
-    remote_addr: SocketAddr,
-    resolver: Arc<DynamicCertResolver>,
-    ctx: ProxyContext,
-    tls_info: Option<TlsConnectionInfo>,
-) {
-    // Mint (or reuse) a leaf for the policy-vetted CONNECT host; the acceptor
-    // presents it regardless of the client's SNI, so untrusted SNI never drives
-    // a mint.
-    let acceptor = match resolver.acceptor_for(host) {
-        Some(acceptor) => acceptor,
-        None => {
-            tracing::warn!(host, "failed to build interception acceptor for host");
-            return;
-        }
-    };
-
-    let tls_stream = match acceptor.accept(client_io).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            tracing::warn!(host, error = %e, "TLS interception handshake failed");
-            return;
-        }
-    };
-
-    let authority = match format!("{host}:{port}").parse::<http::uri::Authority>() {
-        Ok(authority) => authority,
-        Err(e) => {
-            tracing::warn!(host, error = %e, "invalid interception authority");
-            return;
-        }
-    };
-
-    // The decrypted inner requests are origin-form; supply their HTTPS scheme and
-    // target authority so token injection and forwarding resolve the destination.
-    let conn = ConnContext {
-        remote_addr,
-        tls_info,
-        forced_upstream_scheme: Some(UpstreamScheme::Https),
-        injected_authority: Some(authority),
-    };
-    serve_http(TokioIo::new(tls_stream), ctx, conn).await;
-}
-
-/// Resolves the CONNECT target, connects, and copies bytes transparently.
-async fn run_tunnel(
-    handler: &ConnectHandler,
-    client_io: &mut TokioIo<Upgraded>,
-    host: &str,
-    port: u16,
-) {
-    let addr = match handler.resolve_and_validate(host, port).await {
-        Ok(addr) => addr,
-        Err(e) => {
-            tracing::warn!(error = %e, "CONNECT target resolution failed");
-            return;
-        }
-    };
-    let mut upstream = match handler.connect_upstream(addr).await {
-        Ok(stream) => stream,
-        Err(e) => {
-            tracing::warn!(error = %e, "CONNECT upstream connect failed");
-            return;
-        }
-    };
-    if let Err(e) = handler.copy_bidirectional(client_io, &mut upstream).await {
-        tracing::debug!(error = %e, "CONNECT tunnel closed with error");
-    }
-}
-
-/// Serves HTTP/1.1 over `io` using a built middleware-stack `service`.
-///
-/// Applies per-request connection context and a per-request timeout, and handles
-/// CONNECT requests (when `connect` is provided) by upgrading to a tunnel. Shared
-/// by both the with/without-rate-limit stacks and the decrypted inner stream of
-/// an intercepted CONNECT.
-async fn serve_connection_with<I, S>(
-    io: I,
-    service: S,
-    conn: ConnContext,
-    request_timeout: Duration,
-    connect: Option<ConnectDeps>,
-) where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-    S: Service<
-            Request<Incoming>,
-            Response = Response<UnifiedBody>,
-            Error = icebreaker_common::TokenizerError,
-        > + Clone
-        + Send
-        + 'static,
-    S::Future: Send,
-{
-    let remote_addr = conn.remote_addr;
-
-    let service_fn = hyper::service::service_fn(move |mut req: Request<Incoming>| {
-        let mut svc = service.clone();
-        let conn = conn.clone();
-        let connect = connect.clone();
-        async move {
-            // CONNECT requests are handled before the middleware stack: they
-            // establish a tunnel rather than being forwarded as HTTP.
-            if let Some(deps) = connect {
-                if is_connect_request(&req) {
-                    return Ok(handle_connect(
-                        &mut req,
-                        &deps,
-                        conn.remote_addr,
-                        conn.tls_info.as_ref(),
-                    )
-                    .await);
-                }
-            }
-
-            let req = match prepare_request(req, &conn) {
-                Ok(req) => req,
-                Err(e) => {
-                    tracing::error!(error = %e, "request preparation failed");
-                    return Err(e);
-                }
-            };
-
-            // Apply request timeout to prevent requests from hanging indefinitely
-            let result = tokio::time::timeout(request_timeout, async {
-                match svc.ready().await {
-                    Ok(ready_svc) => ready_svc.call(req).await,
-                    Err(e) => Err(e),
-                }
-            })
-            .await;
-
-            match result {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(e)) => {
-                    tracing::error!(error = %e, "request failed");
-                    Err(e)
-                }
-                Err(_elapsed) => {
-                    tracing::warn!("request timed out");
-                    Err(icebreaker_common::TokenizerError::Timeout)
-                }
-            }
-        }
-    });
-
-    let connection = http1::Builder::new()
-        .serve_connection(io, service_fn)
-        .with_upgrades();
-    if let Err(e) = connection.await {
-        tracing::debug!(
-            error = %e,
-            remote_addr = %remote_addr,
-            "connection error"
-        );
-    }
-}
-
-/// Handles an HTTP connection, applying the middleware stack and serving requests.
-///
-/// Order matters:
-/// 1. RateLimitLayer - protects against brute-force attacks (when enabled)
-/// 2. MetricsLayer - record metrics
-/// 3. TokenInjectionLayer - decrypts tokens and injects secrets
-/// 4. DynamicResponseScanLayer - scans responses for leaked secrets
-///
-/// DynamicResponseScanLayer must come after TokenInjectionLayer so it can read
-/// the ScanPatterns stored by token injection. The outermost `map_response` boxes
-/// the stack's body so it shares one type with CONNECT control responses. Timeout
-/// is applied per-request in `serve_connection_with`.
-async fn serve_http<I>(io: I, ctx: ProxyContext, conn: ConnContext)
-where
-    I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
-{
-    // CONNECT tunneling is handled only on the outer connection, never on the
-    // decrypted inner stream of an intercepted CONNECT. Built from a clone of the
-    // context so the bump path can re-serve the decrypted stream.
-    let connect = if conn.injected_authority.is_none() {
-        Some(ConnectDeps {
-            handler: Arc::new(
-                ConnectHandler::with_all_options(
-                    ctx.crypto.clone(),
-                    ctx.ip_filter.clone(),
-                    TunnelConfig::default(),
-                    ctx.clock_skew.clone(),
-                )
-                .with_nonce_store(ctx.nonce_store.clone()),
-            ),
-            ctx: ctx.clone(),
-            bump_resolver: ctx.bump_resolver.clone(),
-            no_bump_policy: ctx.no_bump_policy.clone(),
-            rate_limiter: ctx.rate_limiter.clone(),
-            tls_info: conn.tls_info.clone(),
-        })
-    } else {
-        None
-    };
-
-    let ProxyContext {
-        crypto,
-        ip_filter,
-        nonce_store,
-        clock_skew,
-        rate_limiter,
-        response_scan_enabled,
-        request_timeout,
-        token_optional,
-        host_policy,
-        ..
-    } = ctx;
-
-    // Create the proxy service for this connection with SSRF protection
-    let proxy_service = ProxyService::new(ip_filter);
-
-    // Handle the two cases (with/without rate limiting) separately to avoid
-    // complex type erasure while keeping concrete types for efficiency.
-    if let Some(limiter) = rate_limiter {
-        let service = ServiceBuilder::new()
-            .layer(RateLimitLayer::from_limiter(limiter))
-            .layer(MetricsLayer::new())
-            .layer({
-                let mut layer = TokenInjectionLayer::new(crypto)
-                    .with_response_scan(response_scan_enabled)
-                    .with_clock_skew(clock_skew)
-                    .with_token_optional(token_optional, host_policy.clone());
-                if let Some(store) = nonce_store {
-                    layer = layer.with_nonce_store(store);
-                }
-                layer
-            })
-            .layer(DynamicResponseScanLayer::new())
-            .service(proxy_service);
-        let service = service.map_response(|res| {
-            let (parts, body) = res.into_parts();
-            Response::from_parts(parts, body.boxed_unsync())
-        });
-        serve_connection_with(io, service, conn, request_timeout, connect).await;
-    } else {
-        let service = ServiceBuilder::new()
-            .layer(MetricsLayer::new())
-            .layer({
-                let mut layer = TokenInjectionLayer::new(crypto)
-                    .with_response_scan(response_scan_enabled)
-                    .with_clock_skew(clock_skew)
-                    .with_token_optional(token_optional, host_policy.clone());
-                if let Some(store) = nonce_store {
-                    layer = layer.with_nonce_store(store);
-                }
-                layer
-            })
-            .layer(DynamicResponseScanLayer::new())
-            .service(proxy_service);
-        let service = service.map_response(|res| {
-            let (parts, body) = res.into_parts();
-            Response::from_parts(parts, body.boxed_unsync())
-        });
-        serve_connection_with(io, service, conn, request_timeout, connect).await;
-    }
-}
-
 fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
@@ -1434,6 +675,17 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             );
         }
 
+        // Build the upstream TLS trust anchors: bundled webpki roots plus any
+        // operator-supplied --upstream-ca bundle for private upstreams.
+        let upstream_ca_pem = match &args.upstream_ca {
+            Some(path) => Some(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("failed to read --upstream-ca file {path}: {e}"))?,
+            ),
+            None => None,
+        };
+        let upstream_roots = Arc::new(build_upstream_root_store(upstream_ca_pem.as_deref())?);
+
         // Build a process-wide rate limiter if enabled. One shared limiter keeps GCRA
         // state across connections (and is reused by the CONNECT path), so per-key
         // throttling spans connections instead of resetting on each one.
@@ -1555,6 +807,7 @@ fn run_server(args: ServeArgs) -> Result<(), Box<dyn std::error::Error>> {
             host_policy,
             bump_resolver,
             no_bump_policy,
+            upstream_roots,
         };
 
         // Accept connections until shutdown signal
@@ -2320,40 +1573,5 @@ mod build_seal_payload_tests {
 
         let err = build_seal_payload(&args).expect_err("invalid JSON should fail");
         assert!(err.contains("invalid processor JSON"), "got: {err}");
-    }
-
-    fn connect_request(authority: &str) -> Request<()> {
-        Request::builder()
-            .method(http::Method::CONNECT)
-            .uri(authority)
-            .body(())
-            .expect("connect request should build")
-    }
-
-    #[test]
-    fn test_connect_policy_port_pinned_rejects_wrong_port() {
-        let policy = HostValidationConfig::new().allow_host("api.example.com:443");
-
-        let allowed = connect_target_with_policy(&connect_request("api.example.com:443"), &policy)
-            .expect("matching port should be allowed");
-        assert_eq!(allowed, ("api.example.com".to_string(), 443));
-
-        let err = connect_target_with_policy(&connect_request("api.example.com:22"), &policy)
-            .expect_err("non-matching port should be rejected");
-        assert!(matches!(
-            err,
-            icebreaker_common::TokenizerError::HostNotAllowed { .. }
-        ));
-    }
-
-    #[test]
-    fn test_connect_policy_bare_entry_allows_any_port() {
-        let policy = HostValidationConfig::new().allow_host("api.example.com");
-
-        let (host, port) =
-            connect_target_with_policy(&connect_request("api.example.com:22"), &policy)
-                .expect("bare entry should match any port");
-        assert_eq!(host, "api.example.com");
-        assert_eq!(port, 22);
     }
 }

@@ -1,5 +1,9 @@
 //! Test client infrastructure for mTLS integration tests.
+//!
+//! Shared across test binaries; not every helper is used by every binary.
+#![allow(dead_code)]
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
@@ -8,6 +12,8 @@ use rustls_pki_types::pem::PemObject;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+
+use icebreaker_proxy::TOKEN_HEADER;
 
 use super::certs::{GeneratedCert, TestCertificateAuthority};
 
@@ -77,6 +83,107 @@ impl TestClient {
         // Parse response
         parse_http_response(&response)
     }
+}
+
+/// Performs a forward-proxy `CONNECT` then an inner-TLS `GET` over the same socket.
+///
+/// Sends `CONNECT target_host:target_port` to the proxy at `proxy_addr` (with an
+/// `X-Tokenizer-Token` header when `token` is `Some`), expects a `200`, then runs
+/// inner TLS trusting `trust_ca` (SNI = `target_host`) and issues `GET path`.
+///
+/// `trust_ca` is the interception CA for a bumped connection, or the upstream's
+/// own CA for a transparent (no-bump) tunnel.
+pub async fn connect_then_get(
+    proxy_addr: SocketAddr,
+    target_host: &str,
+    target_port: u16,
+    token: Option<&str>,
+    trust_ca: &TestCertificateAuthority,
+    path: &str,
+) -> Result<HttpResponse, String> {
+    let mut stream = TcpStream::connect(proxy_addr)
+        .await
+        .map_err(|e| format!("connect failed: {e}"))?;
+
+    let mut connect_req = format!(
+        "CONNECT {target_host}:{target_port} HTTP/1.1\r\nHost: {target_host}:{target_port}\r\n"
+    );
+    if let Some(token) = token {
+        connect_req.push_str(&format!("{TOKEN_HEADER}: {token}\r\n"));
+    }
+    connect_req.push_str("\r\n");
+    stream
+        .write_all(connect_req.as_bytes())
+        .await
+        .map_err(|e| format!("CONNECT write failed: {e}"))?;
+
+    let status = read_connect_status(&mut stream).await?;
+    if status != 200 {
+        return Ok(HttpResponse {
+            status,
+            body: String::new(),
+        });
+    }
+
+    let config = create_client_config(trust_ca, None);
+    let connector = TlsConnector::from(Arc::new(config));
+    let server_name: ServerName<'static> = target_host
+        .to_string()
+        .try_into()
+        .map_err(|_| "invalid server name".to_string())?;
+    let mut tls = connector
+        .connect(server_name, stream)
+        .await
+        .map_err(|e| format!("inner TLS handshake failed: {e}"))?;
+
+    // The token rides on the inner request too: the decrypted stream passes
+    // through the injection middleware, which needs it to inject (and rejects
+    // token-less requests unless token-optional mode is on).
+    let mut request =
+        format!("GET {path} HTTP/1.1\r\nHost: {target_host}\r\nConnection: close\r\n");
+    if let Some(token) = token {
+        request.push_str(&format!("{TOKEN_HEADER}: {token}\r\n"));
+    }
+    request.push_str("\r\n");
+    tls.write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("inner write failed: {e}"))?;
+
+    // The response-scan layer aborts the body mid-stream when it detects a leak,
+    // which surfaces as a read error; keep whatever bytes arrived first.
+    let mut response = String::new();
+    let _ = tls.read_to_string(&mut response).await;
+
+    parse_http_response(&response)
+}
+
+/// Reads a CONNECT control response up to the header terminator and returns its
+/// status code. Stops at `\r\n\r\n` so it does not consume any following bytes.
+async fn read_connect_status(stream: &mut TcpStream) -> Result<u16, String> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 256];
+    loop {
+        let n = stream
+            .read(&mut chunk)
+            .await
+            .map_err(|e| format!("CONNECT read failed: {e}"))?;
+        if n == 0 {
+            return Err("proxy closed before CONNECT response".to_string());
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            break;
+        }
+    }
+
+    let text = String::from_utf8_lossy(&buf);
+    let status_line = text.lines().next().ok_or("empty CONNECT response")?;
+    let code = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or_else(|| format!("invalid CONNECT status line: {status_line}"))?;
+    code.parse::<u16>()
+        .map_err(|_| format!("invalid CONNECT status code: {code}"))
 }
 
 fn create_client_config(

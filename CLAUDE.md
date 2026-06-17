@@ -176,6 +176,7 @@ a concrete body type. See `InjectBodyProcessor` for the pattern:
 | Response scanning | `icebreaker-proxy/src/middleware/response_scan.rs`, `body/scanning.rs` |
 | SSRF prevention | `icebreaker-proxy/src/network/ip_filter.rs` |
 | CONNECT tunneling | `icebreaker-proxy/src/tunnel/connect_handler.rs` |
+| Connection serving / TLS interception (bump) | `icebreaker-proxy/src/serve/` (`http.rs` `serve_http`, `connect.rs` bump path, `proxy_service.rs` upstream re-origination) |
 | TLS/mTLS support | `icebreaker-proxy/src/tls/acceptor.rs`, `tls/cert_extract.rs` |
 | Metrics | `icebreaker-proxy/src/metrics/mod.rs` |
 | CLI entry point | `icebreaker-cli/src/main.rs` |
@@ -248,6 +249,7 @@ icebreaker seal --secret <SECRET> --allowed-hosts api.example.com --public-key <
 | `ICEBREAKER_INTERCEPT_CA_CERT` | - | Path to interception CA certificate (PEM). With the key, enables TLS interception of CONNECT. |
 | `ICEBREAKER_INTERCEPT_CA_KEY` | - | Path to interception CA private key (PEM) |
 | `ICEBREAKER_NO_BUMP_HOSTS` | - | Comma-separated hosts tunneled transparently, never intercepted (for cert-pinning / HTTP-2-only hosts) |
+| `ICEBREAKER_UPSTREAM_CA` | - | Path to a PEM CA bundle trusted for upstream HTTPS re-origination, in addition to the bundled webpki roots. Use to reach a private or test upstream signed by a non-public CA. |
 
 ## Forward Proxy and TLS Interception
 

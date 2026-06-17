@@ -17,6 +17,7 @@ pub mod metrics;
 pub mod middleware;
 pub mod network;
 pub mod processor;
+pub mod serve;
 pub mod tls;
 pub mod tunnel;
 

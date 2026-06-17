@@ -1653,6 +1653,7 @@ dependencies = [
  "http-body 1.0.1",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "icebreaker-common",
  "icebreaker-crypto",
@@ -1679,6 +1680,7 @@ dependencies = [
  "tower-service",
  "tracing",
  "urlencoding",
+ "webpki-roots 0.26.11",
  "wiremock",
  "x509-parser 0.17.0",
 ]
