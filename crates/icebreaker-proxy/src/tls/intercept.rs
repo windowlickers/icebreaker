@@ -37,7 +37,10 @@ const LEAF_BACKDATE: Duration = Duration::hours(1);
 /// host, so this only bites under `--token-optional-allow-any`, where the CONNECT
 /// host itself is attacker-controlled; the LRU then evicts the least-recently-used
 /// host instead of growing without bound.
-const MAX_CACHED_LEAVES: usize = 1024;
+const MAX_CACHED_LEAVES: NonZeroUsize = match NonZeroUsize::new(1024) {
+    Some(n) => n,
+    None => NonZeroUsize::MIN,
+};
 
 /// Placeholder host used to mint a throwaway leaf when validating the CA at load.
 const CA_SELF_CHECK_HOST: &str = "ca-self-check.invalid";
@@ -238,10 +241,9 @@ impl DynamicCertResolver {
     ///
     /// Returns [`InterceptError`] if the certificate or key cannot be parsed.
     pub fn from_pem(cert_pem: &str, key_pem: &str) -> Result<Self, InterceptError> {
-        let capacity = NonZeroUsize::new(MAX_CACHED_LEAVES).unwrap_or(NonZeroUsize::MIN);
         Ok(Self {
             ca: Arc::new(InterceptCa::load(cert_pem, key_pem)?),
-            cache: Arc::new(Mutex::new(LruCache::new(capacity))),
+            cache: Arc::new(Mutex::new(LruCache::new(MAX_CACHED_LEAVES))),
         })
     }
 
@@ -552,7 +554,7 @@ mod tests {
         let not_after = OffsetDateTime::now_utc() + Duration::days(LEAF_VALIDITY_DAYS);
         {
             let mut cache = resolver.cache.lock().expect("lock cache");
-            for i in 0..MAX_CACHED_LEAVES + 5 {
+            for i in 0..MAX_CACHED_LEAVES.get() + 5 {
                 cache.put(
                     format!("host-{i}.example.com"),
                     CachedLeaf {
@@ -566,7 +568,7 @@ mod tests {
         let cache = resolver.cache.lock().expect("lock cache");
         assert_eq!(
             cache.len(),
-            MAX_CACHED_LEAVES,
+            MAX_CACHED_LEAVES.get(),
             "cache must never exceed its bound"
         );
         assert!(

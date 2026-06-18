@@ -61,10 +61,9 @@ fn connect_target_with_policy<B>(
 
 /// Builds the 200 response that completes a CONNECT, triggering the upgrade.
 fn connect_success_response() -> Response<UnifiedBody> {
-    Response::builder()
-        .status(StatusCode::OK)
-        .body(unified_empty())
-        .unwrap_or_else(|_| Response::new(unified_empty()))
+    let mut resp = Response::new(unified_empty());
+    *resp.status_mut() = StatusCode::OK;
+    resp
 }
 
 /// Validates a CONNECT request and, on success, spawns a transparent tunnel.
