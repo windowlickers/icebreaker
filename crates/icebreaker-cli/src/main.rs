@@ -993,7 +993,7 @@ fn run_sso(args: &SsoArgs) -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let (stream, remote_addr) = match accept_result {
+            let (stream, _remote_addr) = match accept_result {
                 Ok(conn) => conn,
                 Err(e) => {
                     tracing::warn!(error = %e, "failed to accept connection");
@@ -1005,19 +1005,7 @@ fn run_sso(args: &SsoArgs) -> Result<(), Box<dyn std::error::Error>> {
 
             tokio::spawn(async move {
                 let io = TokioIo::new(stream);
-
-                let service_fn = hyper::service::service_fn(move |req: Request<Incoming>| {
-                    let service = service.clone();
-                    async move { handle_sso_request(&service, req).await }
-                });
-
-                if let Err(e) = http1::Builder::new().serve_connection(io, service_fn).await {
-                    tracing::debug!(
-                        error = %e,
-                        remote_addr = %remote_addr,
-                        "connection error"
-                    );
-                }
+                icebreaker_sso::serve::serve_connection(service, io).await;
             });
         }
 
@@ -1026,171 +1014,6 @@ fn run_sso(args: &SsoArgs) -> Result<(), Box<dyn std::error::Error>> {
     })?;
 
     Ok(())
-}
-
-/// Handles SSO HTTP requests by routing to the appropriate endpoint.
-async fn handle_sso_request(
-    service: &icebreaker_sso::SsoService,
-    req: Request<Incoming>,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    use icebreaker_sso::endpoints::{
-        handle_callback, handle_health, handle_refresh, handle_start, CallbackParams, StartParams,
-    };
-
-    let path = req.uri().path();
-    let method = req.method();
-    let query = req.uri().query();
-
-    // Extract cookie header for callback
-    let cookie_header = req
-        .headers()
-        .get(http::header::COOKIE)
-        .and_then(|h| h.to_str().ok());
-
-    // Extract authorization header for refresh
-    let auth_header = req
-        .headers()
-        .get("Proxy-Authorization")
-        .and_then(|h| h.to_str().ok());
-
-    // Route requests
-    let response = if path == "/health" || path == "/healthz" {
-        let health_response = handle_health();
-        Ok(Response::builder()
-            .status(health_response.status)
-            .header("Content-Type", "text/plain")
-            .body(Full::new(Bytes::from(health_response.body)))
-            .unwrap_or_default())
-    } else if let Some(captures) = parse_provider_path(path) {
-        let provider_id = captures.0;
-        let action = captures.1;
-
-        match (method.as_str(), action) {
-            ("GET", "start") => {
-                let params = StartParams::from_query(query);
-                match handle_start(service, provider_id, params) {
-                    Ok(resp) => {
-                        let http_resp = resp.into_response();
-                        Ok(Response::builder()
-                            .status(http_resp.status())
-                            .header(
-                                "Location",
-                                http_resp
-                                    .headers()
-                                    .get("Location")
-                                    .and_then(|h| h.to_str().ok())
-                                    .unwrap_or(""),
-                            )
-                            .header(
-                                "Set-Cookie",
-                                http_resp
-                                    .headers()
-                                    .get("Set-Cookie")
-                                    .and_then(|h| h.to_str().ok())
-                                    .unwrap_or(""),
-                            )
-                            .header("Cache-Control", "no-store")
-                            .body(Full::new(Bytes::new()))
-                            .unwrap_or_default())
-                    }
-                    Err(e) => error_response(&e),
-                }
-            }
-            ("GET", "callback") => {
-                let params = CallbackParams::from_query(query);
-                match handle_callback(service, provider_id, params, cookie_header).await {
-                    Ok(resp) => {
-                        let http_resp = resp.into_response();
-                        let mut builder = Response::builder()
-                            .status(http_resp.status())
-                            .header(
-                                "Set-Cookie",
-                                http_resp
-                                    .headers()
-                                    .get("Set-Cookie")
-                                    .and_then(|h| h.to_str().ok())
-                                    .unwrap_or(""),
-                            )
-                            .header("Cache-Control", "no-store");
-
-                        if let Some(location) = http_resp.headers().get("Location") {
-                            builder = builder.header("Location", location);
-                        }
-
-                        Ok(builder
-                            .body(Full::new(Bytes::from(http_resp.into_body())))
-                            .unwrap_or_default())
-                    }
-                    Err(e) => error_response(&e),
-                }
-            }
-            ("POST", "refresh") => match handle_refresh(service, provider_id, auth_header).await {
-                Ok(resp) => {
-                    let http_resp = resp.into_response();
-                    Ok(Response::builder()
-                        .status(http_resp.status())
-                        .header("Content-Type", "application/json")
-                        .header(
-                            "Cache-Control",
-                            http_resp
-                                .headers()
-                                .get("Cache-Control")
-                                .and_then(|h| h.to_str().ok())
-                                .unwrap_or("no-store"),
-                        )
-                        .body(Full::new(Bytes::from(http_resp.into_body())))
-                        .unwrap_or_default())
-                }
-                Err(e) => error_response(&e),
-            },
-            _ => not_found_response(),
-        }
-    } else {
-        not_found_response()
-    };
-
-    response
-}
-
-/// Parses a provider path like "/google/start" into ("google", "start").
-fn parse_provider_path(path: &str) -> Option<(&str, &str)> {
-    let path = path.strip_prefix('/')?;
-    let parts: Vec<&str> = path.splitn(2, '/').collect();
-    if parts.len() == 2 && !parts[0].is_empty() && !parts[1].is_empty() {
-        Some((parts[0], parts[1]))
-    } else {
-        None
-    }
-}
-
-/// Creates an error response for SSO errors.
-fn error_response(
-    error: &icebreaker_sso::SsoError,
-) -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    let status = error.status_code();
-    if status.is_server_error() {
-        tracing::error!(error = %error, status = %status, "sso request failed");
-    } else {
-        tracing::warn!(error = %error, status = %status, "sso request rejected");
-    }
-    let body = serde_json::json!({
-        "error": error.client_message()
-    });
-
-    Ok(Response::builder()
-        .status(status)
-        .header("Content-Type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())))
-        .unwrap_or_default())
-}
-
-/// Creates a 404 Not Found response.
-fn not_found_response() -> Result<Response<Full<Bytes>>, std::convert::Infallible> {
-    Ok(Response::builder()
-        .status(StatusCode::NOT_FOUND)
-        .header("Content-Type", "application/json")
-        .body(Full::new(Bytes::from(r#"{"error":"not found"}"#)))
-        .unwrap_or_default())
 }
 
 fn keygen(args: &KeygenArgs) -> Result<(), Box<dyn std::error::Error>> {

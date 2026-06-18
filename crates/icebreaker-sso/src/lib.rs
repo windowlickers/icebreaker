@@ -53,11 +53,13 @@ pub mod config;
 pub mod endpoints;
 pub mod error;
 pub mod provider;
+pub mod serve;
 pub mod transaction;
 
 pub use config::{CookieConfig, CryptoConfig, ProviderConfig, SameSitePolicy, SsoConfig};
 pub use error::{Result, SsoError};
 pub use provider::{BuiltinProfile, ProviderProfile, ProviderRegistry};
+pub use serve::serve_connection;
 pub use transaction::{CookieManager, TransactionState};
 
 use std::sync::Arc;

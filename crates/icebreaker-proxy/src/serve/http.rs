@@ -347,7 +347,8 @@ mod tests {
 
     #[test]
     fn test_canonical_authority_keeps_non_default_port() {
-        let out = canonical_authority(&auth("api.example.com:8443"), UpstreamScheme::Https).unwrap();
+        let out =
+            canonical_authority(&auth("api.example.com:8443"), UpstreamScheme::Https).unwrap();
         assert_eq!(out.as_str(), "api.example.com:8443");
     }
 
