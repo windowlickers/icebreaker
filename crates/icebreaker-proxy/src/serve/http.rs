@@ -55,6 +55,25 @@ impl ConnContext {
     }
 }
 
+/// Returns `authority` with its port removed when it equals the scheme default.
+///
+/// The CONNECT authority is always built in `host:port` form, so a default-port
+/// target would otherwise forward a non-canonical `Host: host:443` upstream and
+/// break virtual-host routing.
+fn canonical_authority(
+    authority: &http::uri::Authority,
+    scheme: UpstreamScheme,
+) -> Result<http::uri::Authority, icebreaker_common::TokenizerError> {
+    if authority.port_u16() != Some(scheme.default_port()) {
+        return Ok(authority.clone());
+    }
+    authority.host().parse().map_err(|e| {
+        icebreaker_common::TokenizerError::InvalidPayload(format!(
+            "invalid host in authority {authority}: {e}"
+        ))
+    })
+}
+
 /// Applies per-connection context to a request before the middleware stack runs.
 ///
 /// Inserts the unforgeable connection identity, and for intercepted inner streams
@@ -92,9 +111,13 @@ fn prepare_request(
             .path_and_query()
             .map(|pq| pq.as_str())
             .unwrap_or("/");
-        let scheme = conn.forced_upstream_scheme.unwrap_or_default().as_str();
+        let scheme = conn.forced_upstream_scheme.unwrap_or_default();
+        // The CONNECT authority always carries an explicit port; strip it when it is
+        // the scheme default so default-port upstreams receive a canonical bare host
+        // (`api.example.com`, not `api.example.com:443`) in both the URI and Host header.
+        let authority = canonical_authority(authority, scheme)?;
         let new_uri = Uri::builder()
-            .scheme(scheme)
+            .scheme(scheme.as_str())
             .authority(authority.clone())
             .path_and_query(path)
             .build()
@@ -299,5 +322,39 @@ where
             Response::from_parts(parts, body.boxed_unsync())
         });
         serve_connection_with(io, service, conn, request_timeout, connect).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn auth(s: &str) -> http::uri::Authority {
+        s.parse().expect("valid authority")
+    }
+
+    #[test]
+    fn test_canonical_authority_strips_default_https_port() {
+        let out = canonical_authority(&auth("api.example.com:443"), UpstreamScheme::Https).unwrap();
+        assert_eq!(out.as_str(), "api.example.com");
+    }
+
+    #[test]
+    fn test_canonical_authority_strips_default_http_port() {
+        let out = canonical_authority(&auth("api.example.com:80"), UpstreamScheme::Http).unwrap();
+        assert_eq!(out.as_str(), "api.example.com");
+    }
+
+    #[test]
+    fn test_canonical_authority_keeps_non_default_port() {
+        let out = canonical_authority(&auth("api.example.com:8443"), UpstreamScheme::Https).unwrap();
+        assert_eq!(out.as_str(), "api.example.com:8443");
+    }
+
+    #[test]
+    fn test_canonical_authority_keeps_cross_scheme_default_port() {
+        // 80 is not the HTTPS default, so it must be preserved.
+        let out = canonical_authority(&auth("api.example.com:80"), UpstreamScheme::Https).unwrap();
+        assert_eq!(out.as_str(), "api.example.com:80");
     }
 }

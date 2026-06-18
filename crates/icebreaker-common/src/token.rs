@@ -76,6 +76,15 @@ impl UpstreamScheme {
             UpstreamScheme::Https => "https",
         }
     }
+
+    /// Returns the default TCP port for this scheme (`80` for HTTP, `443` for HTTPS).
+    #[must_use]
+    pub fn default_port(&self) -> u16 {
+        match self {
+            UpstreamScheme::Http => 80,
+            UpstreamScheme::Https => 443,
+        }
+    }
 }
 
 impl std::fmt::Display for UpstreamScheme {
