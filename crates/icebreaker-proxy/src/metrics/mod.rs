@@ -121,6 +121,15 @@ pub fn record_host_rejection(host: &str) {
     .increment(1);
 }
 
+/// Records a token-less (token-optional) request rejected by the static host policy.
+///
+/// Unlike [`record_host_rejection`], the host here is supplied by an unauthenticated
+/// client and is therefore unbounded, so it is deliberately omitted from the label set
+/// to prevent metrics-cardinality growth. Log the host via `tracing` if it is needed.
+pub fn record_token_optional_host_rejection() {
+    counter!("icebreaker_token_optional_host_rejections_total").increment(1);
+}
+
 /// Records a method rejection (token used for unauthorized HTTP method).
 pub fn record_method_rejection(method: &str) {
     counter!(

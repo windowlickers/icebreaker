@@ -32,7 +32,8 @@ use icebreaker_nonce::{CheckResult, NonceStore};
 
 use crate::metrics::{
     record_host_rejection, record_method_rejection, record_path_rejection, record_processor_used,
-    record_replay_attempt, record_token_validation, TokenValidationResult,
+    record_replay_attempt, record_token_optional_host_rejection, record_token_validation,
+    TokenValidationResult,
 };
 use crate::middleware::host_validation::HostValidationConfig;
 use crate::middleware::response_scan::ScanPatterns;
@@ -275,7 +276,11 @@ where
                         )
                     })?;
                     if let Err(e) = host_policy.validate(&authority) {
-                        record_host_rejection(&authority);
+                        // The authority is client-supplied and unbounded on this
+                        // unauthenticated path, so keep it out of the metric label set
+                        // (cardinality) and surface it via tracing instead.
+                        record_token_optional_host_rejection();
+                        tracing::warn!(authority = %authority, "token-optional host rejected");
                         return Err(e);
                     }
                     return inner.call(request).await.map_err(|e| {
