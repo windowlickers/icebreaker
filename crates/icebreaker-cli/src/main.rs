@@ -23,7 +23,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use icebreaker_common::UpstreamScheme;
 use icebreaker_common::{
     ClientAuthMode, ClockSkewConfig, HealthConfig, InjectConfig, NetworkProtectionConfig,
-    ProcessorConfig, ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, TlsConfig,
+    ProcessorConfig, ProxyConfig, RateLimitConfig, ReplayProtection, ShutdownConfig, Sigv4Config,
+    TlsConfig,
 };
 use icebreaker_crypto::{DecryptConfig, KeyStore, Keypair, TokenCrypto, VersionedKeypair};
 use icebreaker_proxy::serve::{
@@ -304,6 +305,12 @@ struct SealArgs {
     /// Allowed path pattern (regex, e.g., "/api/v[12]/.*")
     #[arg(long)]
     allowed_path_pattern: Option<String>,
+
+    /// AWS access key ID for SigV4 (S3) re-signing. The token --secret is used
+    /// as the AWS secret key; region and service are derived from the request's
+    /// own SigV4 Authorization header. Ignores --header/--prefix.
+    #[arg(long, conflicts_with = "processor_json")]
+    sigv4_access_key: Option<String>,
 
     /// Advanced: JSON processor configuration (overrides --header/--prefix).
     /// Example: '{"type":"multi","processors":[{"type":"inject","header_name":"Authorization","prefix":"Bearer "},{"type":"inject","header_name":"X-Api-Key"}]}'
@@ -1073,6 +1080,10 @@ fn parse_processor_config(args: &SealArgs) -> std::result::Result<ProcessorConfi
         return Ok(config);
     }
 
+    if let Some(ref access_key) = args.sigv4_access_key {
+        return Ok(ProcessorConfig::Sigv4(Sigv4Config::new(access_key)));
+    }
+
     let inject_config = if let Some(ref prefix) = args.prefix {
         InjectConfig {
             header_name: args.header.clone(),
@@ -1295,7 +1306,7 @@ fn inspect(args: &InspectArgs) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 #[cfg(test)]
-#[allow(clippy::expect_used)]
+#[allow(clippy::expect_used, clippy::panic)]
 mod build_seal_payload_tests {
     use super::*;
 
@@ -1315,6 +1326,7 @@ mod build_seal_payload_tests {
             allowed_methods: None,
             allowed_paths: None,
             allowed_path_pattern: None,
+            sigv4_access_key: None,
             processor_json: None,
             upstream_scheme: None,
         }
@@ -1363,6 +1375,20 @@ mod build_seal_payload_tests {
         let payload = build_seal_payload(&args).expect("should build");
         assert_eq!(payload.allowed_methods, vec!["GET", "POST"]);
         assert_eq!(payload.allowed_paths, vec!["/a", "/b"]);
+    }
+
+    #[test]
+    fn test_sigv4_access_key_builds_sigv4_processor() {
+        let mut args = minimal_args("s3.us-east-1.amazonaws.com");
+        args.sigv4_access_key = Some("AKIAIOSFODNN7EXAMPLE".to_string());
+
+        let config = parse_processor_config(&args).expect("should build sigv4 config");
+        match config {
+            ProcessorConfig::Sigv4(sigv4) => {
+                assert_eq!(sigv4.access_key, "AKIAIOSFODNN7EXAMPLE");
+            }
+            other => panic!("expected Sigv4 processor, got {:?}", other.processor_type()),
+        }
     }
 
     #[test]

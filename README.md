@@ -152,6 +152,7 @@ icebreaker seal \
   --secret <SECRET>                # Required: the credential to inject
   --header <HEADER>                # Header name (default: Authorization)
   --prefix <PREFIX>                # Header prefix (e.g., "Bearer ")
+  --sigv4-access-key <KEY_ID>      # AWS access key ID for SigV4 (S3) re-signing
   --expires-in <SECONDS>           # Token expiration
   --single-use                     # One-time use token
   --max-uses <N>                   # Maximum uses
@@ -168,6 +169,32 @@ Icebreaker supports multiple credential injection methods:
 | **InjectHmac** | HMAC request signing |
 | **OAuth** | OAuth tokens with automatic refresh |
 | **Sigv4** | AWS Signature Version 4 signing |
+
+### S3 (SigV4) example
+
+The SigV4 processor re-signs an incoming AWS request with credentials from the
+token. The access key ID lives in the token; the `--secret` is the AWS secret
+access key. Region and service are read from the request's own SigV4
+`Authorization` header, so no extra flags are needed.
+
+```bash
+icebreaker seal \
+  --public-key "$ICEBREAKER_PUBLIC_KEY" \
+  --secret "$AWS_SECRET_ACCESS_KEY" \
+  --sigv4-access-key "$AWS_ACCESS_KEY_ID" \
+  --allowed-hosts s3.us-east-1.amazonaws.com
+```
+
+Point an S3 client at the proxy and sign with the real access key ID plus a
+**dummy secret** — the proxy discards the client signature and re-signs with the
+token's secret, so the client's secret is never trusted. **Disable chunked
+("streaming") request signing** in the client; the proxy cannot rewrite the
+per-chunk signatures embedded in a streaming body. Single-shot `GetObject` /
+`PutObject` (which send `x-amz-content-sha256`, including `UNSIGNED-PAYLOAD`)
+work as-is.
+
+For a pure-S3 deployment, consider `ICEBREAKER_RESPONSE_SCAN_ENABLED=false`:
+response scanning otherwise runs over every downloaded object body.
 
 ## Security Features
 

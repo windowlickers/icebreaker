@@ -201,6 +201,14 @@ icebreaker seal --secret <SECRET> --allowed-hosts api.example.com --public-key <
     --single-use --expires-in 3600
 ```
 
+S3 / SigV4 token (re-signs incoming AWS requests; `--secret` is the AWS secret key):
+
+```bash
+icebreaker seal --secret "$AWS_SECRET_ACCESS_KEY" --public-key <KEY> \
+    --sigv4-access-key "$AWS_ACCESS_KEY_ID" \
+    --allowed-hosts s3.us-east-1.amazonaws.com
+```
+
 | Option | Description |
 |--------|-------------|
 | `--allowed-hosts` | Comma-separated `host` or `host:port` entries. A bare host matches any port; an entry with a port matches only that port. |
@@ -208,6 +216,7 @@ icebreaker seal --secret <SECRET> --allowed-hosts api.example.com --public-key <
 | `--allowed-paths` | Comma-separated exact paths (empty = skip exact check) |
 | `--allowed-path-pattern` | Regex pattern for paths (auto-anchored, 10KB size limit) |
 | `--upstream-scheme` | `http` or `https`. Scheme used when the inbound request URI lacks one (origin-form). Defaults to `https`. Set to `http` for plaintext upstreams. |
+| `--sigv4-access-key` | AWS access key ID for SigV4 (S3) re-signing. Builds a `Sigv4` processor; the `--secret` is used as the AWS secret key. Conflicts with `--processor-json`; ignores `--header`/`--prefix`. Region/service are derived from the request. |
 | `--single-use` | Make token single-use (enables replay protection) |
 | `--max-uses` | Max number of uses for the token |
 | `--nonce` / `--nonce-ttl` | Custom nonce and TTL for replay protection |
@@ -331,3 +340,7 @@ nix flake check   # Runs: build, cargo fmt, clippy (--all-targets --all-features
 ### CONNECT Tunnel Limitations
 
 The CONNECT tunnel handler (`icebreaker-proxy/src/tunnel/connect_handler.rs`) supports HTTPS destinations but only validates tokens - it cannot inject credentials since the tunnel is encrypted end-to-end. For credential injection, use the proxy's request forwarding mode instead.
+
+### SigV4 Streaming Uploads
+
+The SigV4 processor (`icebreaker-proxy/src/processor/sigv4.rs`) re-signs requests at proxy time, so it cannot support chunked streaming uploads (`x-amz-content-sha256: STREAMING-AWS4-HMAC-SHA256-PAYLOAD`): the per-chunk signatures embedded in the request body are derived from the client's seed signature, and the proxy has no way to rewrite them. Disable chunked/streaming signing in the client. Single-shot requests carrying a precomputed `x-amz-content-sha256` (including `UNSIGNED-PAYLOAD`) work normally. The processor also cannot reproduce SigV4's original replay-protection guarantees, since signing happens at proxy time rather than client request time.
