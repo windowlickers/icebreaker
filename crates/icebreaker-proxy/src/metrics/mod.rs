@@ -40,6 +40,20 @@ pub fn record_request(method: &str, status: u16, processor_type: Option<&str>) {
     .increment(1);
 }
 
+/// Records a request that failed before or while producing a response.
+///
+/// `class` is a stable, low-cardinality label from
+/// [`TokenizerError::error_class`](icebreaker_common::TokenizerError::error_class)
+/// — never client-supplied — so a timeout, an upstream connection failure, and an
+/// internal error are distinguishable instead of all collapsing into `5xx`.
+pub fn record_request_error(class: &str) {
+    counter!(
+        "icebreaker_request_errors_total",
+        "class" => class.to_string()
+    )
+    .increment(1);
+}
+
 /// Records request duration.
 pub fn record_request_duration(duration: Duration) {
     histogram!("icebreaker_request_duration_seconds").record(duration.as_secs_f64());

@@ -74,12 +74,16 @@ crates/
 // Rate limiting is conditionally composed (omitted when disabled)
 ServiceBuilder::new()
     .layer(RateLimitLayer::new(rate_config))  // optional
-    .layer(MetricsLayer::new())
     .layer(TokenInjectionLayer::new(crypto).with_nonce_store(...).with_clock_skew(...))
     .layer(DynamicResponseScanLayer::new())   // must come after TokenInjectionLayer
     .service(proxy_service);
 ```
-Timeout is applied per-request via `tokio::time::timeout`, not as a Tower layer.
+Timeout, the per-request access log, and request metrics are applied in
+`serve_connection_with` (`serve/http.rs`), not as Tower layers — it is the one seam
+that sees the concrete response status and `TokenizerError`, so it records the real
+status code (a forwarded upstream 503 stays 503, a timeout is 504) plus an
+`error_class` breakdown, logs one access line per request, and echoes an
+`X-Request-Id` correlation id.
 
 ### Processors
 | Type | Purpose |

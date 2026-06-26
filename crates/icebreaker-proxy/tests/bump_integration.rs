@@ -160,6 +160,59 @@ async fn test_bump_injects_token_and_reaches_upstream() {
     );
 }
 
+/// A transient upstream 5xx is forwarded verbatim (not swallowed), and the
+/// response carries the per-request correlation id so the incident is traceable.
+/// This is the original symptom: a 503 that previously reached the client with
+/// nothing logged.
+#[tokio::test]
+async fn test_bump_forwards_upstream_503_with_request_id() {
+    let intercept_ca = TestCertificateAuthority::new();
+    let upstream_ca = TestCertificateAuthority::new();
+    let server_cert = upstream_ca.issue_server_cert(CONNECT_HOST, &[CONNECT_HOST]);
+
+    let upstream = TlsUpstream::start_with_status(
+        localhost_ip(),
+        &server_cert,
+        "503 Service Unavailable",
+        "upstream-down",
+    )
+    .await;
+
+    let crypto = Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"));
+    let token = seal_token(&crypto, SECRET, CONNECT_HOST);
+
+    let ctx = make_ctx(
+        crypto,
+        Some(&intercept_ca),
+        &upstream_ca,
+        false,
+        HostValidationConfig::new(),
+        &[],
+    );
+    let proxy_addr = spawn_proxy(ctx).await;
+
+    let resp = connect_then_get(
+        proxy_addr,
+        CONNECT_HOST,
+        upstream.addr.port(),
+        Some(&token),
+        &intercept_ca,
+        "/data",
+    )
+    .await
+    .expect("bumped request should complete even when upstream errors");
+
+    assert_eq!(
+        resp.status, 503,
+        "upstream 503 must be forwarded to the client, not swallowed"
+    );
+    assert!(
+        resp.header("x-request-id").is_some(),
+        "every forwarded response should carry a correlation id; headers: {:?}",
+        resp.headers
+    );
+}
+
 /// Response scanning runs on the decrypted inner stream: a secret echoed by the
 /// upstream is blocked before reaching the client.
 #[tokio::test]

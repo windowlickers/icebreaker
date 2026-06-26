@@ -34,11 +34,22 @@ pub struct TlsUpstream {
 }
 
 impl TlsUpstream {
-    /// Starts the upstream on `bind_ip:0`, presenting `server_cert`.
+    /// Starts the upstream on `bind_ip:0`, presenting `server_cert` and replying `200 OK`.
     ///
     /// `bind_ip` should be the loopback address the proxy will resolve the
     /// CONNECT host to, so re-origination reaches this server.
     pub async fn start(bind_ip: IpAddr, server_cert: &GeneratedCert, body: &str) -> Self {
+        Self::start_with_status(bind_ip, server_cert, "200 OK", body).await
+    }
+
+    /// Like [`start`](Self::start) but replies with `status_line` (e.g.
+    /// `"503 Service Unavailable"`), to exercise upstream-error passthrough.
+    pub async fn start_with_status(
+        bind_ip: IpAddr,
+        server_cert: &GeneratedCert,
+        status_line: &str,
+        body: &str,
+    ) -> Self {
         ensure_crypto_provider();
 
         let listener = TcpListener::bind(SocketAddr::new(bind_ip, 0))
@@ -53,6 +64,7 @@ impl TlsUpstream {
         tokio::spawn(run(
             listener,
             acceptor,
+            status_line.to_string(),
             body.to_string(),
             seen_auth.clone(),
             shutdown_rx,
@@ -99,6 +111,7 @@ fn build_acceptor(server_cert: &GeneratedCert) -> TlsAcceptor {
 async fn run(
     listener: TcpListener,
     acceptor: TlsAcceptor,
+    status_line: String,
     body: String,
     seen_auth: Arc<Mutex<Option<String>>>,
     mut shutdown_rx: oneshot::Receiver<()>,
@@ -109,9 +122,10 @@ async fn run(
             result = listener.accept() => {
                 let Ok((stream, _)) = result else { continue };
                 let acceptor = acceptor.clone();
+                let status_line = status_line.clone();
                 let body = body.clone();
                 let seen_auth = seen_auth.clone();
-                tokio::spawn(serve_connection(stream, acceptor, body, seen_auth));
+                tokio::spawn(serve_connection(stream, acceptor, status_line, body, seen_auth));
             }
         }
     }
@@ -120,6 +134,7 @@ async fn run(
 async fn serve_connection(
     stream: tokio::net::TcpStream,
     acceptor: TlsAcceptor,
+    status_line: String,
     body: String,
     seen_auth: Arc<Mutex<Option<String>>>,
 ) {
@@ -154,7 +169,8 @@ async fn serve_connection(
     *seen_auth.lock().expect("seen_auth lock") = auth;
 
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+        status_line,
         body.len(),
         body
     );

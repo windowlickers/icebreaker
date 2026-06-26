@@ -25,8 +25,8 @@ pub mod tunnel;
 pub use body::{OverlapBuffer, ScanningBody, SecretScannerConfig, StreamScanner};
 pub use middleware::{
     generate_scan_patterns, DynamicResponseScanLayer, HostValidationConfig, HostValidationLayer,
-    MetricsLayer, MetricsService, RateLimitLayer, RateLimiter, ResponseScanLayer, ScanPatterns,
-    TokenInjectionLayer, TOKEN_HEADER,
+    RateLimitLayer, RateLimiter, ResponseScanLayer, ScanPatterns, TokenInjectionLayer,
+    TOKEN_HEADER,
 };
 pub use network::{BlockReason, IpFilter, ValidatingConnector, ValidatingStream};
 pub use processor::{

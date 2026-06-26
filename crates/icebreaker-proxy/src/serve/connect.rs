@@ -125,6 +125,12 @@ pub(crate) fn handle_connect<'a>(
         match target {
             Ok((host, port)) => {
                 record_connect_tunnel();
+                tracing::info!(
+                    host = %host,
+                    port,
+                    remote_addr = %remote_addr,
+                    "CONNECT tunnel established"
+                );
                 let on_upgrade = hyper::upgrade::on(req);
                 let deps = deps.clone();
                 let guard = ConnectionGuard::new(deps.ctx.shutdown.clone());
@@ -142,7 +148,12 @@ pub(crate) fn handle_connect<'a>(
             }
             Err(e) => {
                 record_token_validation(TokenValidationResult::Invalid);
-                tracing::warn!(error = %e, "CONNECT request rejected");
+                tracing::warn!(
+                    error = %e,
+                    status = e.status_code(),
+                    remote_addr = %remote_addr,
+                    "CONNECT request rejected"
+                );
                 to_unified(ConnectHandler::error_response(&e))
             }
         }

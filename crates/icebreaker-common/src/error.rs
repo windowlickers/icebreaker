@@ -205,6 +205,71 @@ impl TokenizerError {
         )
     }
 
+    /// Returns the HTTP status code this failure corresponds to.
+    ///
+    /// Used to record the request metric with the failure's true status instead
+    /// of a blanket 500, so a transient upstream 503 or a timeout (504) is not
+    /// mislabeled. `UpstreamError` reports the status the upstream actually sent.
+    #[must_use]
+    pub fn status_code(&self) -> u16 {
+        match self {
+            Self::Timeout => 504,
+            Self::RateLimitExceeded => 429,
+            Self::UpstreamError { status, .. } => *status,
+            Self::HttpError(_) => 502,
+            Self::ProxyAuthRequired { .. } => 407,
+            Self::HostNotAllowed { .. }
+            | Self::MethodNotAllowed { .. }
+            | Self::PathNotAllowed { .. }
+            | Self::BlockedAddress { .. }
+            | Self::SecretLeakDetected
+            | Self::UnsupportedContentEncoding { .. } => 403,
+            Self::InvalidPayload(_) => 400,
+            Self::TokenExpired
+            | Self::DecryptionError(_)
+            | Self::TokenReplayDetected { .. }
+            | Self::ReplayProtectionUnavailable => 401,
+            Self::CryptoError(_)
+            | Self::OAuthRefreshError(_)
+            | Self::SigningError(_)
+            | Self::ConfigError(_)
+            | Self::AuditError(_)
+            | Self::NonceStoreError(_)
+            | Self::InternalError(_) => 500,
+        }
+    }
+
+    /// Returns a stable, low-cardinality label identifying the failure class.
+    ///
+    /// Safe to use as a metric label: one value per variant, never client-supplied.
+    #[must_use]
+    pub fn error_class(&self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::RateLimitExceeded => "rate_limited",
+            Self::UpstreamError { .. } | Self::HttpError(_) => "upstream",
+            Self::ProxyAuthRequired { .. } => "proxy_auth",
+            Self::HostNotAllowed { .. } => "host_not_allowed",
+            Self::MethodNotAllowed { .. } => "method_not_allowed",
+            Self::PathNotAllowed { .. } => "path_not_allowed",
+            Self::BlockedAddress { .. } => "blocked_address",
+            Self::SecretLeakDetected => "leak_blocked",
+            Self::UnsupportedContentEncoding { .. } => "unsupported_encoding",
+            Self::InvalidPayload(_) => "invalid_token",
+            Self::TokenExpired => "token_expired",
+            Self::DecryptionError(_) => "decryption_failed",
+            Self::TokenReplayDetected { .. } => "replay_detected",
+            Self::ReplayProtectionUnavailable => "replay_unavailable",
+            Self::CryptoError(_) => "crypto",
+            Self::OAuthRefreshError(_) => "oauth",
+            Self::SigningError(_) => "signing",
+            Self::ConfigError(_) => "config",
+            Self::AuditError(_) => "audit",
+            Self::NonceStoreError(_) => "nonce_store",
+            Self::InternalError(_) => "internal",
+        }
+    }
+
     /// Returns `true` if this error is a security-related error.
     #[must_use]
     pub fn is_security_error(&self) -> bool {
@@ -282,6 +347,76 @@ mod tests {
 
         assert!(!TokenizerError::Timeout.is_security_error());
         assert!(!TokenizerError::ConfigError("missing key".into()).is_security_error());
+    }
+
+    #[test]
+    fn test_status_code_maps_transient_failures() {
+        assert_eq!(TokenizerError::Timeout.status_code(), 504);
+        assert_eq!(TokenizerError::RateLimitExceeded.status_code(), 429);
+        assert_eq!(
+            TokenizerError::HttpError("connect refused".into()).status_code(),
+            502
+        );
+        assert_eq!(
+            TokenizerError::UpstreamError {
+                status: 503,
+                message: "Service Unavailable".into()
+            }
+            .status_code(),
+            503
+        );
+        assert_eq!(
+            TokenizerError::ProxyAuthRequired {
+                reason: "missing header".into()
+            }
+            .status_code(),
+            407
+        );
+        assert_eq!(
+            TokenizerError::HostNotAllowed {
+                host: "evil.com".into()
+            }
+            .status_code(),
+            403
+        );
+        assert_eq!(TokenizerError::TokenExpired.status_code(), 401);
+        assert_eq!(
+            TokenizerError::InvalidPayload("bad json".into()).status_code(),
+            400
+        );
+        assert_eq!(
+            TokenizerError::InternalError("oops".into()).status_code(),
+            500
+        );
+    }
+
+    #[test]
+    fn test_error_class_is_distinct_per_failure_mode() {
+        assert_eq!(TokenizerError::Timeout.error_class(), "timeout");
+        assert_eq!(
+            TokenizerError::RateLimitExceeded.error_class(),
+            "rate_limited"
+        );
+        assert_eq!(
+            TokenizerError::HttpError("boom".into()).error_class(),
+            "upstream"
+        );
+        assert_eq!(
+            TokenizerError::UpstreamError {
+                status: 503,
+                message: "down".into()
+            }
+            .error_class(),
+            "upstream"
+        );
+        assert_eq!(
+            TokenizerError::SecretLeakDetected.error_class(),
+            "leak_blocked"
+        );
+        assert_eq!(
+            TokenizerError::InternalError("oops".into()).error_class(),
+            "internal"
+        );
     }
 
     #[test]

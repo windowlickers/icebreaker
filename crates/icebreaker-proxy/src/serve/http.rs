@@ -3,21 +3,27 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use http::{Request, Response, Uri};
+use http::{HeaderValue, Request, Response, Uri};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use tower::{Service, ServiceBuilder, ServiceExt};
+use tracing::Instrument;
 
 use icebreaker_common::UpstreamScheme;
 use icebreaker_crypto::{ConnectionInfo, TlsConnectionInfo};
 
-use crate::middleware::{
-    DynamicResponseScanLayer, MetricsLayer, RateLimitLayer, TokenInjectionLayer,
-};
+use crate::metrics::{record_request, record_request_duration, record_request_error};
+use crate::middleware::{DynamicResponseScanLayer, RateLimitLayer, TokenInjectionLayer};
 use crate::tunnel::{is_connect_request, ConnectHandler, TunnelConfig};
+
+/// HTTP header carrying the per-request correlation id.
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Longest inbound `X-Request-Id` reused before a fresh id is generated instead.
+const MAX_REQUEST_ID_LEN: usize = 128;
 
 use super::body::UnifiedBody;
 use super::connect::{handle_connect, ConnectDeps};
@@ -135,6 +141,41 @@ fn prepare_request(
     Ok(req)
 }
 
+/// Returns a correlation id for the request.
+///
+/// Reuses the inbound `X-Request-Id` when the client supplied a safe one — non-empty,
+/// within [`MAX_REQUEST_ID_LEN`], and made up solely of ASCII alphanumerics, `-`, `_`,
+/// or `.`. That restriction bounds metric/log cardinality and prevents an
+/// attacker-controlled header from injecting into logs. Otherwise a fresh 128-bit
+/// hex id is generated.
+fn resolve_request_id<B>(req: &Request<B>) -> String {
+    let inbound = req
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|s| {
+            !s.is_empty()
+                && s.len() <= MAX_REQUEST_ID_LEN
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        });
+    match inbound {
+        Some(id) => id.to_string(),
+        None => format!("{:032x}", rand::random::<u128>()),
+    }
+}
+
+/// Best-effort destination host for the access log: the `Host` header, falling back
+/// to the request URI's authority.
+fn request_host<B>(req: &Request<B>) -> String {
+    req.headers()
+        .get(http::header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+        .or_else(|| req.uri().host().map(str::to_string))
+        .unwrap_or_default()
+}
+
 /// Serves HTTP/1.1 over `io` using a built middleware-stack `service`.
 ///
 /// Applies per-request connection context and a per-request timeout, and handles
@@ -165,8 +206,9 @@ async fn serve_connection_with<I, S>(
         let conn = conn.clone();
         let connect = connect.clone();
         async move {
-            // CONNECT requests are handled before the middleware stack: they
-            // establish a tunnel rather than being forwarded as HTTP.
+            // CONNECT requests are handled before the middleware stack and the
+            // per-request span: they establish a tunnel rather than being forwarded
+            // as HTTP, and log their own outcome in `handle_connect`.
             if let Some(deps) = connect {
                 if is_connect_request(&req) {
                     return Ok(handle_connect(
@@ -179,34 +221,107 @@ async fn serve_connection_with<I, S>(
                 }
             }
 
-            let req = match prepare_request(req, &conn) {
-                Ok(req) => req,
-                Err(e) => {
-                    tracing::error!(error = %e, "request preparation failed");
-                    return Err(e);
-                }
-            };
+            let request_id = resolve_request_id(&req);
+            let method = req.method().clone();
+            let path = req.uri().path().to_string();
+            let host = request_host(&req);
 
-            // Apply request timeout to prevent requests from hanging indefinitely.
-            let result = tokio::time::timeout(request_timeout, async {
-                match svc.ready().await {
-                    Ok(ready_svc) => ready_svc.call(req).await,
-                    Err(e) => Err(e),
-                }
-            })
-            .await;
+            // A span carries the correlation id and request identity onto every
+            // downstream log; the access-log events below add per-outcome detail.
+            let span = tracing::info_span!(
+                "request",
+                request_id = %request_id,
+                method = %method,
+                host = %host,
+                remote_addr = %conn.remote_addr,
+            );
 
-            match result {
-                Ok(Ok(response)) => Ok(response),
-                Ok(Err(e)) => {
-                    tracing::error!(error = %e, "request failed");
-                    Err(e)
-                }
-                Err(_elapsed) => {
-                    tracing::warn!("request timed out");
-                    Err(icebreaker_common::TokenizerError::Timeout)
+            async move {
+                let start = Instant::now();
+
+                let req = match prepare_request(req, &conn) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        record_request(method.as_str(), e.status_code(), None);
+                        record_request_error(e.error_class());
+                        record_request_duration(start.elapsed());
+                        tracing::error!(
+                            error = %e,
+                            status = e.status_code(),
+                            "request preparation failed"
+                        );
+                        return Err(e);
+                    }
+                };
+
+                // Apply request timeout to prevent requests from hanging indefinitely.
+                let result = tokio::time::timeout(request_timeout, async {
+                    match svc.ready().await {
+                        Ok(ready_svc) => ready_svc.call(req).await,
+                        Err(e) => Err(e),
+                    }
+                })
+                .await;
+
+                let elapsed = start.elapsed();
+                record_request_duration(elapsed);
+                let duration_ms = elapsed.as_millis();
+
+                match result {
+                    Ok(Ok(mut response)) => {
+                        let status = response.status();
+                        record_request(method.as_str(), status.as_u16(), None);
+                        if let Ok(value) = HeaderValue::from_str(&request_id) {
+                            response.headers_mut().insert(REQUEST_ID_HEADER, value);
+                        }
+                        // Upstream 5xx is forwarded verbatim; surface it at warn so a
+                        // transient upstream 503 is no longer invisible in the logs.
+                        if status.is_server_error() {
+                            tracing::warn!(
+                                status = status.as_u16(),
+                                path = %path,
+                                duration_ms,
+                                "request completed with server error"
+                            );
+                        } else {
+                            tracing::info!(
+                                status = status.as_u16(),
+                                path = %path,
+                                duration_ms,
+                                "request completed"
+                            );
+                        }
+                        Ok(response)
+                    }
+                    Ok(Err(e)) => {
+                        record_request(method.as_str(), e.status_code(), None);
+                        record_request_error(e.error_class());
+                        tracing::error!(
+                            error = %e,
+                            status = e.status_code(),
+                            class = e.error_class(),
+                            path = %path,
+                            duration_ms,
+                            "request failed"
+                        );
+                        Err(e)
+                    }
+                    Err(_elapsed) => {
+                        let e = icebreaker_common::TokenizerError::Timeout;
+                        record_request(method.as_str(), e.status_code(), None);
+                        record_request_error(e.error_class());
+                        tracing::warn!(
+                            status = e.status_code(),
+                            path = %path,
+                            duration_ms,
+                            "request timed out"
+                        );
+                        Err(e)
+                    }
                 }
             }
+            .instrument(span)
+            .await
         }
     });
 
@@ -226,14 +341,14 @@ async fn serve_connection_with<I, S>(
 ///
 /// Order matters:
 /// 1. RateLimitLayer - protects against brute-force attacks (when enabled)
-/// 2. MetricsLayer - record metrics
-/// 3. TokenInjectionLayer - decrypts tokens and injects secrets
-/// 4. DynamicResponseScanLayer - scans responses for leaked secrets
+/// 2. TokenInjectionLayer - decrypts tokens and injects secrets
+/// 3. DynamicResponseScanLayer - scans responses for leaked secrets
 ///
 /// DynamicResponseScanLayer must come after TokenInjectionLayer so it can read
 /// the ScanPatterns stored by token injection. The outermost `map_response` boxes
-/// the stack's body so it shares one type with CONNECT control responses. Timeout
-/// is applied per-request in `serve_connection_with`.
+/// the stack's body so it shares one type with CONNECT control responses. Timeout,
+/// per-request access logging, and request metrics are applied in
+/// `serve_connection_with`, which sees the concrete response status and error.
 pub async fn serve_http<I>(io: I, ctx: ProxyContext, conn: ConnContext)
 where
     I: hyper::rt::Read + hyper::rt::Write + Unpin + Send + 'static,
@@ -284,7 +399,6 @@ where
     if let Some(limiter) = rate_limiter {
         let service = ServiceBuilder::new()
             .layer(RateLimitLayer::from_limiter(limiter))
-            .layer(MetricsLayer::new())
             .layer({
                 let mut layer = TokenInjectionLayer::new(crypto)
                     .with_response_scan(response_scan_enabled)
@@ -304,7 +418,6 @@ where
         serve_connection_with(io, service, conn, request_timeout, connect).await;
     } else {
         let service = ServiceBuilder::new()
-            .layer(MetricsLayer::new())
             .layer({
                 let mut layer = TokenInjectionLayer::new(crypto)
                     .with_response_scan(response_scan_enabled)
@@ -357,5 +470,63 @@ mod tests {
         // 80 is not the HTTPS default, so it must be preserved.
         let out = canonical_authority(&auth("api.example.com:80"), UpstreamScheme::Https).unwrap();
         assert_eq!(out.as_str(), "api.example.com:80");
+    }
+
+    fn request_with_id(id: &str) -> Request<()> {
+        Request::builder()
+            .uri("https://api.example.com/v1/users")
+            .header(REQUEST_ID_HEADER, id)
+            .body(())
+            .expect("request should build")
+    }
+
+    #[test]
+    fn test_resolve_request_id_reuses_safe_inbound_value() {
+        let req = request_with_id("abc-123_DEF.4");
+        assert_eq!(resolve_request_id(&req), "abc-123_DEF.4");
+    }
+
+    #[test]
+    fn test_resolve_request_id_generates_when_absent() {
+        let req = Request::builder()
+            .uri("https://api.example.com/")
+            .body(())
+            .expect("request should build");
+        let id = resolve_request_id(&req);
+        assert_eq!(id.len(), 32);
+        assert!(id.bytes().all(|b| b.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn test_resolve_request_id_rejects_unsafe_inbound_value() {
+        // A space (or other out-of-charset byte) could forge a log field; an
+        // over-long value blows cardinality. Both are replaced by a generated id.
+        let injected = resolve_request_id(&request_with_id("evil injected"));
+        assert_eq!(injected.len(), 32);
+
+        let too_long = resolve_request_id(&request_with_id(&"a".repeat(MAX_REQUEST_ID_LEN + 1)));
+        assert_eq!(too_long.len(), 32);
+
+        let empty = resolve_request_id(&request_with_id(""));
+        assert_eq!(empty.len(), 32);
+    }
+
+    #[test]
+    fn test_request_host_prefers_host_header() {
+        let req = Request::builder()
+            .uri("https://uri-host.example.com/path")
+            .header(http::header::HOST, "header-host.example.com")
+            .body(())
+            .expect("request should build");
+        assert_eq!(request_host(&req), "header-host.example.com");
+    }
+
+    #[test]
+    fn test_request_host_falls_back_to_uri_authority() {
+        let req = Request::builder()
+            .uri("https://uri-host.example.com/path")
+            .body(())
+            .expect("request should build");
+        assert_eq!(request_host(&req), "uri-host.example.com");
     }
 }

@@ -26,6 +26,17 @@ pub struct TestClient {
 pub struct HttpResponse {
     pub status: u16,
     pub body: String,
+    pub headers: Vec<(String, String)>,
+}
+
+impl HttpResponse {
+    /// Returns the first value of `name` (case-insensitive), if present.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 impl TestClient {
@@ -122,6 +133,7 @@ pub async fn connect_then_get(
         return Ok(HttpResponse {
             status,
             body: String::new(),
+            headers: Vec::new(),
         });
     }
 
@@ -240,10 +252,24 @@ fn parse_http_response(response: &str) -> Result<HttpResponse, String> {
         .parse()
         .map_err(|_| format!("invalid status code: {}", parts[1]))?;
 
+    // Header lines run from after the status line up to the first blank line.
+    let headers = lines[1..]
+        .iter()
+        .take_while(|line| !line.is_empty())
+        .filter_map(|line| {
+            line.split_once(':')
+                .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        })
+        .collect();
+
     // Find body (after empty line)
     let body = response.split("\r\n\r\n").nth(1).unwrap_or("").to_string();
 
-    Ok(HttpResponse { status, body })
+    Ok(HttpResponse {
+        status,
+        body,
+        headers,
+    })
 }
 
 #[cfg(test)]

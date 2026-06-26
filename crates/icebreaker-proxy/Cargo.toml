@@ -60,6 +60,8 @@ pin-project-lite = { workspace = true }
 regex = { workspace = true }
 ipnet = { workspace = true }
 urlencoding = { workspace = true }
+# Per-request correlation id generation.
+rand = { workspace = true }
 
 # AWS signing
 aws-sigv4 = { workspace = true }
