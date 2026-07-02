@@ -394,48 +394,29 @@ where
     // Create the proxy service for this connection with SSRF protection.
     let proxy_service = ProxyService::new(ip_filter, &upstream_roots);
 
-    // Handle the two cases (with/without rate limiting) separately to avoid
-    // complex type erasure while keeping concrete types for efficiency.
-    if let Some(limiter) = rate_limiter {
-        let service = ServiceBuilder::new()
-            .layer(RateLimitLayer::from_limiter(limiter))
-            .layer({
-                let mut layer = TokenInjectionLayer::new(crypto)
-                    .with_response_scan(response_scan_enabled)
-                    .with_clock_skew(clock_skew)
-                    .with_token_optional(token_optional, host_policy.clone());
-                if let Some(store) = nonce_store {
-                    layer = layer.with_nonce_store(store);
-                }
-                layer
-            })
-            .layer(DynamicResponseScanLayer::new())
-            .service(proxy_service);
-        let service = service.map_response(|res| {
+    let token_injection = {
+        let mut layer = TokenInjectionLayer::new(crypto)
+            .with_response_scan(response_scan_enabled)
+            .with_clock_skew(clock_skew)
+            .with_token_optional(token_optional, host_policy);
+        if let Some(store) = nonce_store {
+            layer = layer.with_nonce_store(store);
+        }
+        layer
+    };
+    // `option_layer` keeps concrete service types: the stack is
+    // `Either<RateLimitService<...>, ...>`, which unifies because both sides
+    // share the same Response and Error (TokenizerError) types.
+    let service = ServiceBuilder::new()
+        .option_layer(rate_limiter.map(RateLimitLayer::from_limiter))
+        .layer(token_injection)
+        .layer(DynamicResponseScanLayer::new())
+        .service(proxy_service)
+        .map_response(|res| {
             let (parts, body) = res.into_parts();
             Response::from_parts(parts, body.boxed_unsync())
         });
-        serve_connection_with(io, service, conn, request_timeout, connect).await;
-    } else {
-        let service = ServiceBuilder::new()
-            .layer({
-                let mut layer = TokenInjectionLayer::new(crypto)
-                    .with_response_scan(response_scan_enabled)
-                    .with_clock_skew(clock_skew)
-                    .with_token_optional(token_optional, host_policy.clone());
-                if let Some(store) = nonce_store {
-                    layer = layer.with_nonce_store(store);
-                }
-                layer
-            })
-            .layer(DynamicResponseScanLayer::new())
-            .service(proxy_service);
-        let service = service.map_response(|res| {
-            let (parts, body) = res.into_parts();
-            Response::from_parts(parts, body.boxed_unsync())
-        });
-        serve_connection_with(io, service, conn, request_timeout, connect).await;
-    }
+    serve_connection_with(io, service, conn, request_timeout, connect).await;
 }
 
 #[cfg(test)]
