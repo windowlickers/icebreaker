@@ -29,7 +29,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use icebreaker_common::{InjectConfig, ProcessorConfig, TokenPayload, TokenizerError};
 use icebreaker_crypto::{Keypair, TokenCrypto};
-use icebreaker_proxy::{DynamicResponseScanLayer, TokenInjectionLayer, TOKEN_HEADER};
+use icebreaker_proxy::{
+    DynamicResponseScanLayer, TokenAdmission, TokenInjectionLayer, TOKEN_HEADER,
+};
 
 const SECRET: &str = "super-secret-api-token-xyz-42";
 
@@ -79,7 +81,7 @@ async fn test_raw_secret_in_body_blocks_stream() {
     });
 
     let svc = ServiceBuilder::new()
-        .layer(TokenInjectionLayer::new(crypto))
+        .layer(TokenInjectionLayer::new(TokenAdmission::new(crypto)))
         .layer(DynamicResponseScanLayer::new())
         .service(forwarder);
 
@@ -115,7 +117,7 @@ async fn test_base64_encoded_secret_in_body_blocks_stream() {
     });
 
     let svc = ServiceBuilder::new()
-        .layer(TokenInjectionLayer::new(crypto))
+        .layer(TokenInjectionLayer::new(TokenAdmission::new(crypto)))
         .layer(DynamicResponseScanLayer::new())
         .service(forwarder);
 
@@ -150,7 +152,7 @@ async fn test_clean_response_passes_through() {
     });
 
     let svc = ServiceBuilder::new()
-        .layer(TokenInjectionLayer::new(crypto))
+        .layer(TokenInjectionLayer::new(TokenAdmission::new(crypto)))
         .layer(DynamicResponseScanLayer::new())
         .service(forwarder);
 
@@ -187,7 +189,7 @@ async fn test_secret_in_response_header_blocks_response() {
     });
 
     let svc = ServiceBuilder::new()
-        .layer(TokenInjectionLayer::new(crypto))
+        .layer(TokenInjectionLayer::new(TokenAdmission::new(crypto)))
         .layer(DynamicResponseScanLayer::new())
         .service(forwarder);
 
@@ -196,7 +198,7 @@ async fn test_secret_in_response_header_blocks_response() {
     // `Response<ScanningBody<..>>` doesn't impl Debug, so we can't use expect_err.
     match svc.oneshot(req).await {
         Ok(_) => panic!("header leak must abort before body is returned"),
-        // TokenInjectionService flattens inner errors (token_injection.rs:517) —
+        // TokenInjectionService flattens inner errors (its call() maps them to HttpError) —
         // the scan layer's `SecretLeakDetected` is remapped to `HttpError`.
         // If that flattening is ever tightened to preserve identity, tighten this too.
         Err(TokenizerError::HttpError(_)) => {}

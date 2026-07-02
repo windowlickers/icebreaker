@@ -302,6 +302,80 @@ pub struct DynamicResponseScanService<S> {
 #[derive(Clone, Debug)]
 pub struct ScanPatterns(pub Vec<Vec<u8>>);
 
+/// Minimum secret length to generate encoded variants.
+/// Short secrets produce many false positives when encoded.
+const MIN_SECRET_LEN_FOR_VARIANTS: usize = 8;
+
+/// Encodes HTML/XML special characters. Returns None if no encoding needed.
+fn encode_html_entities(s: &str) -> Option<String> {
+    if !s.chars().any(|c| matches!(c, '&' | '<' | '>' | '"' | '\'')) {
+        return None;
+    }
+    let mut result = String::with_capacity(s.len() + 16);
+    for c in s.chars() {
+        match c {
+            '&' => result.push_str("&amp;"),
+            '<' => result.push_str("&lt;"),
+            '>' => result.push_str("&gt;"),
+            '"' => result.push_str("&quot;"),
+            '\'' => result.push_str("&#39;"),
+            _ => result.push(c),
+        }
+    }
+    Some(result)
+}
+
+/// Generates scan patterns including encoded variants of the secret.
+/// Returns patterns for: raw bytes, base64 standard, base64 URL-safe, URL-encoded,
+/// hex lowercase, hex uppercase, and HTML entities.
+/// Short secrets (< 8 chars) only return the raw pattern to avoid false positives.
+pub fn generate_scan_patterns(secret: &str) -> Vec<Vec<u8>> {
+    use base64::Engine;
+
+    let raw = secret.as_bytes().to_vec();
+
+    // Skip very short secrets to avoid false positives
+    if raw.len() < MIN_SECRET_LEN_FOR_VARIANTS {
+        return vec![raw];
+    }
+
+    let mut patterns = Vec::with_capacity(7);
+    patterns.push(raw.clone());
+
+    // Base64 standard encoding
+    let b64_standard = base64::engine::general_purpose::STANDARD.encode(&raw);
+    patterns.push(b64_standard.into_bytes());
+
+    // Base64 URL-safe encoding (used in JWTs, cookies)
+    let b64_url = base64::engine::general_purpose::URL_SAFE.encode(&raw);
+    // Only add if different from standard encoding
+    if b64_url.as_bytes() != patterns[1] {
+        patterns.push(b64_url.into_bytes());
+    }
+
+    // URL encoding (percent-encoded)
+    let url_encoded = urlencoding::encode(secret);
+    // Only add if different from raw (alphanumeric strings don't change)
+    if url_encoded.as_bytes() != raw {
+        patterns.push(url_encoded.as_bytes().to_vec());
+    }
+
+    // Hex encoding - lowercase (common in modern APIs)
+    let hex_lower = hex::encode(&raw);
+    patterns.push(hex_lower.into_bytes());
+
+    // Hex encoding - uppercase (common in legacy systems)
+    let hex_upper = hex::encode_upper(&raw);
+    patterns.push(hex_upper.into_bytes());
+
+    // HTML entity encoding (only if secret contains special chars)
+    if let Some(html_encoded) = encode_html_entities(secret) {
+        patterns.push(html_encoded.into_bytes());
+    }
+
+    patterns
+}
+
 impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for DynamicResponseScanService<S>
 where
     S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
@@ -357,6 +431,162 @@ mod tests {
     use std::convert::Infallible;
     use std::io::Write;
     use tower::ServiceExt;
+
+    mod scan_patterns {
+        use super::generate_scan_patterns;
+        use base64::Engine;
+
+        #[test]
+        fn short_secret_returns_only_raw() {
+            // Secrets shorter than 8 chars should only return raw pattern
+            let patterns = generate_scan_patterns("short");
+            assert_eq!(patterns.len(), 1);
+            assert_eq!(patterns[0], b"short");
+        }
+
+        #[test]
+        fn exactly_min_length_generates_variants() {
+            // Exactly 8 chars should generate variants
+            let patterns = generate_scan_patterns("12345678");
+            assert!(patterns.len() > 1);
+            assert_eq!(patterns[0], b"12345678");
+        }
+
+        #[test]
+        fn generates_base64_standard_variant() {
+            let secret = "my-secret-api-key";
+            let patterns = generate_scan_patterns(secret);
+
+            let expected_b64 = base64::engine::general_purpose::STANDARD.encode(secret);
+            assert!(patterns.contains(&expected_b64.into_bytes()));
+        }
+
+        #[test]
+        fn generates_base64_url_safe_variant_when_different() {
+            // Standard base64 uses + and /, URL-safe uses - and _
+            // We need a secret that produces + or / in its base64 encoding.
+            // The bytes [0xfb, 0xef] in base64 produce characters that differ.
+            // Using a string that produces + or / when base64 encoded.
+
+            // ">>>???" encodes to "Pj4+Pz8/" in standard and "Pj4-Pz8_" in URL-safe
+            let secret = ">>>???>>"; // 8 chars, produces / and + in base64
+            let patterns = generate_scan_patterns(secret);
+
+            let b64_standard = base64::engine::general_purpose::STANDARD.encode(secret);
+            let b64_url = base64::engine::general_purpose::URL_SAFE.encode(secret);
+
+            // If they're different, both should be in patterns
+            if b64_standard != b64_url {
+                assert!(patterns.contains(&b64_standard.into_bytes()));
+                assert!(patterns.contains(&b64_url.into_bytes()));
+            }
+        }
+
+        #[test]
+        fn alphanumeric_secret_no_url_encoded_duplicate() {
+            // Alphanumeric strings don't need URL encoding, so no duplicate should be added
+            let secret = "AlphaNumeric123Secret";
+            let patterns = generate_scan_patterns(secret);
+
+            // Should have: raw, base64 standard, possibly base64 URL-safe
+            // Should NOT have URL-encoded duplicate (it would be identical to raw)
+            let url_encoded = urlencoding::encode(secret);
+            assert_eq!(url_encoded.as_ref(), secret); // Confirms no encoding needed
+
+            // Count how many times raw appears - should be exactly once
+            let raw_count = patterns.iter().filter(|p| *p == secret.as_bytes()).count();
+            assert_eq!(raw_count, 1);
+        }
+
+        #[test]
+        fn special_chars_generate_url_encoded_variant() {
+            // Secrets with special characters should have URL-encoded variant
+            let secret = "api-key=value&token";
+            let patterns = generate_scan_patterns(secret);
+
+            let url_encoded = urlencoding::encode(secret);
+            assert_ne!(url_encoded.as_ref(), secret); // Confirms encoding is needed
+            assert!(patterns.contains(&url_encoded.as_bytes().to_vec()));
+        }
+
+        #[test]
+        fn real_world_api_key_generates_expected_patterns() {
+            // Test with a realistic API key format
+            let secret = "sk_live_abcdef123456789";
+            let patterns = generate_scan_patterns(secret);
+
+            // Should have at least raw and base64
+            assert!(patterns.len() >= 2);
+            assert_eq!(patterns[0], secret.as_bytes());
+
+            // Verify base64 encoding is present
+            let b64 = base64::engine::general_purpose::STANDARD.encode(secret);
+            assert!(patterns.contains(&b64.into_bytes()));
+        }
+
+        #[test]
+        fn generates_hex_lowercase_variant() {
+            let secret = "my-secret-api-key";
+            let patterns = generate_scan_patterns(secret);
+
+            let expected_hex = hex::encode(secret);
+            assert!(
+                patterns.contains(&expected_hex.into_bytes()),
+                "patterns should contain hex lowercase encoding"
+            );
+        }
+
+        #[test]
+        fn generates_hex_uppercase_variant() {
+            let secret = "my-secret-api-key";
+            let patterns = generate_scan_patterns(secret);
+
+            let expected_hex = hex::encode_upper(secret);
+            assert!(
+                patterns.contains(&expected_hex.into_bytes()),
+                "patterns should contain hex uppercase encoding"
+            );
+        }
+
+        #[test]
+        fn generates_html_entity_variant_when_needed() {
+            // Secret containing HTML special characters
+            let secret = "key&value<>test";
+            let patterns = generate_scan_patterns(secret);
+
+            // Should contain HTML-encoded variant
+            let expected_html = "key&amp;value&lt;&gt;test";
+            assert!(
+                patterns.contains(&expected_html.as_bytes().to_vec()),
+                "patterns should contain HTML entity encoding"
+            );
+        }
+
+        #[test]
+        fn no_html_variant_for_alphanumeric_secret() {
+            // Alphanumeric secrets don't need HTML encoding
+            let secret = "AlphaNumeric123Secret";
+            let patterns = generate_scan_patterns(secret);
+
+            // Should NOT have a duplicate from HTML encoding since no special chars
+            // The raw secret should appear exactly once
+            let raw_count = patterns.iter().filter(|p| *p == secret.as_bytes()).count();
+            assert_eq!(raw_count, 1, "raw pattern should appear exactly once");
+        }
+
+        #[test]
+        fn html_entity_encodes_all_special_chars() {
+            use super::super::encode_html_entities;
+
+            // Test all 5 HTML special characters
+            let input = "a&b<c>d\"e'f";
+            let result = encode_html_entities(input);
+
+            assert!(result.is_some());
+            let encoded = result.expect("should encode");
+            assert_eq!(encoded, "a&amp;b&lt;c&gt;d&quot;e&#39;f");
+        }
+    }
 
     fn gzip_compress(data: &[u8]) -> Vec<u8> {
         use flate2::write::GzEncoder;

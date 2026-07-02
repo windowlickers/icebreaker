@@ -22,7 +22,7 @@ use tower::{ServiceBuilder, ServiceExt};
 
 use icebreaker_common::{ProcessorConfig, Sigv4Config, TokenPayload};
 use icebreaker_crypto::{Keypair, TokenCrypto};
-use icebreaker_proxy::{TokenInjectionLayer, TOKEN_HEADER};
+use icebreaker_proxy::{TokenAdmission, TokenInjectionLayer, TOKEN_HEADER};
 
 const AWS_SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
 const TOKEN_ACCESS_KEY: &str = "AKIAEXAMPLES3TOKEN";
@@ -98,7 +98,7 @@ async fn resign(auth: Option<&str>, amz_date: Option<&str>) -> Result<Option<Str
     });
 
     let svc = ServiceBuilder::new()
-        .layer(TokenInjectionLayer::new(crypto))
+        .layer(TokenInjectionLayer::new(TokenAdmission::new(crypto)))
         .service(forwarder);
 
     let req = build_signed_request(&token_header, auth, amz_date);

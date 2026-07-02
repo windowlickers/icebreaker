@@ -60,7 +60,7 @@ crates/
 
 ### Token Flow
 1. Client sends `X-Tokenizer-Token` header
-2. `TokenInjectionService` decrypts sealed token
+2. `TokenAdmission::admit()` (in `icebreaker-proxy/src/admission.rs`) decrypts the sealed token
 3. Host validation against allowlist
 4. Method validation against `allowed_methods` (if configured)
 5. Path validation against `allowed_paths` / `allowed_path_pattern` (if configured)
@@ -69,12 +69,16 @@ crates/
 8. `ResponseScanLayer` wraps response with `ScanningBody` for leak detection
 9. `OverlapBuffer` (256-byte overlap) detects secrets spanning chunk boundaries
 
+Steps 2–5 plus replay protection and injection are the admission pipeline —
+one `admit(Request) -> Result<Request, TokenizerError>` method, unit-testable
+without a Tower stack. `TokenInjectionLayer` is a thin Tower adapter over it.
+
 ### Tower Middleware Stack
 ```rust
-// Rate limiting is conditionally composed (omitted when disabled)
+let admission = TokenAdmission::new(crypto).with_nonce_store(...).with_clock_skew(...);
 ServiceBuilder::new()
-    .layer(RateLimitLayer::new(rate_config))  // optional
-    .layer(TokenInjectionLayer::new(crypto).with_nonce_store(...).with_clock_skew(...))
+    .option_layer(rate_limiter.map(RateLimitLayer::from_limiter))  // optional, keeps concrete types
+    .layer(TokenInjectionLayer::new(admission))
     .layer(DynamicResponseScanLayer::new())   // must come after TokenInjectionLayer
     .service(proxy_service);
 ```
@@ -175,7 +179,8 @@ a concrete body type. See `InjectBodyProcessor` for the pattern:
 | Error handling | `icebreaker-common/src/error.rs` |
 | Processor configs | `icebreaker-common/src/processor.rs` |
 | Cryptographic ops | `icebreaker-crypto/src/sealed_box.rs`, `keypair.rs`, `hmac.rs` |
-| Token injection | `icebreaker-proxy/src/middleware/token_injection.rs` |
+| Token admission pipeline | `icebreaker-proxy/src/admission.rs` |
+| Token injection (Tower adapter) | `icebreaker-proxy/src/middleware/token_injection.rs` |
 | Processor factory | `icebreaker-proxy/src/processor/mod.rs` |
 | Response scanning | `icebreaker-proxy/src/middleware/response_scan.rs`, `body/scanning.rs` |
 | SSRF prevention | `icebreaker-proxy/src/network/ip_filter.rs` |

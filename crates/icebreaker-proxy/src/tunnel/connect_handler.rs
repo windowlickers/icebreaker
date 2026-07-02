@@ -12,8 +12,8 @@ use icebreaker_common::{ClockSkewConfig, ExpirationStatus, Result, TokenPayload,
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 use icebreaker_nonce::{CheckResult, NonceStore};
 
+use crate::admission::TOKEN_HEADER;
 use crate::metrics::record_replay_attempt;
-use crate::middleware::TOKEN_HEADER;
 use crate::network::IpFilter;
 
 /// Configuration for the CONNECT tunnel handler.

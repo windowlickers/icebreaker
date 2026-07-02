@@ -8,9 +8,7 @@ mod token_injection;
 pub use host_validation::{HostValidationConfig, HostValidationLayer, HostValidationService};
 pub use rate_limit::{RateLimitLayer, RateLimitService, RateLimiter};
 pub use response_scan::{
-    DynamicResponseScanLayer, DynamicResponseScanService, ResponseScanLayer, ResponseScanService,
-    ScanPatterns,
+    generate_scan_patterns, DynamicResponseScanLayer, DynamicResponseScanService,
+    ResponseScanLayer, ResponseScanService, ScanPatterns,
 };
-pub use token_injection::{
-    generate_scan_patterns, TokenInjectionLayer, TokenInjectionService, TOKEN_HEADER,
-};
+pub use token_injection::{TokenInjectionLayer, TokenInjectionService};

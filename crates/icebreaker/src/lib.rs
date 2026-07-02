@@ -75,7 +75,7 @@ pub mod prelude {
     // Proxy middleware
     pub use icebreaker_proxy::{
         HostValidationConfig, HostValidationLayer, RateLimitLayer, ResponseScanLayer,
-        SecretScannerConfig, TokenInjectionLayer, TOKEN_HEADER,
+        SecretScannerConfig, TokenAdmission, TokenInjectionLayer, TOKEN_HEADER,
     };
 
     // Processors

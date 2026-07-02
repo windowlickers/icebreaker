@@ -5,6 +5,7 @@
 //!
 //! This crate provides the core proxy functionality:
 //!
+//! - [`admission`]: The token admission pipeline (decrypt, validate, inject)
 //! - [`middleware`]: Tower middleware for token injection, response scanning, etc.
 //! - [`body`]: Body handling utilities for streaming response scanning
 //! - [`processor`]: Request processors for different injection strategies
@@ -12,6 +13,7 @@
 //! - [`tunnel`]: HTTP CONNECT tunneling support
 //! - [`metrics`]: Prometheus metrics recording
 
+pub mod admission;
 pub mod body;
 pub mod metrics;
 pub mod middleware;
@@ -22,11 +24,11 @@ pub mod tls;
 pub mod tunnel;
 
 // Re-exports for convenience
+pub use admission::{TokenAdmission, TOKEN_HEADER};
 pub use body::{OverlapBuffer, ScanningBody, SecretScannerConfig, StreamScanner};
 pub use middleware::{
     generate_scan_patterns, DynamicResponseScanLayer, HostValidationConfig, HostValidationLayer,
     RateLimitLayer, RateLimiter, ResponseScanLayer, ScanPatterns, TokenInjectionLayer,
-    TOKEN_HEADER,
 };
 pub use network::{BlockReason, IpFilter, ValidatingConnector, ValidatingStream};
 pub use processor::{

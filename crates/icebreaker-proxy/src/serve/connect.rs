@@ -104,7 +104,7 @@ pub(crate) fn handle_connect<'a>(
         // fallback is keyed on token *absence* so a present-but-rejected token
         // (e.g. failed auth binding, which also yields ProxyAuthRequired) is not
         // silently downgraded to token-less treatment.
-        let has_token = req.headers().contains_key(crate::middleware::TOKEN_HEADER)
+        let has_token = req.headers().contains_key(crate::admission::TOKEN_HEADER)
             || req
                 .headers()
                 .contains_key(http::header::PROXY_AUTHORIZATION);

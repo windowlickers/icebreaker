@@ -15,6 +15,7 @@ use tracing::Instrument;
 use icebreaker_common::UpstreamScheme;
 use icebreaker_crypto::{ConnectionInfo, TlsConnectionInfo};
 
+use crate::admission::TokenAdmission;
 use crate::metrics::{record_request, record_request_duration, record_request_error};
 use crate::middleware::{DynamicResponseScanLayer, RateLimitLayer, TokenInjectionLayer};
 use crate::tunnel::{is_connect_request, ConnectHandler, TunnelConfig};
@@ -395,14 +396,14 @@ where
     let proxy_service = ProxyService::new(ip_filter, &upstream_roots);
 
     let token_injection = {
-        let mut layer = TokenInjectionLayer::new(crypto)
+        let mut admission = TokenAdmission::new(crypto)
             .with_response_scan(response_scan_enabled)
             .with_clock_skew(clock_skew)
             .with_token_optional(token_optional, host_policy);
         if let Some(store) = nonce_store {
-            layer = layer.with_nonce_store(store);
+            admission = admission.with_nonce_store(store);
         }
-        layer
+        TokenInjectionLayer::new(admission)
     };
     // `option_layer` keeps concrete service types: the stack is
     // `Either<RateLimitService<...>, ...>`, which unifies because both sides
