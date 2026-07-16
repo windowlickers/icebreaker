@@ -34,7 +34,8 @@ fn seal_sigv4_token(crypto: &TokenCrypto, access_key: &str, host: &str) -> Strin
         ProcessorConfig::Sigv4(Sigv4Config::new(access_key)),
     )
     .allowed_host(host)
-    .build();
+    .build()
+    .expect("build test token");
     crypto
         .seal(&payload)
         .expect("seal should succeed")

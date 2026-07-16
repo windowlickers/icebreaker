@@ -253,7 +253,7 @@ fn seal_refreshed_token(
 
     builder = builder.oauth(oauth_metadata);
 
-    let payload = builder.build();
+    let payload = builder.build()?;
 
     let sealed = service
         .crypto()
@@ -365,7 +365,8 @@ mod tests {
             OAuthMetadata::new("test-provider")
                 .with_refresh_token(SecretString::from("my-refresh-token")),
         )
-        .build();
+        .build()
+        .expect("build test token");
 
         let result = extract_refresh_token(&payload);
         assert!(result.is_ok());
@@ -378,7 +379,8 @@ mod tests {
             SecretString::from("access_token"),
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
-        .build();
+        .build()
+        .expect("build test token");
 
         let result = extract_refresh_token(&payload);
         assert!(matches!(result, Err(SsoError::TokenRefreshFailed { .. })));
@@ -391,7 +393,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .oauth(OAuthMetadata::new("test-provider"))
-        .build();
+        .build()
+        .expect("build test token");
 
         let result = extract_refresh_token(&payload);
         assert!(matches!(result, Err(SsoError::TokenRefreshFailed { .. })));
@@ -462,7 +465,8 @@ mod integration_tests {
                 .with_refresh_token(SecretString::from(refresh_token.to_string()))
                 .with_token_type("Bearer".to_string()),
         )
-        .build();
+        .build()
+        .expect("build test token");
 
         let sealed = service
             .crypto()
@@ -590,7 +594,8 @@ mod integration_tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .oauth(OAuthMetadata::new("test-provider"))
-        .build();
+        .build()
+        .expect("build test token");
 
         let sealed = service
             .crypto()

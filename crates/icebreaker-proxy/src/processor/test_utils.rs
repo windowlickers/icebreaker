@@ -23,7 +23,9 @@ use secrecy::SecretString;
 /// ```
 #[must_use]
 pub fn create_test_payload(secret: &str, config: ProcessorConfig) -> TokenPayload {
-    TokenPayload::builder(SecretString::from(secret), config).build()
+    TokenPayload::builder(SecretString::from(secret), config)
+        .build()
+        .expect("build test token")
 }
 
 /// Creates a test payload with the given secret, config, and allowed host.
@@ -38,6 +40,7 @@ pub fn create_test_payload_with_host(
     TokenPayload::builder(SecretString::from(secret), config)
         .allowed_host(allowed_host)
         .build()
+        .expect("build test token")
 }
 
 /// Builder for creating test payloads with more customization.
@@ -75,7 +78,7 @@ impl TestPayloadBuilder {
         for host in self.allowed_hosts {
             builder = builder.allowed_host(host);
         }
-        builder.build()
+        builder.build().expect("build test token")
     }
 }
 

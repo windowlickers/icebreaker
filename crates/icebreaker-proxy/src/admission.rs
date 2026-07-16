@@ -27,9 +27,7 @@ use std::time::Duration;
 
 use http::Request;
 
-use icebreaker_common::{
-    ClockSkewConfig, ReplayProtection, SealedToken, TokenPayload, TokenizerError,
-};
+use icebreaker_common::{ClockSkewConfig, SealedToken, TokenPayload, TokenizerError};
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 use icebreaker_nonce::{CheckResult, NonceStore};
 
@@ -43,6 +41,32 @@ use crate::processor::{create_processor, validate_processor_config};
 
 /// The header name for the sealed token.
 pub const TOKEN_HEADER: &str = "X-Tokenizer-Token";
+
+/// Derives the nonce TTL for a replay-protected token.
+///
+/// Uses the explicit `nonce_ttl_seconds` when set, otherwise the time until the
+/// token expiry plus the clock-skew tolerance so the nonce outlives the token.
+/// Callers must reject replay-protected tokens without an expiry before calling
+/// this; the already-expired branch is defensive, since expiry is validated at
+/// unseal before replay enforcement runs.
+pub(crate) fn ttl_from_expiry(
+    explicit_ttl_seconds: Option<u64>,
+    expires_at: u64,
+    clock_skew: &ClockSkewConfig,
+) -> Result<Duration, TokenizerError> {
+    if let Some(secs) = explicit_ttl_seconds {
+        return Ok(Duration::from_secs(secs));
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let effective_expiry = expires_at + clock_skew.tolerance_seconds;
+    match effective_expiry.checked_sub(now) {
+        Some(secs) if secs > 0 => Ok(Duration::from_secs(secs)),
+        _ => Err(TokenizerError::TokenExpired),
+    }
+}
 
 /// Extracts the destination authority (`host[:port]`) from a request's
 /// absolute-form URI or its `Host` header, for static host-policy checks in
@@ -297,7 +321,16 @@ impl TokenAdmission {
             return Err(TokenizerError::ReplayProtectionUnavailable);
         };
 
-        let ttl = self.nonce_ttl(replay, payload.expires_at);
+        let Some(expires_at) = payload.expires_at else {
+            record_token_validation(TokenValidationResult::ReplayProtectionUnavailable);
+            tracing::warn!(
+                nonce = %replay.nonce,
+                "rejecting token with replay protection but no expiry"
+            );
+            return Err(TokenizerError::ReplayProtectionRequiresExpiry);
+        };
+
+        let ttl = ttl_from_expiry(replay.nonce_ttl_seconds, expires_at, &self.clock_skew)?;
         match store
             .check_and_record(&replay.nonce, replay.max_uses, ttl)
             .await
@@ -336,32 +369,6 @@ impl TokenAdmission {
                 Err(TokenizerError::NonceStoreError(e.to_string()))
             }
         }
-    }
-
-    /// Calculates the nonce TTL: the explicit `nonce_ttl_seconds`, or the time
-    /// until token expiration (plus the clock skew tolerance, so the nonce
-    /// isn't purged before the token becomes truly expired), or 24 hours.
-    fn nonce_ttl(&self, replay: &ReplayProtection, expires_at: Option<u64>) -> Duration {
-        replay
-            .nonce_ttl_seconds
-            .map(Duration::from_secs)
-            .or_else(|| {
-                expires_at.and_then(|expires_at| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    // Add clock skew tolerance to ensure nonce lives as long as
-                    // the token could potentially be valid
-                    let effective_expiry = expires_at + self.clock_skew.tolerance_seconds;
-                    if effective_expiry > now {
-                        Some(Duration::from_secs(effective_expiry - now))
-                    } else {
-                        None
-                    }
-                })
-            })
-            .unwrap_or(Duration::from_secs(86400)) // 24 hours default
     }
 
     /// Records success metrics and prepares the admitted request: strips the
@@ -435,6 +442,16 @@ mod tests {
         Arc::new(TokenCrypto::with_keypair(Keypair::generate(), "test-key"))
     }
 
+    /// A valid near-future expiry, within the default max-future window so the
+    /// sealed token passes expiration validation.
+    fn future_expiry() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs()
+            + 120
+    }
+
     fn bearer_payload(secret: &str, host: &str) -> TokenPayload {
         TokenPayload::builder(
             SecretString::from(secret),
@@ -442,6 +459,7 @@ mod tests {
         )
         .allowed_host(host)
         .build()
+        .expect("build test token")
     }
 
     fn seal_header(crypto: &TokenCrypto, payload: &TokenPayload) -> String {
@@ -649,7 +667,8 @@ mod tests {
             create_api_key_config(PROXY_AUTHORIZATION_HEADER, api_key, &hmac_key)
                 .expect("should create config"),
         ))
-        .build();
+        .build()
+        .expect("build test token");
         let token_header = seal_header(&crypto, &payload);
         let admission = TokenAdmission::new(crypto);
 
@@ -682,7 +701,8 @@ mod tests {
             create_api_key_config(PROXY_AUTHORIZATION_HEADER, "correct-key", &hmac_key)
                 .expect("should create config"),
         ))
-        .build();
+        .build()
+        .expect("build test token");
         let token_header = seal_header(&crypto, &payload);
         let admission = TokenAdmission::new(crypto);
 
@@ -718,7 +738,8 @@ mod tests {
             create_api_key_config(PROXY_AUTHORIZATION_HEADER, "my-key", &hmac_key)
                 .expect("should create config"),
         ))
-        .build();
+        .build()
+        .expect("build test token");
         let token_header = seal_header(&crypto, &payload);
         let admission = TokenAdmission::new(crypto);
 
@@ -838,7 +859,8 @@ mod tests {
         )
         .allowed_host("forge.example.com")
         .upstream_scheme(UpstreamScheme::Http)
-        .build();
+        .build()
+        .expect("build test token");
         let token_header = seal_header(&crypto, &payload);
         let admission = TokenAdmission::new(crypto);
 
@@ -928,7 +950,8 @@ mod tests {
         )
         .allowed_host("api.example.com")
         .allowed_method("GET")
-        .build();
+        .build()
+        .expect("build test token");
         let token_header = seal_header(&crypto, &payload);
         let admission = TokenAdmission::new(crypto);
 
@@ -957,7 +980,8 @@ mod tests {
         )
         .allowed_host("api.example.com")
         .allowed_path("/api/v1/users")
-        .build();
+        .build()
+        .expect("build test token");
         let token_header = seal_header(&crypto, &payload);
         let admission = TokenAdmission::new(crypto);
 
@@ -1020,8 +1044,10 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .allowed_host("api.example.com")
+            .expires_at(future_expiry())
             .replay_protection(ReplayProtection::single_use("unique-nonce-123"))
-            .build();
+            .build()
+            .expect("build test token");
             let token_header = seal_header(&crypto, &payload);
             let admission = TokenAdmission::new(crypto).with_nonce_store(nonce_store());
 
@@ -1046,8 +1072,10 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .allowed_host("api.example.com")
+            .expires_at(future_expiry())
             .replay_protection(ReplayProtection::with_max_uses("multi-use-nonce", 3))
-            .build();
+            .build()
+            .expect("build test token");
             let token_header = seal_header(&crypto, &payload);
             let admission = TokenAdmission::new(crypto).with_nonce_store(nonce_store());
 
@@ -1074,7 +1102,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .allowed_host("api.example.com")
-            .build(); // No replay_protection
+            .build()
+            .expect("build test token"); // No replay_protection
             let token_header = seal_header(&crypto, &payload);
             let admission = TokenAdmission::new(crypto).with_nonce_store(nonce_store());
 
@@ -1097,8 +1126,10 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .allowed_host("api.example.com")
+            .expires_at(future_expiry())
             .replay_protection(ReplayProtection::single_use("nonce"))
-            .build();
+            .build()
+            .expect("build test token");
             let token_header = seal_header(&crypto, &payload);
 
             // Admission WITHOUT nonce store — the proxy should fail closed so
@@ -1114,6 +1145,32 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn test_replay_protection_without_expiry_is_rejected() {
+            let crypto = test_crypto();
+            // Simulate a token minted outside the builder (whose invariant would
+            // refuse this): replay protection with no expiry. The proxy must
+            // fail closed rather than fall back to an unbounded nonce TTL.
+            let mut payload = TokenPayload::builder(
+                SecretString::from("my-secret"),
+                ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+            )
+            .allowed_host("api.example.com")
+            .expires_at(future_expiry())
+            .replay_protection(ReplayProtection::single_use("no-expiry-nonce"))
+            .build()
+            .expect("build test token");
+            payload.expires_at = None;
+            let token_header = seal_header(&crypto, &payload);
+            let admission = TokenAdmission::new(crypto).with_nonce_store(nonce_store());
+
+            let result = admission.admit(replay_request(&token_header)).await;
+            assert!(
+                matches!(result, Err(TokenizerError::ReplayProtectionRequiresExpiry)),
+                "replay-protected token with no expiry must be rejected, got {result:?}"
+            );
+        }
+
+        #[tokio::test]
         async fn test_different_nonces_are_independent() {
             let crypto = test_crypto();
             let admission = TokenAdmission::new(crypto.clone()).with_nonce_store(nonce_store());
@@ -1125,8 +1182,10 @@ mod tests {
                     ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
                 )
                 .allowed_host("api.example.com")
+                .expires_at(future_expiry())
                 .replay_protection(ReplayProtection::single_use(nonce))
-                .build();
+                .build()
+                .expect("build test token");
                 let token_header = seal_header(&crypto, &payload);
 
                 let result = admission.admit(replay_request(&token_header)).await;

@@ -678,9 +678,21 @@ impl TokenPayloadBuilder {
     }
 
     /// Builds the `TokenPayload`.
-    #[must_use]
-    pub fn build(self) -> TokenPayload {
-        TokenPayload {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`TokenizerError::ReplayProtectionRequiresExpiry`] if the token
+    /// carries replay protection but no expiry: its nonce TTL could then only
+    /// be bounded by store eviction, letting a never-expiring token replay once
+    /// the nonce is purged.
+    ///
+    /// [`TokenizerError::ReplayProtectionRequiresExpiry`]: crate::error::TokenizerError::ReplayProtectionRequiresExpiry
+    pub fn build(self) -> Result<TokenPayload> {
+        if self.replay_protection.is_some() && self.expires_at.is_none() {
+            return Err(crate::error::TokenizerError::ReplayProtectionRequiresExpiry);
+        }
+
+        Ok(TokenPayload {
             secret: self.secret,
             processor: self.processor,
             auth: self.auth,
@@ -696,7 +708,7 @@ impl TokenPayloadBuilder {
             replay_protection: self.replay_protection,
             cached_host_regex: OnceLock::new(),
             cached_path_regex: OnceLock::new(),
-        }
+        })
     }
 }
 
@@ -987,7 +999,8 @@ mod tests {
             SecretString::from("super-secret"),
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
-        .build();
+        .build()
+        .expect("token should build");
 
         let debug = format!("{payload:?}");
         assert!(!debug.contains("super-secret"));
@@ -1002,7 +1015,8 @@ mod tests {
         )
         .allowed_host("api.example.com")
         .allowed_host("api.test.com")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_host("api.example.com").is_ok());
         assert!(payload.validate_host("api.test.com").is_ok());
@@ -1016,7 +1030,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("forge.example.com")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_host("forge.example.com").is_ok());
         assert!(payload.validate_host("forge.example.com:443").is_ok());
@@ -1031,7 +1046,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("forge.example.com:3000")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_host("forge.example.com:3000").is_ok());
         assert!(payload.validate_host("forge.example.com:8080").is_err());
@@ -1051,7 +1067,8 @@ mod tests {
             "forge.example.com:3000".to_string(),
             "forge.example.com".to_string(),
         ])
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_host("forge.example.com:3000").is_ok());
         assert!(payload.validate_host("forge.example.com:8080").is_ok());
@@ -1066,7 +1083,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host_pattern(r".*\.example\.com$")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_host("api.example.com:8080").is_ok());
         assert!(payload.validate_host("api.example.com").is_ok());
@@ -1177,7 +1195,8 @@ mod tests {
                     ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
                 )
                 .allowed_hosts(allowlist)
-                .build();
+                .build()
+        .expect("token should build");
                 let _ = payload.validate_host(&input);
             }
 
@@ -1191,7 +1210,8 @@ mod tests {
                     ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
                 )
                 .allowed_host(host.clone())
-                .build();
+                .build()
+        .expect("token should build");
 
                 let with_port = format!("{host}:{port}");
                 prop_assert!(payload.validate_host(&host).is_ok());
@@ -1213,7 +1233,8 @@ mod tests {
                     ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
                 )
                 .allowed_host(allowed_entry.clone())
-                .build();
+                .build()
+        .expect("token should build");
 
                 prop_assert!(payload.validate_host(&allowed_entry).is_ok());
                 prop_assert!(payload.validate_host(&other_entry).is_err());
@@ -1271,7 +1292,8 @@ mod tests {
         )
         .allowed_host("forge.example.com")
         .upstream_scheme(UpstreamScheme::Http)
-        .build();
+        .build()
+        .expect("token should build");
 
         let json = serde_json::to_string(&payload).expect("serialize payload");
         let decoded: TokenPayload = serde_json::from_str(&json).expect("deserialize payload");
@@ -1298,7 +1320,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host_pattern(r".*\.example\.com$")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_host("api.example.com").is_ok());
         assert!(payload.validate_host("test.example.com").is_ok());
@@ -1313,7 +1336,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host_pattern(r"api\.example\.com")
-        .build();
+        .build()
+        .expect("token should build");
 
         // Exact match should work
         assert!(payload.validate_host("api.example.com").is_ok());
@@ -1333,7 +1357,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host_pattern(r"^.*\.example\.com$")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_host("api.example.com").is_ok());
         assert!(payload.validate_host("deep.sub.example.com").is_ok());
@@ -1355,7 +1380,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .expires_at(now + 60)
-        .build();
+        .build()
+        .expect("token should build");
         assert!(payload.check_expiration(&clock_skew).is_valid());
 
         // Expired (past)
@@ -1364,7 +1390,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .expires_at(0)
-        .build();
+        .build()
+        .expect("token should build");
         assert!(payload.check_expiration(&clock_skew).is_expired());
 
         // No expiration
@@ -1372,7 +1399,8 @@ mod tests {
             SecretString::from("secret"),
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
-        .build();
+        .build()
+        .expect("token should build");
         let status = payload.check_expiration(&clock_skew);
         assert!(matches!(status, ExpirationStatus::NoExpiration));
 
@@ -1382,7 +1410,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .expires_at(now + 3600) // 1 hour, beyond default 300s max_future
-        .build();
+        .build()
+        .expect("token should build");
         assert!(payload.check_expiration(&clock_skew).is_future_dated());
     }
 
@@ -1450,8 +1479,10 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("api.example.com")
+        .expires_at(9_999_999_999)
         .replay_protection(super::ReplayProtection::single_use("unique-nonce"))
-        .build();
+        .build()
+        .expect("replay token with expiry should build");
 
         assert!(payload.replay_protection.is_some());
         let replay = payload.replay_protection.as_ref().expect("should exist");
@@ -1466,9 +1497,26 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("api.example.com")
-        .build();
+        .build()
+        .expect("token without replay protection should build");
 
         assert!(payload.replay_protection.is_none());
+    }
+
+    #[test]
+    fn test_build_rejects_replay_protection_without_expiry() {
+        let result = TokenPayload::builder(
+            SecretString::from("secret"),
+            ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
+        )
+        .allowed_host("api.example.com")
+        .replay_protection(super::ReplayProtection::single_use("nonce"))
+        .build();
+
+        assert!(matches!(
+            result,
+            Err(crate::error::TokenizerError::ReplayProtectionRequiresExpiry)
+        ));
     }
 
     #[test]
@@ -1478,8 +1526,10 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("api.example.com")
+        .expires_at(9_999_999_999)
         .replay_protection(super::ReplayProtection::with_max_uses("nonce", 5).with_ttl(3600))
-        .build();
+        .build()
+        .expect("replay token with expiry should build");
 
         let json = serde_json::to_string(&payload).expect("should serialize");
         assert!(json.contains("replay_protection"));
@@ -1508,7 +1558,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host_pattern(&huge_pattern)
-        .build();
+        .build()
+        .expect("token should build");
 
         let result = payload.validate_host("test.com");
         assert!(matches!(
@@ -1525,7 +1576,8 @@ mod tests {
         )
         .allowed_method("GET")
         .allowed_method("POST")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_method("GET").is_ok());
         assert!(payload.validate_method("POST").is_ok());
@@ -1540,7 +1592,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_method("GET")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_method("get").is_ok());
         assert!(payload.validate_method("Get").is_ok());
@@ -1553,7 +1606,8 @@ mod tests {
             SecretString::from("secret"),
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_method("GET").is_ok());
         assert!(payload.validate_method("POST").is_ok());
@@ -1568,7 +1622,8 @@ mod tests {
         )
         .allowed_path("/api/v1/users")
         .allowed_path("/api/v1/items")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_path("/api/v1/users").is_ok());
         assert!(payload.validate_path("/api/v1/items").is_ok());
@@ -1583,7 +1638,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_path_pattern(r"/api/v[12]/.*")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_path("/api/v1/users").is_ok());
         assert!(payload.validate_path("/api/v2/items").is_ok());
@@ -1597,7 +1653,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_path_pattern(r"/api/v1/users")
-        .build();
+        .build()
+        .expect("token should build");
 
         // Exact match should work
         assert!(payload.validate_path("/api/v1/users").is_ok());
@@ -1612,7 +1669,8 @@ mod tests {
             SecretString::from("secret"),
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_path("/any/path").is_ok());
         assert!(payload.validate_path("/").is_ok());
@@ -1626,7 +1684,8 @@ mod tests {
         )
         .allowed_path("/health")
         .allowed_path_pattern(r"/api/.*")
-        .build();
+        .build()
+        .expect("token should build");
 
         // Exact match works
         assert!(payload.validate_path("/health").is_ok());
@@ -1644,7 +1703,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_path_pattern(&huge_pattern)
-        .build();
+        .build()
+        .expect("token should build");
 
         let result = payload.validate_path("/test");
         assert!(matches!(
@@ -1682,7 +1742,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host_pattern(r".*\.example\.com")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.cached_host_regex.get().is_none());
         assert!(payload.validate_host("api.example.com").is_ok());
@@ -1696,7 +1757,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_path_pattern(r"/api/.*")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.cached_path_regex.get().is_none());
         assert!(payload.validate_path("/api/v1/users").is_ok());
@@ -1710,7 +1772,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host_pattern(r"[invalid")
-        .build();
+        .build()
+        .expect("token should build");
 
         assert!(payload.validate_host("any.com").is_err());
         let cached = payload.cached_host_regex.get();
@@ -1741,7 +1804,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now - 10)
-            .build();
+            .build()
+            .expect("token should build");
 
             let status = payload.check_expiration(&config);
             assert_eq!(status, ExpirationStatus::Valid);
@@ -1759,7 +1823,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now - 60)
-            .build();
+            .build()
+            .expect("token should build");
 
             let status = payload.check_expiration(&config);
             assert_eq!(status, ExpirationStatus::Expired);
@@ -1778,7 +1843,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now + 3600)
-            .build();
+            .build()
+            .expect("token should build");
 
             let status = payload.check_expiration(&config);
             assert!(status.is_future_dated());
@@ -1797,7 +1863,8 @@ mod tests {
                 SecretString::from("secret"),
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
-            .build();
+            .build()
+            .expect("token should build");
 
             let status = payload.check_expiration(&config);
             assert_eq!(status, ExpirationStatus::NoExpiration);
@@ -1815,7 +1882,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now - 1)
-            .build();
+            .build()
+            .expect("token should build");
 
             let status = payload.check_expiration(&config);
             assert_eq!(status, ExpirationStatus::Expired);
@@ -1832,7 +1900,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now - 200)
-            .build();
+            .build()
+            .expect("token should build");
 
             let status = payload.check_expiration(&config);
             assert_eq!(status, ExpirationStatus::Valid);
@@ -1849,7 +1918,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now + 86400 * 365) // 1 year
-            .build();
+            .build()
+            .expect("token should build");
 
             let status = payload.check_expiration(&config);
             assert_eq!(status, ExpirationStatus::Valid);

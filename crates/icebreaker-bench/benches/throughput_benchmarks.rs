@@ -394,7 +394,8 @@ fn bench_sigv4_pipeline(c: &mut Criterion) {
         ProcessorConfig::Sigv4(sigv4_config.clone()),
     )
     .allowed_host("s3.amazonaws.com")
-    .build();
+    .build()
+    .expect("build bench token");
 
     let sealed = crypto.seal(&payload).unwrap();
     let processor = create_processor(&ProcessorConfig::Sigv4(sigv4_config));
@@ -607,7 +608,8 @@ fn bench_processor_overhead_comparison(c: &mut Criterion) {
         ProcessorConfig::Sigv4(sigv4_config.clone()),
     )
     .allowed_host("s3.amazonaws.com")
-    .build();
+    .build()
+    .expect("build bench token");
     let sigv4_sealed = crypto.seal(&sigv4_payload).unwrap();
     let sigv4_processor = create_processor(&ProcessorConfig::Sigv4(sigv4_config));
 

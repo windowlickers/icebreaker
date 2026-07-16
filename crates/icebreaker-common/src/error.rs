@@ -126,6 +126,17 @@ pub enum TokenizerError {
     #[error("replay protection unavailable: token requires nonce tracking but it is disabled")]
     ReplayProtectionUnavailable,
 
+    /// Token carries replay protection but no expiry, so its nonce TTL cannot be
+    /// bounded by the token lifetime.
+    ///
+    /// Sealing or admitting such a token is refused: once the nonce is evicted
+    /// from the store a token that never expires would become replayable again.
+    /// Single-use and max-use tokens must set `expires_at`.
+    #[error(
+        "replay protection requires an expiry: single-use and max-use tokens must set expires_at"
+    )]
+    ReplayProtectionRequiresExpiry,
+
     /// Response uses an unsupported Content-Encoding that cannot be scanned.
     #[error("unsupported content encoding: {encoding}")]
     UnsupportedContentEncoding {
@@ -167,6 +178,7 @@ impl TokenizerError {
             Self::TokenReplayDetected { .. } => "token already used",
             Self::NonceStoreError(_) => "internal error",
             Self::ReplayProtectionUnavailable => "token rejected",
+            Self::ReplayProtectionRequiresExpiry => "token rejected",
             Self::UnsupportedContentEncoding { .. } => "unsupported response encoding",
             Self::InternalError(_) => "internal error",
         }
@@ -202,6 +214,7 @@ impl TokenizerError {
                 | Self::ProxyAuthRequired { .. }
                 | Self::TokenReplayDetected { .. }
                 | Self::ReplayProtectionUnavailable
+                | Self::ReplayProtectionRequiresExpiry
         )
     }
 
@@ -228,7 +241,8 @@ impl TokenizerError {
             Self::TokenExpired
             | Self::DecryptionError(_)
             | Self::TokenReplayDetected { .. }
-            | Self::ReplayProtectionUnavailable => 401,
+            | Self::ReplayProtectionUnavailable
+            | Self::ReplayProtectionRequiresExpiry => 401,
             Self::CryptoError(_)
             | Self::OAuthRefreshError(_)
             | Self::SigningError(_)
@@ -260,6 +274,7 @@ impl TokenizerError {
             Self::DecryptionError(_) => "decryption_failed",
             Self::TokenReplayDetected { .. } => "replay_detected",
             Self::ReplayProtectionUnavailable => "replay_unavailable",
+            Self::ReplayProtectionRequiresExpiry => "replay_requires_expiry",
             Self::CryptoError(_) => "crypto",
             Self::OAuthRefreshError(_) => "oauth",
             Self::SigningError(_) => "signing",
@@ -284,6 +299,7 @@ impl TokenizerError {
                 | Self::ProxyAuthRequired { .. }
                 | Self::TokenReplayDetected { .. }
                 | Self::ReplayProtectionUnavailable
+                | Self::ReplayProtectionRequiresExpiry
                 | Self::UnsupportedContentEncoding { .. }
         )
     }

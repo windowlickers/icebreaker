@@ -121,7 +121,8 @@ fn profile_sigv4_processing() {
         sigv4_config,
     )
     .allowed_host("s3.amazonaws.com")
-    .build();
+    .build()
+    .expect("build bench token");
 
     profile("sigv4_s3_get", || {
         let request = http::Request::builder()
@@ -162,7 +163,8 @@ fn profile_multi_processor_dispatch() {
         multi_config,
     )
     .allowed_host("api.example.com")
-    .build();
+    .build()
+    .expect("build bench token");
 
     profile("multi_3_processors", || {
         let request = http::Request::builder()

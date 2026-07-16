@@ -12,7 +12,7 @@ use icebreaker_common::{ClockSkewConfig, ExpirationStatus, Result, TokenPayload,
 use icebreaker_crypto::{validate_auth, TlsConnectionInfo, TokenCrypto};
 use icebreaker_nonce::{CheckResult, NonceStore};
 
-use crate::admission::TOKEN_HEADER;
+use crate::admission::{ttl_from_expiry, TOKEN_HEADER};
 use crate::metrics::record_replay_attempt;
 use crate::network::IpFilter;
 
@@ -204,22 +204,20 @@ impl ConnectHandler {
             return Err(TokenizerError::ReplayProtectionUnavailable);
         };
 
-        // TTL: explicit nonce_ttl_seconds, else derive from the token expiry (plus
-        // clock-skew tolerance so the nonce outlives the token), else 24 hours.
-        let ttl = replay
-            .nonce_ttl_seconds
-            .map(Duration::from_secs)
-            .or_else(|| {
-                payload.expires_at.and_then(|expires_at| {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let effective_expiry = expires_at + self.clock_skew.tolerance_seconds;
-                    (effective_expiry > now).then(|| Duration::from_secs(effective_expiry - now))
-                })
-            })
-            .unwrap_or(Duration::from_secs(86400));
+        // Replay protection requires an expiry so the nonce TTL is bounded by the
+        // token lifetime. Without one the nonce could be evicted while the token
+        // lives on, letting it replay.
+        let Some(expires_at) = payload.expires_at else {
+            tracing::warn!(
+                nonce = %replay.nonce,
+                "rejecting CONNECT token with replay protection but no expiry"
+            );
+            return Err(TokenizerError::ReplayProtectionRequiresExpiry);
+        };
+
+        // TTL: explicit nonce_ttl_seconds, else derived from the token expiry plus
+        // clock-skew tolerance so the nonce outlives the token.
+        let ttl = ttl_from_expiry(replay.nonce_ttl_seconds, expires_at, &self.clock_skew)?;
 
         match store
             .check_and_record(&replay.nonce, replay.max_uses, ttl)
@@ -412,7 +410,7 @@ mod tests {
         for host in allowed_hosts {
             builder = builder.allowed_host(*host);
         }
-        let payload = builder.build();
+        let payload = builder.build().expect("build test token");
         connect_request_for(handler, &payload, target_authority)
     }
 
@@ -438,14 +436,26 @@ mod tests {
             .with_nonce_store(Some(Arc::new(icebreaker_nonce::InMemoryNonceStore::new())))
     }
 
+    /// A valid near-future expiry, within the default max-future window so the
+    /// sealed token passes expiration validation.
+    fn future_expiry() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before unix epoch")
+            .as_secs()
+            + 120
+    }
+
     fn replay_payload(nonce: &str, host: &str) -> TokenPayload {
         TokenPayload::builder(
             SecretString::from("secret"),
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host(host)
+        .expires_at(future_expiry())
         .replay_protection(icebreaker_common::ReplayProtection::single_use(nonce))
         .build()
+        .expect("build test token")
     }
 
     #[test]
@@ -636,6 +646,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_enforce_replay_rejects_without_expiry() {
+        // A replay-protected token with no expiry (as an external minter could
+        // produce, bypassing the builder invariant) is rejected: its nonce TTL
+        // could otherwise only be bounded by store eviction.
+        let handler = handler_with_nonce_store();
+        let mut payload = replay_payload("nonce-no-expiry", "api.example.com");
+        payload.expires_at = None;
+        let err = handler
+            .enforce_replay(&payload)
+            .await
+            .expect_err("must reject replay protection without expiry");
+        assert!(
+            matches!(err, TokenizerError::ReplayProtectionRequiresExpiry),
+            "expected ReplayProtectionRequiresExpiry, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_enforce_replay_noop_without_protection() {
         // A token with no replay protection is unaffected, with or without a store.
         let handler = handler_with_nonce_store();
@@ -644,7 +672,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("api.example.com")
-        .build();
+        .build()
+        .expect("build test token");
         handler
             .enforce_replay(&payload)
             .await
@@ -663,7 +692,8 @@ mod tests {
         )
         .allowed_host("api.example.com")
         .auth(AuthConfig::MutualTls(MutualTlsConfig::new("fp-trusted")))
-        .build();
+        .build()
+        .expect("build test token");
         let request = connect_request_for(&handler, &payload, "api.example.com:443");
 
         // No client certificate: rejected.

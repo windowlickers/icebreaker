@@ -200,7 +200,8 @@ mod tests {
             ProcessorConfig::OAuth(OAuthConfig::default()),
         )
         .oauth(oauth_metadata)
-        .build();
+        .build()
+        .expect("build test token");
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -232,7 +233,8 @@ mod tests {
             ProcessorConfig::OAuth(OAuthConfig::default()),
         )
         .oauth(oauth_metadata)
-        .build();
+        .build()
+        .expect("build test token");
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -284,7 +286,8 @@ mod tests {
             ProcessorConfig::OAuth(OAuthConfig::default()),
         )
         .oauth(oauth_metadata)
-        .build();
+        .build()
+        .expect("build test token");
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -309,7 +312,8 @@ mod tests {
             ProcessorConfig::OAuth(OAuthConfig::default()),
         )
         .oauth(oauth_metadata)
-        .build();
+        .build()
+        .expect("build test token");
 
         let request = Request::builder()
             .uri("https://api.example.com/data")
@@ -337,7 +341,8 @@ mod tests {
             ProcessorConfig::OAuth(OAuthConfig::default()),
         )
         .oauth(oauth_metadata)
-        .build();
+        .build()
+        .expect("build test token");
 
         let request = Request::builder()
             .uri("https://api.example.com/data")

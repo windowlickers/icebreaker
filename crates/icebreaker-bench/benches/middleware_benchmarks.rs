@@ -220,7 +220,8 @@ fn bench_token_payload_host_validation(c: &mut Criterion) {
         )),
     )
     .allowed_host("api.example.com")
-    .build();
+    .build()
+    .expect("build bench token");
 
     let payload_multiple = icebreaker_common::TokenPayload::builder(
         secrecy::SecretString::from("secret"),
@@ -232,7 +233,8 @@ fn bench_token_payload_host_validation(c: &mut Criterion) {
     .allowed_host("api.test.com")
     .allowed_host("api.staging.com")
     .allowed_host("api.production.com")
-    .build();
+    .build()
+    .expect("build bench token");
 
     let payload_pattern = icebreaker_common::TokenPayload::builder(
         secrecy::SecretString::from("secret"),
@@ -241,7 +243,8 @@ fn bench_token_payload_host_validation(c: &mut Criterion) {
         )),
     )
     .allowed_host_pattern(r".*\.example\.com$")
-    .build();
+    .build()
+    .expect("build bench token");
 
     let mut group = c.benchmark_group("token_payload_host_validation");
 
@@ -275,7 +278,8 @@ fn bench_token_payload_method_validation(c: &mut Criterion) {
             "Authorization",
         )),
     )
-    .build();
+    .build()
+    .expect("build bench token");
 
     let payload_single = icebreaker_common::TokenPayload::builder(
         secrecy::SecretString::from("secret"),
@@ -284,7 +288,8 @@ fn bench_token_payload_method_validation(c: &mut Criterion) {
         )),
     )
     .allowed_method("GET")
-    .build();
+    .build()
+    .expect("build bench token");
 
     let payload_multiple = icebreaker_common::TokenPayload::builder(
         secrecy::SecretString::from("secret"),
@@ -296,7 +301,8 @@ fn bench_token_payload_method_validation(c: &mut Criterion) {
     .allowed_method("POST")
     .allowed_method("PUT")
     .allowed_method("DELETE")
-    .build();
+    .build()
+    .expect("build bench token");
 
     let mut group = c.benchmark_group("token_payload_method_validation");
 
@@ -330,7 +336,8 @@ fn bench_token_payload_path_validation(c: &mut Criterion) {
             "Authorization",
         )),
     )
-    .build();
+    .build()
+    .expect("build bench token");
 
     let payload_exact = icebreaker_common::TokenPayload::builder(
         secrecy::SecretString::from("secret"),
@@ -341,7 +348,8 @@ fn bench_token_payload_path_validation(c: &mut Criterion) {
     .allowed_path("/api/v1/users")
     .allowed_path("/api/v1/items")
     .allowed_path("/api/v1/orders")
-    .build();
+    .build()
+    .expect("build bench token");
 
     let payload_pattern = icebreaker_common::TokenPayload::builder(
         secrecy::SecretString::from("secret"),
@@ -350,7 +358,8 @@ fn bench_token_payload_path_validation(c: &mut Criterion) {
         )),
     )
     .allowed_path_pattern(r"/api/v[12]/.*")
-    .build();
+    .build()
+    .expect("build bench token");
 
     let payload_combined = icebreaker_common::TokenPayload::builder(
         secrecy::SecretString::from("secret"),
@@ -361,7 +370,8 @@ fn bench_token_payload_path_validation(c: &mut Criterion) {
     .allowed_path("/health")
     .allowed_path("/ready")
     .allowed_path_pattern(r"/api/v[12]/.*")
-    .build();
+    .build()
+    .expect("build bench token");
 
     let mut group = c.benchmark_group("token_payload_path_validation");
 

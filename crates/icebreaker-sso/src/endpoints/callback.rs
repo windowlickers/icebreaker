@@ -258,7 +258,7 @@ fn seal_oauth_token(
 
     builder = builder.oauth(oauth_metadata);
 
-    let payload = builder.build();
+    let payload = builder.build()?;
 
     // Seal the token
     let sealed = service

@@ -226,10 +226,10 @@ icebreaker seal --secret "$AWS_SECRET_ACCESS_KEY" --public-key <KEY> \
 | `--allowed-path-pattern` | Regex pattern for paths (auto-anchored, 10KB size limit) |
 | `--upstream-scheme` | `http` or `https`. Scheme used when the inbound request URI lacks one (origin-form). Defaults to `https`. Set to `http` for plaintext upstreams. |
 | `--sigv4-access-key` | AWS access key ID for SigV4 (S3) re-signing. Builds a `Sigv4` processor; the `--secret` is used as the AWS secret key. Conflicts with `--processor-json`; ignores `--header`/`--prefix`. Region/service are derived from the request. |
-| `--single-use` | Make token single-use (enables replay protection) |
-| `--max-uses` | Max number of uses for the token |
+| `--single-use` | Make token single-use (enables replay protection; requires `--expires-in`) |
+| `--max-uses` | Max number of uses for the token (enables replay protection; requires `--expires-in`) |
 | `--nonce` / `--nonce-ttl` | Custom nonce and TTL for replay protection |
-| `--expires-in` | Token expiration in seconds from now |
+| `--expires-in` | Token expiration in seconds from now. Required with `--single-use`/`--max-uses`, since the nonce TTL is derived from the token expiry. |
 | `--processor-json` | Advanced JSON processor config (overrides `--header`/`--prefix`, enables Multi) |
 
 ## Environment Variables
@@ -256,7 +256,6 @@ icebreaker seal --secret "$AWS_SECRET_ACCESS_KEY" --public-key <KEY> \
 | `ICEBREAKER_REPLAY_DETECTION` | `true` | Enable replay detection (nonce tracking). When disabled, tokens carrying replay protection are rejected (fail-closed) rather than silently allowed to replay. |
 | `ICEBREAKER_REPLAY_BACKEND` | `memory` | Replay backend: `memory` or `redis` |
 | `ICEBREAKER_REPLAY_REDIS_URL` | - | Redis URL (when backend=redis) |
-| `ICEBREAKER_NONCE_TTL` | `86400` | Default nonce TTL in seconds |
 | `ICEBREAKER_CLOCK_SKEW_TOLERANCE` | `30` | Clock skew tolerance (seconds) for token expiration |
 | `ICEBREAKER_MAX_FUTURE_TOKEN` | `300` | Max seconds token expiration can be in future |
 | `ICEBREAKER_REQUIRE_EXPIRATION` | `false` | Require tokens to have expiration time |

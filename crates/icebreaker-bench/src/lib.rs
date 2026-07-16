@@ -26,6 +26,7 @@ pub fn create_test_payload(secret_size: usize) -> TokenPayload {
     )
     .allowed_host("api.example.com")
     .build()
+    .expect("build bench token")
 }
 
 /// Creates a test token payload with a specific secret value.
@@ -36,6 +37,7 @@ pub fn create_test_payload_with_secret(secret: &str) -> TokenPayload {
     )
     .allowed_host("api.example.com")
     .build()
+    .expect("build bench token")
 }
 
 /// Generates random bytes for benchmarking.
@@ -73,6 +75,7 @@ pub fn create_constrained_payload(secret: &str) -> TokenPayload {
     .allowed_path("/api/v1/orders")
     .allowed_path_pattern(r"/api/v[12]/.*")
     .build()
+    .expect("build bench token")
 }
 
 /// Payload sizes for benchmarking.

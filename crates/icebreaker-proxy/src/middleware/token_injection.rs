@@ -138,7 +138,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("api.example.com")
-        .build();
+        .build()
+        .expect("build test token");
 
         // Seal the token
         let sealed_token = crypto.seal(&payload).expect("should seal");

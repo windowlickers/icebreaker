@@ -217,10 +217,6 @@ struct ServeArgs {
     #[arg(long, env = "ICEBREAKER_REPLAY_REDIS_URL")]
     replay_redis_url: Option<String>,
 
-    /// Default nonce TTL in seconds (for nonces without explicit TTL)
-    #[arg(long, default_value = "86400", env = "ICEBREAKER_NONCE_TTL")]
-    nonce_ttl: u64,
-
     /// Clock skew tolerance in seconds for token expiration validation.
     /// Tokens that expired within this window are still considered valid.
     #[arg(long, default_value = "30", env = "ICEBREAKER_CLOCK_SKEW_TOLERANCE")]
@@ -274,7 +270,10 @@ struct SealArgs {
     #[arg(short, long, default_value = "primary")]
     key_id: String,
 
-    /// Token expiration in seconds from now
+    /// Token expiration in seconds from now.
+    ///
+    /// Required when `--single-use` or `--max-uses` is set: replay protection
+    /// derives the nonce TTL from the token expiry, so the token must have one.
     #[arg(long)]
     expires_in: Option<u64>,
 
@@ -290,7 +289,7 @@ struct SealArgs {
     #[arg(long)]
     nonce: Option<String>,
 
-    /// Nonce TTL in seconds (defaults to token expiration or 24 hours)
+    /// Nonce TTL in seconds (defaults to the token expiration)
     #[arg(long)]
     nonce_ttl: Option<u64>,
 
@@ -1221,10 +1220,13 @@ fn build_seal_payload(
     }
 
     if args.single_use || args.max_uses.is_some() {
+        if args.expires_in.is_none() {
+            return Err("single-use and max-use tokens require --expires-in".to_string());
+        }
         builder = builder.replay_protection(build_replay_protection(args));
     }
 
-    Ok(builder.build())
+    builder.build().map_err(|e| e.to_string())
 }
 
 fn seal(args: &SealArgs) -> Result<(), Box<dyn std::error::Error>> {
@@ -1404,6 +1406,7 @@ mod build_seal_payload_tests {
     fn test_single_use_sets_replay_protection_with_max_one() {
         let mut args = minimal_args("api.example.com");
         args.single_use = true;
+        args.expires_in = Some(3600);
         args.nonce = Some("fixed-nonce".to_string());
 
         let payload = build_seal_payload(&args).expect("should build");
@@ -1413,6 +1416,24 @@ mod build_seal_payload_tests {
             .expect("single_use should set replay_protection");
         assert_eq!(replay.nonce, "fixed-nonce");
         assert_eq!(replay.max_uses, Some(1));
+    }
+
+    #[test]
+    fn test_single_use_without_expiry_is_rejected() {
+        let mut args = minimal_args("api.example.com");
+        args.single_use = true;
+
+        let err = build_seal_payload(&args).expect_err("single-use without expiry should fail");
+        assert!(err.contains("require --expires-in"), "got: {err}");
+    }
+
+    #[test]
+    fn test_max_uses_without_expiry_is_rejected() {
+        let mut args = minimal_args("api.example.com");
+        args.max_uses = Some(5);
+
+        let err = build_seal_payload(&args).expect_err("max-uses without expiry should fail");
+        assert!(err.contains("require --expires-in"), "got: {err}");
     }
 
     #[test]

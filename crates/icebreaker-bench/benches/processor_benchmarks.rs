@@ -20,6 +20,7 @@ fn create_payload(secret: &str, config: ProcessorConfig) -> TokenPayload {
     TokenPayload::builder(SecretString::from(secret), config)
         .allowed_host("api.example.com")
         .build()
+        .expect("build bench token")
 }
 
 // ============================================================================
@@ -573,7 +574,8 @@ fn bench_oauth_processor(c: &mut Criterion) {
     )
     .oauth(oauth_metadata)
     .allowed_host("api.example.com")
-    .build();
+    .build()
+    .expect("build bench token");
 
     group.bench_function("with_expiry_check", |b| {
         b.iter(|| {

@@ -296,6 +296,7 @@ mod tests {
         )
         .allowed_host("api.example.com")
         .build()
+        .expect("build test token")
     }
 
     #[test]
@@ -373,7 +374,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .expires_at(0) // Expired in 1970
-        .build();
+        .build()
+        .expect("build test token");
 
         let versioned = VersionedKeypair::new("test-key", keypair, 1);
         let key_store = KeyStore::with_primary(versioned);
@@ -417,7 +419,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now - 10)
-            .build();
+            .build()
+            .expect("build test token");
 
             let versioned = VersionedKeypair::new("test-key", keypair, 1);
             let key_store = KeyStore::with_primary(versioned);
@@ -442,7 +445,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now - 60)
-            .build();
+            .build()
+            .expect("build test token");
 
             let versioned = VersionedKeypair::new("test-key", keypair, 1);
             let key_store = KeyStore::with_primary(versioned);
@@ -467,7 +471,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now + 3600)
-            .build();
+            .build()
+            .expect("build test token");
 
             let versioned = VersionedKeypair::new("test-key", keypair, 1);
             let key_store = KeyStore::with_primary(versioned);
@@ -506,7 +511,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .expires_at(now - 200)
-            .build();
+            .build()
+            .expect("build test token");
 
             let versioned = VersionedKeypair::new("test-key", keypair, 1);
             let key_store = KeyStore::with_primary(versioned);
@@ -533,7 +539,8 @@ mod tests {
             )
             .allowed_host("api.example.com")
             // No .expires_at() call
-            .build();
+            .build()
+            .expect("build test token");
 
             let versioned = VersionedKeypair::new("test-key", keypair, 1);
             let key_store = KeyStore::with_primary(versioned);
@@ -559,7 +566,8 @@ mod tests {
                 ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
             )
             .allowed_host("api.example.com")
-            .build();
+            .build()
+            .expect("build test token");
 
             let versioned = VersionedKeypair::new("test-key", keypair, 1);
             let key_store = KeyStore::with_primary(versioned);
@@ -585,7 +593,8 @@ mod tests {
             )
             .allowed_host("api.example.com")
             .expires_at(now + 60) // Valid for 60 seconds
-            .build();
+            .build()
+            .expect("build test token");
 
             let versioned = VersionedKeypair::new("test-key", keypair, 1);
             let key_store = KeyStore::with_primary(versioned);

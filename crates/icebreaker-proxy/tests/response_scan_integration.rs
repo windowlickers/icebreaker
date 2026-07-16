@@ -41,7 +41,8 @@ fn seal_token(crypto: &TokenCrypto, secret: &str, host: &str) -> String {
         ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
     )
     .allowed_host(host)
-    .build();
+    .build()
+    .expect("build test token");
     crypto
         .seal(&payload)
         .expect("seal should succeed")

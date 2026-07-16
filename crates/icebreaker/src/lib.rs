@@ -35,7 +35,8 @@
 //!     ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
 //! )
 //! .allowed_host("api.example.com")
-//! .build();
+//! .build()
+//! .expect("build token");
 //!
 //! let sealed_token = crypto.seal(&payload).expect("seal should succeed");
 //!
@@ -106,7 +107,8 @@ mod tests {
             ProcessorConfig::Inject(InjectConfig::bearer("Authorization")),
         )
         .allowed_host("api.example.com")
-        .build();
+        .build()
+        .expect("build token");
 
         // Seal
         let sealed = crypto.seal(&payload).expect("seal should work");

@@ -153,10 +153,15 @@ icebreaker seal \
   --header <HEADER>                # Header name (default: Authorization)
   --prefix <PREFIX>                # Header prefix (e.g., "Bearer ")
   --sigv4-access-key <KEY_ID>      # AWS access key ID for SigV4 (S3) re-signing
-  --expires-in <SECONDS>           # Token expiration
+  --expires-in <SECONDS>           # Token expiration (required with --single-use / --max-uses)
   --single-use                     # One-time use token
   --max-uses <N>                   # Maximum uses
 ```
+
+`--single-use` and `--max-uses` require `--expires-in`: replay protection
+derives the nonce's lifetime from the token expiry, so the token must have one.
+Otherwise a token that never expires could be replayed once its nonce is evicted
+from the store.
 
 ## Processors
 
